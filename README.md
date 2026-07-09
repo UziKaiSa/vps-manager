@@ -34,16 +34,30 @@ Scripts for enrolling headless Linux probe machines into Cloudflare Zero Trust W
    192.0.2.10/32
    ```
 
-## Secret File
+## Credentials
 
-Create `/root/warp-token.env` on the target probe machine:
+The script accepts credentials in this order:
+
+1. Existing environment variables.
+2. Optional `/root/warp-token.env`.
+3. Interactive prompts.
+
+For non-interactive runs, either export variables:
+
+```bash
+export CF_ACCESS_CLIENT_ID='xxx.access'
+export CF_ACCESS_CLIENT_SECRET='xxx'
+sudo -E ./install-komari-warp-agent.sh
+```
+
+Or create `/root/warp-token.env` on the target probe machine:
 
 ```bash
 CF_ACCESS_CLIENT_ID='xxx.access'
 CF_ACCESS_CLIENT_SECRET='xxx'
 ```
 
-Do not commit this file.
+Do not commit secrets.
 
 ## Usage
 
@@ -51,6 +65,13 @@ Install and configure WARP:
 
 ```bash
 sudo ./install-komari-warp-agent.sh
+```
+
+If no credentials are already available, the script will prompt:
+
+```text
+Cloudflare Access Client ID:
+Cloudflare Access Client Secret:
 ```
 
 If the machine kernel lacks `nf_tables` support and WARP cannot start its firewall, upgrade only the kernel package:

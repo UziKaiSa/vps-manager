@@ -14,12 +14,12 @@ Usage: sudo $0 [--upgrade-kernel] [--reboot-if-needed] [--no-connect]
 
 Installs and configures Cloudflare WARP for Komari agent private-network access.
 
-Required secret file:
-  ${TOKEN_ENV_FILE}
-
-Expected variables in the secret file:
-  CF_ACCESS_CLIENT_ID='xxx.access'
-  CF_ACCESS_CLIENT_SECRET='xxx'
+Credential input order:
+  1. Existing environment variables:
+     CF_ACCESS_CLIENT_ID / CF_ACCESS_CLIENT_SECRET
+  2. Optional env file, if present:
+     ${TOKEN_ENV_FILE}
+  3. Interactive prompt
 
 Optional environment overrides:
   TEAM_NAME=${TEAM_NAME}
@@ -92,18 +92,36 @@ install_warp_repo() {
 }
 
 load_token_env() {
-  if [[ ! -f "${TOKEN_ENV_FILE}" ]]; then
-    echo "Missing token env file: ${TOKEN_ENV_FILE}" >&2
-    exit 1
+  if [[ -f "${TOKEN_ENV_FILE}" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "${TOKEN_ENV_FILE}"
+    set +a
   fi
 
-  set -a
-  # shellcheck disable=SC1090
-  . "${TOKEN_ENV_FILE}"
-  set +a
+  if [[ -z "${CF_ACCESS_CLIENT_ID:-}" ]]; then
+    if [[ -t 0 ]]; then
+      read -r -p "Cloudflare Access Client ID: " CF_ACCESS_CLIENT_ID
+      export CF_ACCESS_CLIENT_ID
+    else
+      echo "Missing CF_ACCESS_CLIENT_ID and stdin is not interactive." >&2
+      exit 1
+    fi
+  fi
 
-  if [[ -z "${CF_ACCESS_CLIENT_ID:-}" || -z "${CF_ACCESS_CLIENT_SECRET:-}" ]]; then
-    echo "Missing CF_ACCESS_CLIENT_ID or CF_ACCESS_CLIENT_SECRET in ${TOKEN_ENV_FILE}" >&2
+  if [[ -z "${CF_ACCESS_CLIENT_SECRET:-}" ]]; then
+    if [[ -t 0 ]]; then
+      read -r -s -p "Cloudflare Access Client Secret: " CF_ACCESS_CLIENT_SECRET
+      echo
+      export CF_ACCESS_CLIENT_SECRET
+    else
+      echo "Missing CF_ACCESS_CLIENT_SECRET and stdin is not interactive." >&2
+      exit 1
+    fi
+  fi
+
+  if [[ -z "${CF_ACCESS_CLIENT_ID}" || -z "${CF_ACCESS_CLIENT_SECRET}" ]]; then
+    echo "Cloudflare Access Client ID/Secret cannot be empty." >&2
     exit 1
   fi
 }
