@@ -52,6 +52,12 @@ chmod +x install-komari-warp-agent.sh
 sudo ./install-komari-warp-agent.sh
 ```
 
+如果当前已经是 `root`，并且系统没有 `sudo`，最后一行改成：
+
+```bash
+./install-komari-warp-agent.sh
+```
+
 脚本会先配置 WARP，验证私网访问，然后询问是否继续安装 Komari Agent。
 
 如果因为私有仓库权限导致 raw 链接无法下载，可以改用 GitHub SSH 克隆：
@@ -59,12 +65,6 @@ sudo ./install-komari-warp-agent.sh
 ```bash
 git clone git@github.com:UziKaiSa/komari-warp-scripts.git
 cd komari-warp-scripts
-sudo ./install-komari-warp-agent.sh
-```
-
-如果你已经在机器上放好了脚本，也可以直接运行：
-
-```bash
 sudo ./install-komari-warp-agent.sh
 ```
 
@@ -124,10 +124,12 @@ WARP 私网接入配置已完成。
 Komari 连接地址 [http://komari.example.internal:8080]:
 Komari Agent 安装目录 [/home/ubuntu/repos/komari/komari-agent]:
 流量统计重置日 [11]:
-是否禁用 Web SSH [Y/n]:
-是否启用 GPU 监控 [Y/n]:
-是否自动探测公网 IPv4 并写入 --custom-ipv4 [Y/n]:
+是否禁用 Web SSH（直接回车默认：是） [Y/n]:
+是否启用 GPU 监控（直接回车默认：是） [Y/n]:
+是否自动探测公网 IPv4 并写入 --custom-ipv4（直接回车默认：是） [Y/n]:
 ```
+
+安装目录支持输入 `~/xxx`，脚本会自动展开成当前用户的绝对路径，例如 root 用户下会变成 `/root/xxx`。systemd 不支持 `~` 路径，所以不要把未展开的 `~/xxx` 直接写进服务文件。
 
 脚本会自动探测机器的公网 IPv4，并写入 `--custom-ipv4`，这样 Komari 后台展示的 IP 和国家会按真实公网出口计算，而不是 WARP/内网 IP。
 

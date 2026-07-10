@@ -126,6 +126,25 @@ prompt_yes_no() {
   esac
 }
 
+normalize_path() {
+  local input_path="$1"
+
+  case "${input_path}" in
+    "~")
+      printf '%s' "${HOME}"
+      ;;
+    "~/"*)
+      printf '%s/%s' "${HOME}" "${input_path#"~/"}"
+      ;;
+    /*)
+      printf '%s' "${input_path}"
+      ;;
+    *)
+      printf '%s/%s' "$(pwd -P)" "${input_path}"
+      ;;
+  esac
+}
+
 install_warp_repo() {
   local codename
   codename="$(. /etc/os-release && echo "${VERSION_CODENAME:-}")"
@@ -309,23 +328,27 @@ install_komari_agent() {
     install_dir="$(prompt_with_default "Komari Agent 安装目录" "${install_dir}")"
     month_rotate="$(prompt_with_default "流量统计重置日" "${month_rotate}")"
 
-    if prompt_yes_no "是否禁用 Web SSH" "${disable_web_ssh}"; then
+    install_dir="$(normalize_path "${install_dir}")"
+
+    if prompt_yes_no "是否禁用 Web SSH（直接回车默认：是）" "${disable_web_ssh}"; then
       disable_web_ssh=1
     else
       disable_web_ssh=0
     fi
 
-    if prompt_yes_no "是否启用 GPU 监控" "${gpu}"; then
+    if prompt_yes_no "是否启用 GPU 监控（直接回车默认：是）" "${gpu}"; then
       gpu=1
     else
       gpu=0
     fi
 
-    if prompt_yes_no "是否自动探测公网 IPv4 并写入 --custom-ipv4" "${auto_public_ipv4}"; then
+    if prompt_yes_no "是否自动探测公网 IPv4 并写入 --custom-ipv4（直接回车默认：是）" "${auto_public_ipv4}"; then
       auto_public_ipv4=1
     else
       auto_public_ipv4=0
     fi
+  else
+    install_dir="$(normalize_path "${install_dir}")"
   fi
 
   install_args=(-e "${endpoint}" -t "${token}" --install-dir "${install_dir}" --month-rotate "${month_rotate}")
