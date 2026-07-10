@@ -12,6 +12,7 @@
 - WARP 设备配置文件：`komari-agent-warp`
 - Split Tunnel 模式：只 include `192.0.2.10/32`
 - 本地域回退：`example.internal -> 192.0.2.10`
+- 默认 Agent 安装目录：`当前用户 HOME/scripts/komari-agent`
 
 ## Cloudflare 前置配置
 
@@ -122,12 +123,17 @@ WARP 私网接入配置已完成。
 
 ```text
 Komari 连接地址 [http://komari.example.internal:8080]:
-Komari Agent 安装目录 [/home/ubuntu/repos/komari/komari-agent]:
+Komari Agent 安装目录 [当前用户 HOME/scripts/komari-agent]:
 流量统计重置日 [11]:
 是否禁用 Web SSH（直接回车默认：是） [Y/n]:
 是否启用 GPU 监控（直接回车默认：是） [Y/n]:
 是否自动探测公网 IPv4 并写入 --custom-ipv4（直接回车默认：是） [Y/n]:
 ```
+
+默认安装目录会动态计算：
+
+- 如果通过普通用户执行 `sudo ./install-komari-warp-agent.sh`，默认目录是：`该用户 HOME/scripts/komari-agent`
+- 如果已经是 root 直接执行 `./install-komari-warp-agent.sh`，默认目录是：`/root/scripts/komari-agent`
 
 安装目录支持输入 `~/xxx`，脚本会自动展开成当前用户的绝对路径，例如 root 用户下会变成 `/root/xxx`。systemd 不支持 `~` 路径，所以不要把未展开的 `~/xxx` 直接写进服务文件。
 
@@ -149,6 +155,13 @@ WARP 模式下不要再加：
 export CF_ACCESS_CLIENT_ID='xxx.access'
 export CF_ACCESS_CLIENT_SECRET='xxx'
 export KOMARI_AGENT_TOKEN='komari-client-token'
+sudo -E ./install-komari-warp-agent.sh --install-agent
+```
+
+如需覆盖默认安装目录，可以传环境变量：
+
+```bash
+export KOMARI_AGENT_INSTALL_DIR="$HOME/scripts/komari-agent"
 sudo -E ./install-komari-warp-agent.sh --install-agent
 ```
 

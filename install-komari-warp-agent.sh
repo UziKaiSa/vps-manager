@@ -8,11 +8,25 @@ SERVICE_MODE="${SERVICE_MODE:-warp}"
 AUTO_CONNECT="${AUTO_CONNECT:-1}"
 APT_FRONTEND="${DEBIAN_FRONTEND:-noninteractive}"
 KOMARI_AGENT_INSTALL_SCRIPT_URL="${KOMARI_AGENT_INSTALL_SCRIPT_URL:-https://raw.githubusercontent.com/komari-monitor/komari-agent/refs/heads/main/install.sh}"
-KOMARI_AGENT_INSTALL_DIR="${KOMARI_AGENT_INSTALL_DIR:-/home/ubuntu/repos/komari/komari-agent}"
 KOMARI_AGENT_MONTH_ROTATE="${KOMARI_AGENT_MONTH_ROTATE:-11}"
 KOMARI_AGENT_DISABLE_WEB_SSH="${KOMARI_AGENT_DISABLE_WEB_SSH:-1}"
 KOMARI_AGENT_GPU="${KOMARI_AGENT_GPU:-1}"
 KOMARI_AGENT_AUTO_PUBLIC_IPV4="${KOMARI_AGENT_AUTO_PUBLIC_IPV4:-1}"
+
+detect_target_home() {
+  local target_user
+  target_user="${SUDO_USER:-}"
+
+  if [[ -n "${target_user}" && "${target_user}" != "root" ]]; then
+    getent passwd "${target_user}" | cut -d: -f6
+    return
+  fi
+
+  printf '%s' "${HOME:-/root}"
+}
+
+TARGET_HOME="${TARGET_HOME:-$(detect_target_home)}"
+KOMARI_AGENT_INSTALL_DIR="${KOMARI_AGENT_INSTALL_DIR:-${TARGET_HOME}/scripts/komari-agent}"
 
 usage() {
   cat <<USAGE
@@ -31,6 +45,7 @@ Cloudflare Service Token 读取顺序:
   TEAM_NAME=${TEAM_NAME}
   KOMARI_PRIVATE_URL=${KOMARI_PRIVATE_URL}
   TOKEN_ENV_FILE=${TOKEN_ENV_FILE}
+  KOMARI_AGENT_INSTALL_DIR=${KOMARI_AGENT_INSTALL_DIR}
 
 参数:
   --upgrade-kernel    如果缺少 nftables 内核支持，则升级 linux-image-amd64。
