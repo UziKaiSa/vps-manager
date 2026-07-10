@@ -44,7 +44,17 @@
 
 ## 一键使用命令
 
-如果目标机器已经配置好 GitHub SSH 访问权限，推荐直接克隆私有仓库：
+优先使用下面这段，复制到目标 Linux 机器上直接执行：
+
+```bash
+wget -O install-komari-warp-agent.sh https://raw.githubusercontent.com/UziKaiSa/komari-warp-scripts/main/install-komari-warp-agent.sh
+chmod +x install-komari-warp-agent.sh
+sudo ./install-komari-warp-agent.sh
+```
+
+脚本会先配置 WARP，验证私网访问，然后询问是否继续安装 Komari Agent。
+
+如果因为私有仓库权限导致 raw 链接无法下载，可以改用 GitHub SSH 克隆：
 
 ```bash
 git clone git@github.com:UziKaiSa/komari-warp-scripts.git
@@ -57,8 +67,6 @@ sudo ./install-komari-warp-agent.sh
 ```bash
 sudo ./install-komari-warp-agent.sh
 ```
-
-脚本会先配置 WARP，验证私网访问，然后询问是否继续安装 Komari Agent。
 
 ## 凭证输入方式
 
