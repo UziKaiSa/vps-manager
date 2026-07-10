@@ -16,28 +16,28 @@ KOMARI_AGENT_AUTO_PUBLIC_IPV4="${KOMARI_AGENT_AUTO_PUBLIC_IPV4:-1}"
 
 usage() {
   cat <<USAGE
-Usage: sudo $0 [--upgrade-kernel] [--reboot-if-needed] [--no-connect] [--install-agent] [--skip-agent]
+用法: sudo $0 [--upgrade-kernel] [--reboot-if-needed] [--no-connect] [--install-agent] [--skip-agent]
 
-Installs and configures Cloudflare WARP for Komari agent private-network access.
+安装并配置 Cloudflare WARP，让 Komari Agent 通过私网访问 Komari 服务端。
 
-Credential input order:
-  1. Existing environment variables:
+Cloudflare Service Token 读取顺序:
+  1. 已存在的环境变量:
      CF_ACCESS_CLIENT_ID / CF_ACCESS_CLIENT_SECRET
-  2. Optional env file, if present:
+  2. 如果存在，则读取环境变量文件:
      ${TOKEN_ENV_FILE}
-  3. Interactive prompt
+  3. 交互式输入
 
-Optional environment overrides:
+可选环境变量覆盖:
   TEAM_NAME=${TEAM_NAME}
   KOMARI_PRIVATE_URL=${KOMARI_PRIVATE_URL}
   TOKEN_ENV_FILE=${TOKEN_ENV_FILE}
 
-Options:
-  --upgrade-kernel    Upgrade linux-image-amd64 if nftables kernel support is missing.
-  --reboot-if-needed  Reboot automatically after kernel upgrade.
-  --no-connect        Configure WARP but do not run warp-cli connect.
-  --install-agent      Install/reinstall Komari Agent after WARP verification.
-  --skip-agent         Do not offer Komari Agent installation.
+参数:
+  --upgrade-kernel    如果缺少 nftables 内核支持，则升级 linux-image-amd64。
+  --reboot-if-needed  内核升级后自动重启。
+  --no-connect        只配置 WARP，不执行 warp-cli connect。
+  --install-agent     WARP 验证后直接安装/重装 Komari Agent。
+  --skip-agent        不询问 Komari Agent 安装流程。
 USAGE
 }
 
@@ -68,7 +68,7 @@ while [[ $# -gt 0 ]]; do
       exit 0
       ;;
     *)
-      echo "Unknown option: $1" >&2
+      echo "未知参数: $1" >&2
       usage
       exit 2
       ;;
@@ -78,7 +78,7 @@ done
 
 need_root() {
   if [[ "${EUID}" -ne 0 ]]; then
-    echo "Please run as root." >&2
+    echo "请使用 root 权限运行，例如 sudo $0。" >&2
     exit 1
   fi
 }
@@ -120,7 +120,7 @@ prompt_yes_no() {
       return
       ;;
     *)
-      echo "Please answer yes or no." >&2
+      echo "请输入 yes/no，或直接回车使用默认值。" >&2
       prompt_yes_no "${prompt}" "${default_value}"
       ;;
   esac
@@ -155,27 +155,27 @@ load_token_env() {
 
   if [[ -z "${CF_ACCESS_CLIENT_ID:-}" ]]; then
     if [[ -t 0 ]]; then
-      read -r -p "Cloudflare Access Client ID: " CF_ACCESS_CLIENT_ID
+      read -r -p "请输入 Cloudflare Access Client ID: " CF_ACCESS_CLIENT_ID
       export CF_ACCESS_CLIENT_ID
     else
-      echo "Missing CF_ACCESS_CLIENT_ID and stdin is not interactive." >&2
+      echo "缺少 CF_ACCESS_CLIENT_ID，且当前不是交互式终端。" >&2
       exit 1
     fi
   fi
 
   if [[ -z "${CF_ACCESS_CLIENT_SECRET:-}" ]]; then
     if [[ -t 0 ]]; then
-      read -r -s -p "Cloudflare Access Client Secret: " CF_ACCESS_CLIENT_SECRET
+      read -r -s -p "请输入 Cloudflare Access Client Secret（输入时不会显示）: " CF_ACCESS_CLIENT_SECRET
       echo
       export CF_ACCESS_CLIENT_SECRET
     else
-      echo "Missing CF_ACCESS_CLIENT_SECRET and stdin is not interactive." >&2
+      echo "缺少 CF_ACCESS_CLIENT_SECRET，且当前不是交互式终端。" >&2
       exit 1
     fi
   fi
 
   if [[ -z "${CF_ACCESS_CLIENT_ID}" || -z "${CF_ACCESS_CLIENT_SECRET}" ]]; then
-    echo "Cloudflare Access Client ID/Secret cannot be empty." >&2
+    echo "Cloudflare Access Client ID/Secret 不能为空。" >&2
     exit 1
   fi
 }
@@ -208,30 +208,30 @@ nft_supported() {
 
 maybe_upgrade_kernel() {
   if nft_supported; then
-    log "nftables kernel support is available."
+    log "nftables 内核支持正常。"
     return 0
   fi
 
-  log "nftables kernel support is not available."
+  log "当前内核缺少 nftables 支持。"
   if [[ "${UPGRADE_KERNEL}" -ne 1 ]]; then
     cat >&2 <<EOF
-WARP may fail to connect without nf_tables/nftables support.
-Re-run with --upgrade-kernel to install the latest linux-image-amd64.
+缺少 nf_tables/nftables 支持时，WARP 可能无法连接。
+如需自动安装新内核，请重新运行并添加 --upgrade-kernel。
 EOF
     return 0
   fi
 
-  log "Upgrading linux-image-amd64 only."
+  log "仅升级 linux-image-amd64 内核包。"
   export DEBIAN_FRONTEND="${APT_FRONTEND}"
   apt-get update
   apt-get install -y --no-install-recommends linux-image-amd64
 
   if [[ "${REBOOT_IF_NEEDED}" -eq 1 ]]; then
-    log "Rebooting to load the upgraded kernel."
+    log "正在重启以加载新内核。"
     sync
     reboot
   else
-    log "Kernel upgraded. Reboot is required before WARP can use the new kernel."
+    log "内核已升级。需要重启后 WARP 才能使用新内核。"
   fi
 }
 
@@ -251,17 +251,17 @@ configure_warp() {
 }
 
 verify() {
-  log "WARP status"
+  log "WARP 状态"
   warp-cli --accept-tos status || true
 
-  log "Relevant WARP settings"
+  log "相关 WARP 配置"
   warp-cli --accept-tos settings list 2>&1 \
     | grep -E 'Organization|Mode:|Include mode|Exclude mode|Profile ID|Daemon Teams Auth|172\.31\.9\.160|Auto Connect' || true
 
-  log "Komari private URL check: ${KOMARI_PRIVATE_URL}"
+  log "检查 Komari 私网地址: ${KOMARI_PRIVATE_URL}"
   curl -i --connect-timeout 10 --max-time 20 "${KOMARI_PRIVATE_URL}" | sed -n '1,40p'
 
-  log "Resource usage"
+  log "资源占用"
   free -h
   ps -eo pid,comm,%cpu,%mem,rss --sort=-rss | head -n 15
 }
@@ -281,7 +281,7 @@ install_komari_agent() {
   local install_args
 
   if [[ ! -t 0 && -z "${KOMARI_AGENT_TOKEN:-}" ]]; then
-    echo "Cannot install Komari Agent non-interactively without KOMARI_AGENT_TOKEN." >&2
+    echo "非交互模式安装 Komari Agent 时，必须提供 KOMARI_AGENT_TOKEN。" >&2
     exit 1
   fi
 
@@ -293,35 +293,35 @@ install_komari_agent() {
   auto_public_ipv4="${KOMARI_AGENT_AUTO_PUBLIC_IPV4}"
 
   if [[ -z "${KOMARI_AGENT_TOKEN:-}" ]]; then
-    read -r -s -p "Komari client token: " token
+    read -r -s -p "请输入 Komari Client Token（输入时不会显示）: " token
     echo
   else
     token="${KOMARI_AGENT_TOKEN}"
   fi
 
   if [[ -z "${token}" ]]; then
-    echo "Komari client token cannot be empty." >&2
+    echo "Komari Client Token 不能为空。" >&2
     exit 1
   fi
 
   if [[ -t 0 ]]; then
-    endpoint="$(prompt_with_default "Komari endpoint" "${endpoint}")"
-    install_dir="$(prompt_with_default "Komari Agent install dir" "${install_dir}")"
-    month_rotate="$(prompt_with_default "Traffic reset day" "${month_rotate}")"
+    endpoint="$(prompt_with_default "Komari 连接地址" "${endpoint}")"
+    install_dir="$(prompt_with_default "Komari Agent 安装目录" "${install_dir}")"
+    month_rotate="$(prompt_with_default "流量统计重置日" "${month_rotate}")"
 
-    if prompt_yes_no "Disable Web SSH" "${disable_web_ssh}"; then
+    if prompt_yes_no "是否禁用 Web SSH" "${disable_web_ssh}"; then
       disable_web_ssh=1
     else
       disable_web_ssh=0
     fi
 
-    if prompt_yes_no "Enable GPU reporting" "${gpu}"; then
+    if prompt_yes_no "是否启用 GPU 监控" "${gpu}"; then
       gpu=1
     else
       gpu=0
     fi
 
-    if prompt_yes_no "Auto-detect public IPv4 and pass --custom-ipv4" "${auto_public_ipv4}"; then
+    if prompt_yes_no "是否自动探测公网 IPv4 并写入 --custom-ipv4" "${auto_public_ipv4}"; then
       auto_public_ipv4=1
     else
       auto_public_ipv4=0
@@ -342,18 +342,18 @@ install_komari_agent() {
     public_ipv4="$(detect_public_ipv4)"
     if [[ -n "${public_ipv4}" ]]; then
       install_args+=(--custom-ipv4 "${public_ipv4}")
-      log "Detected public IPv4: ${public_ipv4}"
+      log "已探测到公网 IPv4: ${public_ipv4}"
     else
-      log "Public IPv4 detection failed; installing without --custom-ipv4."
+      log "公网 IPv4 探测失败，将不带 --custom-ipv4 安装。"
     fi
   fi
 
-  log "Installing Komari Agent"
-  log "Endpoint: ${endpoint}"
-  log "Install dir: ${install_dir}"
+  log "开始安装 Komari Agent"
+  log "连接地址: ${endpoint}"
+  log "安装目录: ${install_dir}"
   wget -qO- "${KOMARI_AGENT_INSTALL_SCRIPT_URL}" | bash -s -- "${install_args[@]}"
 
-  log "Komari Agent status"
+  log "Komari Agent 状态"
   systemctl status komari-agent --no-pager -l | sed -n '1,80p' || true
 }
 
@@ -362,7 +362,7 @@ maybe_install_komari_agent() {
 
   case "${AGENT_INSTALL_MODE}" in
     skip)
-      log "Skipping Komari Agent installation."
+      log "跳过 Komari Agent 安装。"
       return 0
       ;;
     install)
@@ -372,26 +372,26 @@ maybe_install_komari_agent() {
   esac
 
   if [[ ! -t 0 ]]; then
-    log "Non-interactive run detected; skipping Komari Agent installation. Re-run with --install-agent to force it."
+    log "检测到非交互运行，跳过 Komari Agent 安装。如需强制安装，请添加 --install-agent。"
     return 0
   fi
 
   echo
-  echo "WARP private-network setup is complete."
-  echo "Choose the next step:"
-  echo "  1) Continue to install/reinstall Komari Agent"
-  echo "  2) Skip Komari Agent installation"
-  read -r -p "Selection [2]: " choice
+  echo "WARP 私网接入配置已完成。"
+  echo "请选择下一步："
+  echo "  1) 继续安装/重装 Komari Agent"
+  echo "  2) 跳过 Komari Agent 安装"
+  read -r -p "请输入选项 [2]: " choice
 
   case "${choice:-2}" in
     1)
       install_komari_agent
       ;;
     2)
-      log "Skipping Komari Agent installation."
+      log "跳过 Komari Agent 安装。"
       ;;
     *)
-      echo "Unknown selection: ${choice}" >&2
+      echo "未知选项: ${choice}" >&2
       return 2
       ;;
   esac
@@ -399,19 +399,19 @@ maybe_install_komari_agent() {
 
 main() {
   need_root
-  log "Installing Cloudflare WARP client"
+  log "安装 Cloudflare WARP 客户端"
   install_warp_repo
 
-  log "Checking kernel support"
+  log "检查内核支持"
   maybe_upgrade_kernel
 
-  log "Loading service token from ${TOKEN_ENV_FILE}"
+  log "读取 Service Token，环境变量文件: ${TOKEN_ENV_FILE}"
   load_token_env
 
-  log "Writing WARP MDM config"
+  log "写入 WARP MDM 配置"
   write_mdm
 
-  log "Configuring WARP"
+  log "配置 WARP"
   configure_warp
 
   verify
