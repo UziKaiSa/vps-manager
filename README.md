@@ -205,6 +205,225 @@ Network: healthy
 HTTP/1.1 200 OK
 ```
 
+## 未来迁移母机时要做的事情
+
+这里的“母机”指运行 Komari 服务端、Cloudflare Tunnel、私有 DNS 的机器。当前母机私网 IP 是 `192.0.2.10`，私网域名是 `komari.example.internal`。
+
+迁移目标是：Agent 仍然使用同一个 endpoint，不需要逐台修改。
+
+```text
+http://komari.example.internal:8080
+```
+
+### 1. 在新母机上准备 Komari 服务端
+
+先把 Komari 服务端迁移到新机器，并确认新机器本机能访问：
+
+```bash
+curl -i http://127.0.0.1:8080
+```
+
+期望能返回 Komari 页面或 `HTTP/1.1 200 OK`。如果 Komari 不是监听 `8080`，需要先统一服务端监听端口，或者同步修改后续所有验证命令。
+
+### 2. 确认新母机私网 IP
+
+在新母机上确认 Cloudflare Tunnel 能访问到的私网 IP，例如：
+
+```bash
+ip -4 addr
+```
+
+假设新母机私网 IP 是：
+
+```text
+NEW_PRIVATE_IP=172.31.x.x
+```
+
+后续命令里的 `NEW_PRIVATE_IP` 都替换成真实值。
+
+### 3. 在新母机上部署私有 DNS
+
+新母机需要继续解析：
+
+```text
+komari.example.internal -> NEW_PRIVATE_IP
+```
+
+如果继续使用 `dnsmasq`，可以参考：
+
+```bash
+sudo apt-get update
+sudo apt-get install -y dnsmasq dnsutils
+
+sudo tee /etc/dnsmasq.d/komari-internal.conf >/dev/null <<EOF
+# Private DNS for Komari agents over Cloudflare WARP.
+listen-address=NEW_PRIVATE_IP
+bind-interfaces
+address=/komari.example.internal/NEW_PRIVATE_IP
+local=/example.internal/
+domain-needed
+bogus-priv
+EOF
+
+sudo dnsmasq --test
+sudo systemctl enable dnsmasq
+sudo systemctl restart dnsmasq
+```
+
+验证：
+
+```bash
+dig +short @NEW_PRIVATE_IP komari.example.internal A
+```
+
+期望返回：
+
+```text
+NEW_PRIVATE_IP
+```
+
+### 4. 调整 Cloudflare Tunnel 私网路由
+
+在 Cloudflare Zero Trust 的 CIDR Routes 里，把旧路由切换到新母机：
+
+```text
+旧：192.0.2.10/32 -> 旧 Tunnel
+新：NEW_PRIVATE_IP/32 -> 新 Tunnel
+```
+
+如果新母机沿用同一个 Tunnel 名称，可以添加新 route 后再删除旧 route。命令示例：
+
+```bash
+cloudflared tunnel route ip add NEW_PRIVATE_IP/32 example-tunnel
+```
+
+确认新路由生效后，再删除旧的：
+
+```bash
+cloudflared tunnel route ip delete 192.0.2.10/32 example-tunnel
+```
+
+如果你是在 Cloudflare 控制台操作，就在：
+
+```text
+Zero Trust -> 网络 -> 路由 -> CIDR 路由
+```
+
+确认最终只有新母机的 `/32` 路由指向正确 Tunnel。
+
+### 5. 调整 WARP 设备配置文件的 Split Tunnel
+
+进入：
+
+```text
+Zero Trust -> 团队和资源 -> 设备 -> 设备配置文件 -> komari-agent-warp
+```
+
+确认拆分隧道仍是 Include 模式，并把旧 IP 替换为：
+
+```text
+NEW_PRIVATE_IP/32
+```
+
+如果仍保留旧的 `192.0.2.10/32`，Agent 可能继续把流量送到旧母机。
+
+### 6. 调整 Local Domain Fallback
+
+仍在 `komari-agent-warp` 设备配置文件里，找到：
+
+```text
+Local Domain Fallback / 本地域回退
+```
+
+把：
+
+```text
+example.internal -> 192.0.2.10
+```
+
+改成：
+
+```text
+example.internal -> NEW_PRIVATE_IP
+```
+
+这里不要改 Agent endpoint，Agent 仍然用：
+
+```text
+http://komari.example.internal:8080
+```
+
+### 7. 在一台已接入 WARP 的探针机器上验证
+
+以 `hk` 这类探针机器为例，重连 WARP：
+
+```bash
+warp-cli --accept-tos disconnect
+warp-cli --accept-tos connect
+```
+
+验证 DNS：
+
+```bash
+dig komari.example.internal
+getent hosts komari.example.internal
+```
+
+期望解析到：
+
+```text
+NEW_PRIVATE_IP
+```
+
+验证 HTTP：
+
+```bash
+curl -i http://komari.example.internal:8080
+```
+
+期望返回 Komari 页面或 `HTTP/1.1 200 OK`。
+
+### 8. 验证已有 Agent 是否自动恢复
+
+因为 Agent endpoint 没变，正常情况下不需要逐台修改 Agent。只需要在探针机器上看服务状态：
+
+```bash
+systemctl status komari-agent --no-pager -l
+journalctl -u komari-agent -n 80 --no-pager
+```
+
+期望看到类似：
+
+```text
+Basic info uploaded successfully
+WebSocket connected using v2 protocol
+```
+
+### 9. 迁移完成后清理旧母机
+
+确认所有探针都恢复后，再清理旧母机：
+
+```text
+1. 删除旧 Cloudflare Tunnel route：192.0.2.10/32
+2. 停止旧母机上的 dnsmasq
+3. 停止旧母机上的 Komari 服务
+4. 下线旧服务器
+```
+
+不要在新链路验证完成前删除旧 route，否则 Agent 会短暂全部断连。
+
+### 10. 回滚方式
+
+如果新母机验证失败，回滚只需要反向恢复三处：
+
+```text
+1. CIDR Route 恢复：192.0.2.10/32 -> 旧 Tunnel
+2. Split Tunnel include 恢复：192.0.2.10/32
+3. Local Domain Fallback 恢复：example.internal -> 192.0.2.10
+```
+
+Agent 仍然使用 `http://komari.example.internal:8080`，所以回滚也不需要逐台修改 Agent。
+
 ## 资源占用说明
 
 在测试用的小规格 `hk` Debian 机器上：
