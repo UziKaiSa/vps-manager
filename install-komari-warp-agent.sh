@@ -15,10 +15,17 @@ KOMARI_AGENT_AUTO_PUBLIC_IPV4="${KOMARI_AGENT_AUTO_PUBLIC_IPV4:-1}"
 
 detect_target_home() {
   local target_user
+  local detected_home
   target_user="${SUDO_USER:-}"
 
   if [[ -n "${target_user}" && "${target_user}" != "root" ]]; then
     getent passwd "${target_user}" | cut -d: -f6
+    return
+  fi
+
+  detected_home="$(getent passwd | awk -F: '$3 >= 1000 && $3 < 60000 && $1 != "nobody" && $6 ~ "^/home/" {print $6; exit}')"
+  if [[ -n "${detected_home}" ]]; then
+    printf '%s' "${detected_home}"
     return
   fi
 
