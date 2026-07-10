@@ -172,6 +172,62 @@ sudo -E ./install-komari-warp-agent.sh --install-agent
 sudo ./install-komari-warp-agent.sh --skip-agent
 ```
 
+## Komari 看板主题脚本
+
+仓库里还包含一个可选脚本：
+
+```text
+apply-kaisa-komari-theme.py
+```
+
+这个脚本用于向 Komari SQLite 数据库写入 `configs.custom_head` 和 `configs.custom_body`，实现当前 KaiSa 看板样式：
+
+- 静态背景图和暗色遮罩
+- 主页面透明化
+- 搜索框轻暗底
+- 节点卡片 hover 的主题色渐变黑和毛玻璃效果
+- 查看延迟浮层的主题色毛玻璃效果
+
+脚本不会硬编码 Komari 数据库路径。运行时需要通过参数或环境变量传入 DB 路径：
+
+```bash
+python3 apply-kaisa-komari-theme.py --db ./data/komari.db
+```
+
+也可以使用环境变量：
+
+```bash
+export KOMARI_DB_PATH=./data/komari.db
+python3 apply-kaisa-komari-theme.py
+```
+
+如果需要自定义备份目录：
+
+```bash
+python3 apply-kaisa-komari-theme.py \
+  --db ./data/komari.db \
+  --backup-dir ./data/theme-backups
+```
+
+默认会先备份数据库到：
+
+```text
+<db_dir>/theme-backups/<db_name>.before-kaisa-theme-<timestamp>
+```
+
+如果明确不需要备份，可以加：
+
+```bash
+python3 apply-kaisa-komari-theme.py --db ./data/komari.db --no-backup
+```
+
+如果要替换背景图：
+
+```bash
+KAISA_BG_IMAGE_URL='https://example.com/background.jpg' \
+python3 apply-kaisa-komari-theme.py --db ./data/komari.db
+```
+
 ## 内核兼容处理
 
 如果机器内核缺少 `nf_tables` 支持，WARP 可能无法启动防火墙。可以只升级内核包：
