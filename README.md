@@ -5,11 +5,13 @@ Scripts for enrolling headless Linux probe machines into Cloudflare Zero Trust W
 ## Current Network Design
 
 - Komari server private route: `192.0.2.10/32`
-- Komari private endpoint for remote agents: `http://192.0.2.10:8080`
+- Komari private DNS: `komari.example.internal -> 192.0.2.10`
+- Komari private endpoint for remote agents: `http://komari.example.internal:8080`
 - Komari endpoint for the Komari host itself: `http://127.0.0.1:8080`
 - Cloudflare Zero Trust team: `uzikaisa`
 - WARP device profile: `komari-agent-warp`
 - Split Tunnel mode: Include only `192.0.2.10/32`
+- Local Domain Fallback: `example.internal -> 192.0.2.10`
 
 ## Cloudflare Prerequisites
 
@@ -32,6 +34,12 @@ Scripts for enrolling headless Linux probe machines into Cloudflare Zero Trust W
 
    ```text
    192.0.2.10/32
+   ```
+
+5. Ensure Local Domain Fallback contains:
+
+   ```text
+   example.internal -> 192.0.2.10
    ```
 
 ## Credentials
@@ -74,6 +82,40 @@ Cloudflare Access Client ID:
 Cloudflare Access Client Secret:
 ```
 
+After WARP verification, interactive runs ask whether to continue installing
+Komari Agent:
+
+```text
+1) Continue to install/reinstall Komari Agent
+2) Skip Komari Agent installation
+```
+
+If you choose `1`, the script prompts for the Komari client token and then uses
+the verified private endpoint by default:
+
+```text
+http://komari.example.internal:8080
+```
+
+The script also auto-detects the machine public IPv4 and passes it as
+`--custom-ipv4`, so Komari shows the machine's real public IP/country instead of
+the WARP/private IP. Do not add `--get-ip-addr-from-nic` for WARP-based agents.
+
+To force Komari Agent installation in a non-interactive run:
+
+```bash
+export CF_ACCESS_CLIENT_ID='xxx.access'
+export CF_ACCESS_CLIENT_SECRET='xxx'
+export KOMARI_AGENT_TOKEN='client-token-from-komari'
+sudo -E ./install-komari-warp-agent.sh --install-agent
+```
+
+To only configure WARP and never prompt for Komari Agent:
+
+```bash
+sudo ./install-komari-warp-agent.sh --skip-agent
+```
+
 If the machine kernel lacks `nf_tables` support and WARP cannot start its firewall, upgrade only the kernel package:
 
 ```bash
@@ -92,7 +134,8 @@ sudo ./install-komari-warp-agent.sh --upgrade-kernel --reboot-if-needed
 
 ```bash
 warp-cli --accept-tos status
-curl -i http://192.0.2.10:8080
+dig komari.example.internal
+curl -i http://komari.example.internal:8080
 ```
 
 Expected:
@@ -100,6 +143,7 @@ Expected:
 ```text
 Status update: Connected
 Network: healthy
+192.0.2.10
 HTTP/1.1 200 OK
 ```
 
