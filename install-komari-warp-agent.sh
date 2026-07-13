@@ -12,6 +12,7 @@ KOMARI_AGENT_MONTH_ROTATE="${KOMARI_AGENT_MONTH_ROTATE:-11}"
 KOMARI_AGENT_DISABLE_WEB_SSH="${KOMARI_AGENT_DISABLE_WEB_SSH:-1}"
 KOMARI_AGENT_GPU="${KOMARI_AGENT_GPU:-1}"
 KOMARI_AGENT_AUTO_PUBLIC_IPV4="${KOMARI_AGENT_AUTO_PUBLIC_IPV4:-1}"
+SCRIPT_SELF_CLEANUP="${SCRIPT_SELF_CLEANUP:-1}"
 
 detect_target_home() {
   local target_user
@@ -19,14 +20,18 @@ detect_target_home() {
   target_user="${SUDO_USER:-}"
 
   if [[ -n "${target_user}" && "${target_user}" != "root" ]]; then
-    getent passwd "${target_user}" | cut -d: -f6
-    return
+    if command -v getent >/dev/null 2>&1; then
+      getent passwd "${target_user}" | cut -d: -f6
+      return
+    fi
   fi
 
-  detected_home="$(getent passwd | awk -F: '$3 >= 1000 && $3 < 60000 && $1 != "nobody" && $6 ~ "^/home/" {print $6; exit}')"
-  if [[ -n "${detected_home}" ]]; then
-    printf '%s' "${detected_home}"
-    return
+  if command -v getent >/dev/null 2>&1; then
+    detected_home="$(getent passwd | awk -F: '$3 >= 1000 && $3 < 60000 && $1 != "nobody" && $6 ~ "^/home/" {print $6; exit}')"
+    if [[ -n "${detected_home}" ]]; then
+      printf '%s' "${detected_home}"
+      return
+    fi
   fi
 
   printf '%s' "${HOME:-/root}"
@@ -37,7 +42,7 @@ KOMARI_AGENT_INSTALL_DIR="${KOMARI_AGENT_INSTALL_DIR:-${TARGET_HOME}/scripts/kom
 
 usage() {
   cat <<USAGE
-用法: sudo $0 [--upgrade-kernel] [--reboot-if-needed] [--no-connect] [--install-agent] [--skip-agent]
+用法: sudo $0 [--upgrade-kernel] [--reboot-if-needed] [--no-connect] [--install-agent] [--skip-agent] [--no-self-cleanup]
 
 安装并配置 Cloudflare WARP，让 Komari Agent 通过私网访问 Komari 服务端。
 
@@ -60,6 +65,7 @@ Cloudflare Service Token 读取顺序:
   --no-connect        只配置 WARP，不执行 warp-cli connect。
   --install-agent     WARP 验证后直接安装/重装 Komari Agent。
   --skip-agent        不询问 Komari Agent 安装流程。
+  --no-self-cleanup   成功执行后保留当前安装脚本，不自动删除。
 USAGE
 }
 
@@ -85,6 +91,9 @@ while [[ $# -gt 0 ]]; do
     --skip-agent)
       AGENT_INSTALL_MODE="skip"
       ;;
+    --no-self-cleanup)
+      SCRIPT_SELF_CLEANUP=0
+      ;;
     -h|--help)
       usage
       exit 0
@@ -108,6 +117,61 @@ need_root() {
 log() {
   printf '\n[%s] %s\n' "$(date '+%F %T')" "$*"
 }
+
+is_inside_git_worktree() {
+  local current="$1"
+
+  if command -v git >/dev/null 2>&1 && git -C "${current}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    return 0
+  fi
+
+  while [[ "${current}" != "/" && -n "${current}" ]]; do
+    if [[ -e "${current}/.git" ]]; then
+      return 0
+    fi
+    current="$(dirname "${current}")"
+  done
+
+  return 1
+}
+
+resolve_script_path() {
+  local source_path="$1"
+
+  if command -v realpath >/dev/null 2>&1; then
+    realpath "${source_path}" 2>/dev/null && return 0
+  fi
+
+  readlink -f "${source_path}" 2>/dev/null
+}
+
+self_cleanup_on_success() {
+  local exit_code="$?"
+  local script_path script_dir
+
+  if [[ "${exit_code}" -ne 0 || "${SCRIPT_SELF_CLEANUP}" != "1" ]]; then
+    return
+  fi
+
+  script_path="$(resolve_script_path "${BASH_SOURCE[0]}" || true)"
+  if [[ -z "${script_path}" || ! -f "${script_path}" ]]; then
+    return
+  fi
+
+  script_dir="$(dirname "${script_path}")"
+  if is_inside_git_worktree "${script_dir}"; then
+    log "当前脚本位于 Git 工作区内，跳过自清理: ${script_path}"
+    return
+  fi
+
+  if rm -f -- "${script_path}"; then
+    log "已自动清理安装脚本: ${script_path}"
+  else
+    log "安装脚本自清理失败，请手动删除: ${script_path}"
+  fi
+}
+
+trap self_cleanup_on_success EXIT
 
 prompt_with_default() {
   local prompt="$1"

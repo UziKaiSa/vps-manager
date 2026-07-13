@@ -61,6 +61,20 @@ sudo ./install-komari-warp-agent.sh
 
 脚本会先配置 WARP，验证私网访问，然后询问是否继续安装 Komari Agent。
 
+脚本成功执行完成后会自动删除当前下载的 `install-komari-warp-agent.sh`，避免目标机器目录里残留一次性安装脚本。如果是在 `git clone` 出来的仓库目录内运行，脚本会识别 Git 工作区并跳过自删除。
+
+如果调试时想保留脚本，可以使用：
+
+```bash
+sudo ./install-komari-warp-agent.sh --no-self-cleanup
+```
+
+或者：
+
+```bash
+SCRIPT_SELF_CLEANUP=0 sudo -E ./install-komari-warp-agent.sh
+```
+
 如果因为私有仓库权限导致 raw 链接无法下载，可以改用 GitHub SSH 克隆：
 
 ```bash
