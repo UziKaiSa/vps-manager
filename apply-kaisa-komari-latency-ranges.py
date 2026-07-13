@@ -104,13 +104,19 @@ LATENCY_PATCH_SCRIPT = r'''<script id="kaisa-latency-range-patch">
     return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
   };
 
+  const CONTROL_LABEL_SETS = [
+    ["1小时", "6小时", "12小时", "1天"],
+    ["实时", "4小时", "1天", "3天", "7天", "30天"],
+  ];
+
+  const hasAllLabels = (text, labels) => labels.every((label) => text.includes(label));
+
   const findLatencySegmentRoot = () => {
-    const requiredLabels = ["1小时", "6小时", "12小时", "1天"];
     const candidates = Array.from(document.body.querySelectorAll("div, section, nav, [role='tablist'], .rt-SegmentedControlRoot"))
       .filter((node) => {
         if (node.dataset.kaisaLatencyPatched === "true" || !isVisible(node)) return false;
         const text = normalizeText(node.textContent);
-        return requiredLabels.every((label) => text.includes(label));
+        return CONTROL_LABEL_SETS.some((labels) => hasAllLabels(text, labels));
       })
       .sort((a, b) => normalizeText(a.textContent).length - normalizeText(b.textContent).length);
 
@@ -144,7 +150,11 @@ LATENCY_PATCH_SCRIPT = r'''<script id="kaisa-latency-range-patch">
     if (!root || root.dataset.kaisaLatencyPatched === "true") return;
 
     const oneDayTrigger = findRealTrigger(root, "1天");
-    const maxTrigger = findRealTrigger(root, "90天") || Array.from(root.querySelectorAll("button, [role='tab'], .rt-SegmentedControlItem, [data-state]")).at(-1);
+    const maxTrigger =
+      findRealTrigger(root, "90天") ||
+      findRealTrigger(root, "30天") ||
+      findRealTrigger(root, "7天") ||
+      Array.from(root.querySelectorAll("button, [role='tab'], .rt-SegmentedControlItem, [data-state]")).at(-1);
     if (!oneDayTrigger || !maxTrigger) return;
 
     root.dataset.kaisaLatencyPatched = "true";
