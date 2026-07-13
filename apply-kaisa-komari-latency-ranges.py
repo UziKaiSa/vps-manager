@@ -98,39 +98,25 @@ LATENCY_PATCH_SCRIPT = r'''<script id="kaisa-latency-range-patch">
 
   const normalizeText = (value) => (value || "").replace(/\s+/g, "");
 
-  const isVisible = (node) => {
-    const rect = node.getBoundingClientRect();
-    const style = window.getComputedStyle(node);
-    return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
-  };
-
   const findLatencySegmentRoot = () => {
-    const requiredLabels = ["1小时", "6小时", "12小时", "1天"];
-    const candidates = Array.from(document.body.querySelectorAll("div, section, nav, [role='tablist'], .rt-SegmentedControlRoot"))
-      .filter((node) => {
-        if (node.dataset.kaisaLatencyPatched === "true" || !isVisible(node)) return false;
-        const text = normalizeText(node.textContent);
-        return requiredLabels.every((label) => text.includes(label));
-      })
-      .sort((a, b) => normalizeText(a.textContent).length - normalizeText(b.textContent).length);
+    const triggers = Array.from(document.querySelectorAll("button, [role='tab'], .rt-SegmentedControlItem"));
+    const hit = triggers.find((node) => normalizeText(node.textContent) === "1天");
+    if (!hit) return null;
 
-    return candidates[0] || null;
+    let current = hit;
+    for (let depth = 0; current && depth < 6; depth += 1) {
+      const text = normalizeText(current.textContent);
+      if (text.includes("1小时") && text.includes("6小时") && text.includes("12小时") && text.includes("1天")) {
+        return current;
+      }
+      current = current.parentElement;
+    }
+    return null;
   };
 
   const findRealTrigger = (root, normalizedLabel) => {
-    const hit = Array.from(root.querySelectorAll("*"))
-      .filter((node) => normalizeText(node.textContent) === normalizedLabel)
-      .sort((a, b) => normalizeText(a.textContent).length - normalizeText(b.textContent).length)[0];
-    if (!hit) return null;
-    return hit.closest("button, [role='tab'], .rt-SegmentedControlItem, [data-state]") || hit;
-  };
-
-  const activateRealTrigger = (trigger) => {
-    trigger.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, cancelable: true, pointerType: "mouse", button: 0 }));
-    trigger.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, button: 0 }));
-    trigger.dispatchEvent(new PointerEvent("pointerup", { bubbles: true, cancelable: true, pointerType: "mouse", button: 0 }));
-    trigger.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true, button: 0 }));
-    trigger.click();
+    return Array.from(root.querySelectorAll("button, [role='tab'], .rt-SegmentedControlItem"))
+      .find((node) => normalizeText(node.textContent) === normalizedLabel);
   };
 
   const setActive = (panel, hours) => {
@@ -144,7 +130,7 @@ LATENCY_PATCH_SCRIPT = r'''<script id="kaisa-latency-range-patch">
     if (!root || root.dataset.kaisaLatencyPatched === "true") return;
 
     const oneDayTrigger = findRealTrigger(root, "1天");
-    const maxTrigger = findRealTrigger(root, "90天") || Array.from(root.querySelectorAll("button, [role='tab'], .rt-SegmentedControlItem, [data-state]")).at(-1);
+    const maxTrigger = findRealTrigger(root, "90天") || Array.from(root.querySelectorAll("button, [role='tab'], .rt-SegmentedControlItem")).at(-1);
     if (!oneDayTrigger || !maxTrigger) return;
 
     root.dataset.kaisaLatencyPatched = "true";
@@ -162,23 +148,14 @@ LATENCY_PATCH_SCRIPT = r'''<script id="kaisa-latency-range-patch">
       button.className = "kaisa-latency-range-button";
       button.addEventListener("click", () => {
         state.selectedHours = hours;
+        state.pendingOverrideHours = hours;
         state.lastRealTriggerAt = Date.now();
         setActive(panel, hours);
 
-        if (hours === 24) {
-          state.pendingOverrideHours = null;
-          activateRealTrigger(oneDayTrigger);
-          return;
-        }
-
-        state.pendingOverrideHours = null;
-        activateRealTrigger(oneDayTrigger);
-
-        window.setTimeout(() => {
-          state.pendingOverrideHours = hours;
-          state.lastRealTriggerAt = Date.now();
-          activateRealTrigger(maxTrigger);
-        }, 80);
+        const trigger = hours === 24 ? oneDayTrigger : maxTrigger;
+        trigger.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, button: 0 }));
+        trigger.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true, button: 0 }));
+        trigger.click();
 
         window.setTimeout(() => {
           if (Date.now() - state.lastRealTriggerAt >= 1400) {
