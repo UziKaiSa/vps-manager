@@ -186,6 +186,43 @@ sudo -E ./install-komari-warp-agent.sh --install-agent
 sudo ./install-komari-warp-agent.sh --skip-agent
 ```
 
+## Komari 延迟范围脚本
+
+仓库里还包含一个可选脚本：
+
+```text
+apply-kaisa-komari-latency-ranges.py
+```
+
+这个脚本用于向 Komari SQLite 数据库写入 `configs.custom_body`，把实例详情页的延迟时间范围改为：
+
+```text
+1 天 / 3 天 / 7 天 / 10 天 / 30 天 / 60 天 / 90 天
+```
+
+同时会把 `configs.ping_record_preserve_time` 设置为 `2160` 小时，也就是保留 90 天延迟记录。
+
+运行示例：
+
+```bash
+python3 apply-kaisa-komari-latency-ranges.py --db ./data/komari.db
+```
+
+也可以使用环境变量：
+
+```bash
+export KOMARI_DB_PATH=./data/komari.db
+python3 apply-kaisa-komari-latency-ranges.py
+```
+
+默认会先备份数据库到：
+
+```text
+<db_dir>/theme-backups/<db_name>.before-kaisa-latency-ranges-<timestamp>
+```
+
+如果 Komari 后续更新导致前端页面结构变化，可能需要重新运行脚本或适配注入逻辑。脚本本身放在仓库里，便于更新后恢复当前 KaiSa 看板配置。
+
 ## Komari 看板主题脚本
 
 仓库里还包含一个可选脚本：
