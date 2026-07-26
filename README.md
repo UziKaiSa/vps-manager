@@ -18,7 +18,8 @@
 - 检查部分 SOCKS5 域名解析/连接问题并应用 IPv4 兜底
 - 输出可直接放进 Clash/Mihomo YAML 的节点内容
 - 查看、导入、重命名和重新分组 YAML 节点
-- 生成 Windows、Linux 和 macOS 的 SSH 密钥命令
+- 提供独立的 Windows SSH 公钥和私钥生成脚本
+- 在 Linux 主脚本中提供 SSH 公钥校验、写入和加固管理
 - 安装或管理 Komari Agent
 - 使用内置流程配置 Cloudflare WARP 私网
 - 查看系统、BBR、Xray、Komari 和 WARP 状态
@@ -64,7 +65,7 @@ sudo ./vps-manager.sh
 ./vps-manager.sh
 ```
 
-### Windows：仅生成 SSH 公钥和私钥
+## Windows 使用方法：仅生成 SSH 公钥和私钥
 
 Windows 用户可以单独下载密钥生成脚本：
 
@@ -80,6 +81,8 @@ Invoke-WebRequest `
 powershell.exe -NoProfile -ExecutionPolicy Bypass `
   -File ".\windows-ssh-key.ps1"
 ```
+
+Windows 不需要执行 `chmod +x`。上面的 `-ExecutionPolicy Bypass` 只对这一次 PowerShell 进程生效，用于执行刚下载的脚本，不会永久修改系统执行策略。
 
 默认生成位置：
 
