@@ -58,6 +58,53 @@ cd vps-manager
 sudo ./vps-manager.sh
 ```
 
+### 方法四：Windows PowerShell + WSL
+
+在 Windows PowerShell 中下载脚本：
+
+```powershell
+Invoke-WebRequest `
+  -Uri "https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh" `
+  -OutFile ".\vps-manager.sh"
+```
+
+然后通过 WSL 赋予执行权限并运行：
+
+```powershell
+wsl chmod +x ./vps-manager.sh
+wsl sudo ./vps-manager.sh
+```
+
+预览模式：
+
+```powershell
+wsl bash ./vps-manager.sh --demo
+```
+
+### 方法五：Windows 下载后上传到 VPS
+
+先在 Windows PowerShell 中下载：
+
+```powershell
+Invoke-WebRequest `
+  -Uri "https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh" `
+  -OutFile ".\vps-manager.sh"
+```
+
+上传到 VPS：
+
+```powershell
+scp .\vps-manager.sh user@服务器地址:/tmp/vps-manager.sh
+```
+
+远程赋予执行权限并启动脚本：
+
+```powershell
+ssh -t user@服务器地址 "chmod +x /tmp/vps-manager.sh && sudo /tmp/vps-manager.sh"
+```
+
+> `user` 和 `服务器地址` 需要替换为实际 SSH 用户和 VPS IP/域名。该脚本面向 Debian/Ubuntu，不能直接在原生 Windows PowerShell 中执行；Windows 端需要使用 WSL，或者上传到 Linux VPS 后执行。
+
 如果当前已经是 root，可以直接运行：
 
 ```bash
