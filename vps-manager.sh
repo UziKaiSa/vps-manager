@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.6.0-test"
+SCRIPT_VERSION="0.6.1-test"
 SCRIPT_NAME="VPS Manager"
 
 XRAY_BIN="/usr/local/bin/xray"
@@ -1677,7 +1677,7 @@ configure_xray() {
   install -d -o root -g root -m 755 "$(dirname "${XRAY_CONFIG}")"
   install -d -o root -g root -m 700 "${STATE_DIR}"
 
-  staged_config="$(mktemp "$(dirname "${XRAY_CONFIG}")/.config.json.XXXXXX")"
+  staged_config="$(mktemp "$(dirname "${XRAY_CONFIG}")/.config.XXXXXX.json")"
   staged_state="$(mktemp "${STATE_DIR}/.state.json.XXXXXX")"
   staged_info="$(mktemp "${STATE_DIR}/.last-install.txt.XXXXXX")"
   staged_yaml="$(mktemp "${STATE_DIR}/.proxies.yaml.XXXXXX")"
@@ -2169,7 +2169,7 @@ validate_candidate_as_service_user() {
     return 1
   }
   service_group="$(id -gn "${service_user}")" || return 1
-  staged="$(mktemp "$(dirname "${XRAY_CONFIG}")/.vps-manager-check.XXXXXX")" || return 1
+  staged="$(mktemp "$(dirname "${XRAY_CONFIG}")/.vps-manager-check.XXXXXX.json")" || return 1
   if ! install -o root -g "${service_group}" -m 640 "${XRAY_CANDIDATE_CONFIG}" "${staged}"; then
     rm -f -- "${staged}"
     return 1
@@ -2258,7 +2258,7 @@ apply_xray_candidate() {
   service_user="$(xray_service_user)" || return 1
   service_group="$(id -gn "${service_user}")" || return 1
   install -d -o root -g root -m 700 "${STATE_DIR}" || return 1
-  staged_config="$(mktemp "$(dirname "${XRAY_CONFIG}")/.config.json.XXXXXX")" || return 1
+  staged_config="$(mktemp "$(dirname "${XRAY_CONFIG}")/.config.XXXXXX.json")" || return 1
   staged_state="$(mktemp "${STATE_DIR}/.state.json.XXXXXX")" || { rm -f -- "${staged_config}"; return 1; }
   staged_info="$(mktemp "${STATE_DIR}/.last-install.txt.XXXXXX")" || { rm -f -- "${staged_config}" "${staged_state}"; return 1; }
   staged_yaml="$(mktemp "${STATE_DIR}/.proxies.yaml.XXXXXX")" || { rm -f -- "${staged_config}" "${staged_state}" "${staged_info}"; return 1; }
