@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.7.2-test"
+SCRIPT_VERSION="0.7.3-test"
 SCRIPT_NAME="VPS Manager"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh"
 
@@ -274,6 +274,19 @@ port_is_listening() {
 }
 
 
+wait_for_port_listening() {
+  local port="$1"
+  local timeout_seconds="${2:-10}"
+  local attempt
+
+  for ((attempt = 0; attempt < timeout_seconds; attempt++)); do
+    port_is_listening "${port}" && return 0
+    sleep 1
+  done
+  port_is_listening "${port}"
+}
+
+
 detect_public_address() {
   local address
 
@@ -416,6 +429,8 @@ configure_ssh_hardening() {
   local key_check
   local key_type
   local key_blob
+  local use_existing_authorized_keys=0
+  local private_key_confirmation
   local authorized_keys
   local ssh_service
   local public_address
@@ -462,11 +477,14 @@ configure_ssh_hardening() {
   done
 
   if [[ "${DEMO_MODE}" == "1" ]]; then
-    read -r -p "粘贴 SSH 公钥（预览可直接回车）: " public_key || true
-    public_key="${public_key:-ssh-ed25519 <在这里粘贴你的公钥>}"
+    read -r -p "粘贴 SSH 公钥（已有有效 authorized_keys 时可直接回车）: " public_key || true
     log "[预览] SSH 密钥登录配置（不会修改系统）"
-    printf '将把公钥追加到：%s\n' "${authorized_keys}"
-    printf '公钥内容：%s\n' "${public_key}"
+    if [[ -n "${public_key}" ]]; then
+      printf '将把公钥追加到：%s\n' "${authorized_keys}"
+      printf '公钥内容：%s\n' "${public_key}"
+    else
+      printf '将沿用 %s 中已有的有效公钥。\n' "${authorized_keys}"
+    fi
     printf '将写入：%s\n' "${SSHD_MANAGED_CONFIG}"
     cat <<EOF
 Port ${ssh_port}
@@ -495,9 +513,29 @@ EOF
 
   ensure_work_dir
   key_check="${WORK_DIR}/key-check.pub"
+  [[ ! -L "${admin_home}/.ssh" && ! -L "${authorized_keys}" ]] \
+    || die "检测到 .ssh 或 authorized_keys 是符号链接，已停止以避免写错目标。"
   while true; do
-    read -r -p "粘贴 SSH 公钥（以 ssh-ed25519、ecdsa 或 ssh-rsa 开头）: " public_key
+    if [[ -s "${authorized_keys}" ]] \
+      && ssh-keygen -l -f "${authorized_keys}" >/dev/null 2>&1; then
+      read -r -p "粘贴 SSH 公钥（已有有效 authorized_keys，直接回车可沿用）: " public_key
+    else
+      read -r -p "粘贴 SSH 公钥（以 ssh-ed25519、ecdsa 或 ssh-rsa 开头）: " public_key
+    fi
     public_key="${public_key%$'\r'}"
+
+    if [[ -z "${public_key}" ]]; then
+      if [[ -s "${authorized_keys}" ]] \
+        && ssh-keygen -l -f "${authorized_keys}" >/dev/null 2>&1; then
+        use_existing_authorized_keys=1
+        key_blob=""
+        printf '将沿用 %s 中已有的有效公钥。\n' "${authorized_keys}"
+        break
+      fi
+      warn "当前 authorized_keys 中没有可验证的公钥，必须粘贴一整行 SSH 公钥。"
+      continue
+    fi
+
     printf '%s\n' "${public_key}" > "${key_check}"
     chmod 600 "${key_check}"
     key_type="$(awk '{print $1}' "${key_check}")"
@@ -509,18 +547,23 @@ EOF
         ;;
     esac
     if ssh-keygen -l -f "${key_check}" >/dev/null 2>&1; then
+      key_blob="$(awk '{print $2}' "${key_check}")"
       break
     fi
     warn "ssh-keygen 无法验证该公钥，请重新粘贴。"
   done
-  key_blob="$(awk '{print $2}' "${key_check}")"
   rm -f -- "${key_check}"
 
   warn "不要关闭当前 SSH 窗口。修改后必须用第二个终端测试，失败时脚本会回滚。"
   printf '请先在云厂商安全组中放行：%s/tcp\n' "${ssh_port}"
   prompt_yes_no "确认云安全组已经放行 ${ssh_port}/tcp" "0" \
     || { printf '已取消 SSH 加固，未修改配置。\n'; return 0; }
-  prompt_yes_no "确认你持有该公钥对应的私钥" "0" \
+  if [[ "${use_existing_authorized_keys}" == "1" ]]; then
+    private_key_confirmation="确认你持有 authorized_keys 中至少一把公钥对应的私钥"
+  else
+    private_key_confirmation="确认你持有该公钥对应的私钥"
+  fi
+  prompt_yes_no "${private_key_confirmation}" "0" \
     || { printf '已取消 SSH 加固，未修改配置。\n'; return 0; }
 
   if command -v ufw >/dev/null 2>&1 \
@@ -556,8 +599,9 @@ EOF
   fi
 
   cp -a -- "${authorized_keys}" "${WORK_DIR}/authorized_keys.new"
-  if ! awk -v blob="${key_blob}" '$2 == blob {found=1} END {exit !found}' \
-    "${WORK_DIR}/authorized_keys.new"; then
+  if [[ "${use_existing_authorized_keys}" != "1" ]] \
+    && ! awk -v blob="${key_blob}" '$2 == blob {found=1} END {exit !found}' \
+      "${WORK_DIR}/authorized_keys.new"; then
     printf '%s\n' "${public_key}" >> "${WORK_DIR}/authorized_keys.new"
   fi
   install -o "${admin_user}" -g "${admin_group}" -m 600 \
@@ -625,7 +669,7 @@ EOF
     die "SSH reload 失败，已恢复。"
   fi
 
-  if ! port_is_listening "${ssh_port}"; then
+  if ! wait_for_port_listening "${ssh_port}" 10; then
     rollback_ssh_hardening \
       "${config_existed}" "${config_before}" \
       "${authorized_existed}" "${authorized_before}" "${authorized_keys}" \
@@ -2563,7 +2607,7 @@ add_ssh_public_key() {
 ssh_key_helper_menu() {
   local choice key_name key_comment public_key key_file admin_user admin_home authorized_keys
   while true; do
-    printf '\nSSH 密钥与加固管理：\n  1) Linux/macOS 生成并读取公钥\n  2) 校验 SSH 公钥并显示指纹\n  3) 添加公钥到当前管理用户 authorized_keys\n  4) 配置 SSH 高位端口和仅密钥登录\n  5) 查看当前管理用户 authorized_keys\n  0) 返回\n'
+    printf '\nSSH 密钥与加固管理：\n  1) Linux/macOS 生成并读取公钥\n  2) 校验 SSH 公钥并显示指纹\n  3) 配置 SSH 高位端口和仅密钥登录\n  4) 添加公钥到当前管理用户 authorized_keys\n  5) 查看当前管理用户 authorized_keys\n  0) 返回\n'
     read -r -p "请选择 [0]: " choice
     case "${choice:-0}" in
       1)
@@ -2584,10 +2628,10 @@ ssh_key_helper_menu() {
         ssh-keygen -l -f "${key_file}" && printf '公钥有效，可粘贴到 SSH 加固流程。\n' || warn "公钥格式无效。"
         ;;
       3)
-        add_ssh_public_key || true
+        configure_ssh_hardening || true
         ;;
       4)
-        configure_ssh_hardening || true
+        add_ssh_public_key || true
         ;;
       5)
         admin_user="$(default_ssh_admin_user)"; admin_home="$(getent passwd "${admin_user}" 2>/dev/null | cut -d: -f6)"
