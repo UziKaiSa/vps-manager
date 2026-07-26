@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.6.2-test"
+SCRIPT_VERSION="0.7.0-test"
 SCRIPT_NAME="VPS Manager"
+SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh"
 
 XRAY_BIN="/usr/local/bin/xray"
 XRAY_CONFIG="/usr/local/etc/xray/config.json"
@@ -2473,10 +2474,96 @@ show_connection_info() {
 }
 
 
+add_ssh_public_key() {
+  local admin_user admin_home admin_group authorized_keys public_key key_file key_type key_blob
+  local fingerprint candidate staged="" backup_dir=""
+
+  require_root
+  admin_user="$(default_ssh_admin_user)"
+  id "${admin_user}" >/dev/null 2>&1 \
+    || { warn "无法识别当前管理用户：${admin_user}"; return 1; }
+
+  admin_home="$(getent passwd "${admin_user}" 2>/dev/null | cut -d: -f6)"
+  admin_group="$(id -gn "${admin_user}")"
+  [[ "${admin_home}" == /* && "${admin_home}" != "/" ]] \
+    || { warn "用户主目录不安全或无效：${admin_home}"; return 1; }
+  authorized_keys="${admin_home}/.ssh/authorized_keys"
+
+  read -r -p "粘贴要添加的 SSH 公钥完整一行: " public_key
+  public_key="${public_key%$'\r'}"
+  ensure_work_dir
+  key_file="${WORK_DIR}/public-key-to-add.pub"
+  printf '%s\n' "${public_key}" > "${key_file}"
+  chmod 600 "${key_file}"
+
+  command -v ssh-keygen >/dev/null 2>&1 \
+    || { warn "缺少 ssh-keygen，请先运行初始化安装基础工具。"; return 1; }
+  key_type="$(awk '{print $1}' "${key_file}")"
+  case "${key_type}" in
+    ssh-ed25519|ssh-rsa|ecdsa-sha2-*|sk-ssh-ed25519@openssh.com|sk-ecdsa-sha2-*@openssh.com) ;;
+    *)
+      warn "公钥类型或格式不正确，请粘贴 .pub 文件中的完整一行。"
+      return 1
+      ;;
+  esac
+  if ! fingerprint="$(ssh-keygen -l -f "${key_file}" 2>/dev/null)"; then
+    warn "ssh-keygen 无法验证该公钥。"
+    return 1
+  fi
+  key_blob="$(awk '{print $2}' "${key_file}")"
+
+  printf '管理用户：%s\n写入文件：%s\n公钥指纹：%s\n' \
+    "${admin_user}" "${authorized_keys}" "${fingerprint}"
+  if [[ "${DEMO_MODE}" == "1" ]]; then
+    log "[预览] 将把该公钥添加到 authorized_keys；不会修改端口或登录方式。"
+    return 0
+  fi
+
+  [[ ! -L "${admin_home}/.ssh" && ! -L "${authorized_keys}" ]] \
+    || { warn "检测到 .ssh 或 authorized_keys 是符号链接，已停止以避免写错目标。"; return 1; }
+
+  if [[ -f "${authorized_keys}" ]] \
+    && awk -v blob="${key_blob}" '$2 == blob { found=1 } END { exit !found }' "${authorized_keys}"; then
+    printf '该公钥已存在，无需重复写入。\n'
+    return 0
+  fi
+  prompt_yes_no "确认把该公钥添加到 ${admin_user} 的 authorized_keys" "0" \
+    || { printf '已取消，系统没有变化。\n'; return 0; }
+
+  install -d -o "${admin_user}" -g "${admin_group}" -m 700 "${admin_home}/.ssh" \
+    || { warn "无法创建或修正 ${admin_home}/.ssh。"; return 1; }
+  candidate="${WORK_DIR}/authorized_keys.new"
+  if [[ -f "${authorized_keys}" ]]; then
+    cp -a -- "${authorized_keys}" "${candidate}" \
+      || { warn "无法读取现有 authorized_keys。"; return 1; }
+    backup_dir="$(backup_file "${authorized_keys}" "authorized-keys")" \
+      || { warn "无法备份现有 authorized_keys。"; return 1; }
+  else
+    : > "${candidate}"
+  fi
+  printf '%s\n' "${public_key}" >> "${candidate}"
+
+  staged="$(mktemp "${admin_home}/.ssh/.authorized_keys.XXXXXX")" \
+    || { warn "无法创建 authorized_keys 临时文件。"; return 1; }
+  if ! install -o "${admin_user}" -g "${admin_group}" -m 600 "${candidate}" "${staged}"; then
+    rm -f -- "${staged}"
+    warn "无法准备新的 authorized_keys。"
+    return 1
+  fi
+  if ! mv -f -- "${staged}" "${authorized_keys}"; then
+    rm -f -- "${staged}"
+    warn "无法替换 authorized_keys，原文件未改变。"
+    return 1
+  fi
+
+  log "公钥已添加到 ${authorized_keys}"
+  [[ -n "${backup_dir}" ]] && printf '原文件备份：%s\n' "${backup_dir}"
+}
+
 ssh_key_helper_menu() {
   local choice key_name key_comment public_key key_file admin_user admin_home authorized_keys
   while true; do
-    printf '\nSSH 客户端密钥助手：\n  1) Windows PowerShell 生成并读取公钥\n  2) Linux/macOS 生成并读取公钥\n  3) 校验 SSH 公钥并显示指纹\n  4) 查看当前管理用户 authorized_keys\n  0) 返回\n'
+    printf '\nSSH 密钥与加固管理：\n  1) Windows PowerShell 生成并读取公钥\n  2) Linux/macOS 生成并读取公钥\n  3) 校验 SSH 公钥并显示指纹\n  4) 添加公钥到当前管理用户 authorized_keys\n  5) 配置 SSH 高位端口和仅密钥登录\n  6) 查看当前管理用户 authorized_keys\n  0) 返回\n'
     read -r -p "请选择 [0]: " choice
     case "${choice:-0}" in
       1)
@@ -2508,6 +2595,12 @@ ssh_key_helper_menu() {
         ssh-keygen -l -f "${key_file}" && printf '公钥有效，可粘贴到 SSH 加固流程。\n' || warn "公钥格式无效。"
         ;;
       4)
+        add_ssh_public_key || true
+        ;;
+      5)
+        configure_ssh_hardening || true
+        ;;
+      6)
         admin_user="$(default_ssh_admin_user)"; admin_home="$(getent passwd "${admin_user}" 2>/dev/null | cut -d: -f6)"
         authorized_keys="${admin_home}/.ssh/authorized_keys"
         printf '管理用户：%s\n文件：%s\n\n' "${admin_user}" "${authorized_keys}"
@@ -2949,6 +3042,88 @@ show_system_status() {
 }
 
 
+current_script_path() {
+  local path
+  path="$(readlink -f -- "$0" 2>/dev/null || true)"
+  [[ -n "${path}" && -f "${path}" ]] || return 1
+  printf '%s' "${path}"
+}
+
+
+update_current_script() {
+  local target candidate staged new_version
+
+  require_root
+  target="$(current_script_path)" \
+    || { warn "无法确定当前 .sh 文件；通过管道或 /dev/fd 运行时不能自更新。"; return 1; }
+  printf '当前脚本：%s\n更新来源：%s\n' "${target}" "${SCRIPT_UPDATE_URL}"
+  if [[ "${DEMO_MODE}" == "1" ]]; then
+    log "[预览] 将下载、校验并覆盖当前脚本；不会修改任何文件。"
+    return 0
+  fi
+  prompt_yes_no "确认从 GitHub main 更新当前脚本" "0" \
+    || { printf '已取消，脚本没有变化。\n'; return 0; }
+
+  ensure_work_dir
+  candidate="${WORK_DIR}/vps-manager.sh"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fL --retry 3 --connect-timeout 15 "${SCRIPT_UPDATE_URL}" -o "${candidate}" \
+      || { warn "从 GitHub 下载脚本失败。"; return 1; }
+  elif command -v wget >/dev/null 2>&1; then
+    wget -O "${candidate}" "${SCRIPT_UPDATE_URL}" \
+      || { warn "从 GitHub 下载脚本失败。"; return 1; }
+  else
+    warn "缺少 curl 和 wget，请先运行初始化。"
+    return 1
+  fi
+
+  bash -n "${candidate}" \
+    || { warn "下载的脚本未通过 Bash 语法校验，当前脚本未改变。"; return 1; }
+  grep -Fq 'SCRIPT_NAME="VPS Manager"' "${candidate}" \
+    || { warn "下载内容不是预期的 VPS Manager 脚本，当前脚本未改变。"; return 1; }
+  new_version="$(sed -n 's/^SCRIPT_VERSION="\([^"]*\)"/\1/p' "${candidate}" | head -n 1)"
+  [[ -n "${new_version}" ]] \
+    || { warn "无法识别下载脚本的版本，当前脚本未改变。"; return 1; }
+
+  staged="$(mktemp "${target}.update.XXXXXX")" \
+    || { warn "无法在当前脚本目录创建更新文件。"; return 1; }
+  if ! install -m 700 "${candidate}" "${staged}"; then
+    rm -f -- "${staged}"
+    warn "无法准备更新文件。"
+    return 1
+  fi
+  if ! mv -f -- "${staged}" "${target}"; then
+    rm -f -- "${staged}"
+    warn "无法覆盖当前脚本，原文件未改变。"
+    return 1
+  fi
+  log "脚本已更新为 ${new_version}"
+  printf '请退出后重新运行：sudo %s\n' "${target}"
+}
+
+
+delete_current_script() {
+  local target
+
+  require_root
+  target="$(current_script_path)" \
+    || { warn "无法确定当前 .sh 文件；通过管道或 /dev/fd 运行时不能自删除。"; return 1; }
+  printf '将只删除当前脚本：%s\n' "${target}"
+  printf 'Xray、SSH、YAML、Komari 配置和备份都不会删除。\n'
+  if [[ "${DEMO_MODE}" == "1" ]]; then
+    log "[预览] 不会删除任何文件。"
+    return 1
+  fi
+  prompt_yes_no "确认永久删除这个 .sh 文件" "0" \
+    || { printf '已取消，脚本没有变化。\n'; return 1; }
+  rm -f -- "${target}" \
+    || { warn "删除脚本失败。"; return 1; }
+  [[ ! -e "${target}" ]] \
+    || { warn "脚本仍然存在，删除未完成。"; return 1; }
+  log "已删除 ${target}"
+  return 0
+}
+
 initialize_environment() {
   require_root
   install_base_tools
@@ -2959,11 +3134,6 @@ initialize_environment() {
     printf '已跳过 BBR。\n'
   fi
 
-  if prompt_yes_no "是否继续配置 SSH 高位端口和仅密钥登录" "1"; then
-    configure_ssh_hardening
-  else
-    printf '已跳过 SSH 加固。\n'
-  fi
 }
 
 
@@ -3002,7 +3172,7 @@ ${SCRIPT_NAME} ${SCRIPT_VERSION}
 测试版支持 Debian/Ubuntu + systemd。
 SSH 加固会在 reload 后要求使用第二个终端验证，失败则自动恢复。
 首次生成或更新 Xray 配置时，仅检测新增或链接变化的 SOCKS5 出口。
-SSH 密钥助手只生成客户端命令，不会在 VPS 上创建或显示私钥。
+SSH 密钥与加固管理可以写入公钥，但不会在 VPS 上创建或显示客户端私钥。
 YAML 管理仅重写 proxies 和 proxy-groups，并在确认前显示 diff。
 EOF
 }
@@ -3024,12 +3194,14 @@ main_menu() {
   check_supported_os
   while true; do
     show_banner
-    printf '  1) 初始化环境：基础工具，可选 BBR 和 SSH 加固\n'
+    printf '  1) 初始化环境：基础工具和可选 BBR\n'
     printf '  2) Xray 管理：安装、首次配置或更新现有配置\n'
-    printf '  3) SSH 客户端密钥助手\n'
+    printf '  3) SSH 密钥与加固管理\n'
     printf '  4) YAML 管理：查看、导入节点、更新名称和分组\n'
     printf '  5) 安装/管理 Komari Agent\n'
     printf '  6) 状态检查\n'
+    printf '  7) 从 GitHub 更新当前脚本\n'
+    printf '  8) 删除当前 .sh 脚本\n'
     printf '  0) 退出\n'
     read -r -p "请选择: " choice
     case "${choice}" in
@@ -3039,6 +3211,8 @@ main_menu() {
       4) yaml_management_menu; pause_screen ;;
       5) komari_menu; pause_screen ;;
       6) show_system_status; pause_screen ;;
+      7) update_current_script || true; pause_screen ;;
+      8) if delete_current_script; then return 0; fi ;;
       0) printf '已退出。\n'; return 0 ;;
       *) warn "未知选项：${choice}" ;;
     esac
