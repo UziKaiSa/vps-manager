@@ -2,7 +2,7 @@
 
 `VPS Manager` 是一个面向 Debian/Ubuntu VPS 的中文交互式管理脚本，用于完成服务器初始化、SSH 加固、Xray 配置、Clash/Mihomo YAML 管理，以及 Komari Agent/WARP 私网接入。
 
-当前版本：`0.7.4-test`
+当前版本：`0.7.5-test`
 
 > 目前是测试版。首次在正式服务器上使用前，建议先运行预览模式，并保留一个已经登录的 SSH 终端。
 
@@ -102,7 +102,9 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
   -Comment "my-vps"
 ```
 
-脚本只负责生成密钥文件并显示公钥内容，不连接 VPS、不写入 `authorized_keys`，也不修改 Windows 或服务器的 SSH 配置。已有同名密钥时会停止，不会覆盖。
+脚本默认只生成密钥文件并显示公钥内容，不连接 VPS、不写入 `authorized_keys`，也不修改服务器配置；只有在你确认配置快捷名称后，才会更新本机 Windows 的 SSH config。已有同名密钥时会停止，不会覆盖。
+
+密钥生成后，脚本会询问是否配置 SSH 快捷名称。选择后需要填写快捷名称、服务器 IP/域名、SSH 用户和端口，配置会写入 `%USERPROFILE%\.ssh\config`；以后可以直接执行 `ssh 快捷名称`。已有同名 `Host` 时会明确提示，并询问是否换一个名称，绝不会覆盖原配置。
 
 > `vps-manager.sh` 仍然需要在 Debian/Ubuntu VPS 中运行，不能直接在原生 Windows PowerShell 中执行。
 
@@ -255,7 +257,7 @@ ss://BASE64(加密方式:密码)@IP或域名:端口
 子菜单：
 
 ```text
-1) Linux/macOS 生成并读取公钥
+1) 本机 Linux 生成密钥并可配置快捷名称
 2) 校验 SSH 公钥并显示指纹
 3) 配置 SSH 高位端口和仅密钥登录
 4) 添加公钥到当前管理用户 authorized_keys
@@ -263,7 +265,9 @@ ss://BASE64(加密方式:密码)@IP或域名:端口
 0) 返回
 ```
 
-Linux/macOS 密钥助手同样只要求输入文件名后缀。例如输入 `GB`，会输出生成 `~/.ssh/id_ed25519_GB` 和 `~/.ssh/id_ed25519_GB.pub` 的命令；直接回车使用默认后缀 `vps-manager`。
+“本机 Linux 生成密钥”会直接操作当前管理用户的 `~/.ssh`。例如输入后缀 `GB`，会实际生成 `~/.ssh/id_ed25519_GB` 和 `~/.ssh/id_ed25519_GB.pub`；直接回车使用默认后缀 `vps-manager`。可以选择是否为私钥设置密码。
+
+密钥生成后还可以配置本机 SSH 快捷名称。填写快捷名称、服务器地址、用户和端口后，脚本会写入当前管理用户的 `~/.ssh/config`；以后可以直接执行 `ssh 快捷名称`。如果同名 `Host` 已存在，脚本会明确提示并询问是否换一个名称；选择否则取消写入，原配置不会变化。
 
 当前管理用户自动使用运行脚本的登录用户，不需要另外填写用户名。
 

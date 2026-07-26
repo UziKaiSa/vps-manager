@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.7.4-test"
+SCRIPT_VERSION="0.7.5-test"
 SCRIPT_NAME="VPS Manager"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh"
 
@@ -2604,27 +2604,159 @@ add_ssh_public_key() {
   [[ -n "${backup_dir}" ]] && printf '原文件备份：%s\n' "${backup_dir}"
 }
 
-ssh_key_helper_menu() {
-  local choice key_name key_suffix key_comment public_key key_file admin_user admin_home authorized_keys
+generate_local_ssh_key() {
+  local admin_user admin_home admin_group key_suffix key_name key_comment
+  local private_key public_key ssh_config shortcut_name shortcut_host shortcut_user shortcut_port
+  local candidate staged
+  local -a keygen_cmd
+
+  admin_user="$(default_ssh_admin_user)"
+  id "${admin_user}" >/dev/null 2>&1 \
+    || { warn "无法识别当前管理用户：${admin_user}"; return 1; }
+  admin_home="$(getent passwd "${admin_user}" 2>/dev/null | cut -d: -f6)"
+  admin_group="$(id -gn "${admin_user}")"
+  [[ "${admin_home}" == /* && "${admin_home}" != "/" ]] \
+    || { warn "用户主目录不安全或无效：${admin_home}"; return 1; }
+
+  key_suffix="$(prompt_default "密钥文件名后缀（将生成 id_ed25519_后缀）" "vps-manager")"
+  key_comment="$(prompt_default "密钥备注" "vps-manager")"
+  if [[ ! "${key_suffix}" =~ ^[A-Za-z0-9._-]+$ \
+    || "${key_suffix}" == "." || "${key_suffix}" == ".." ]] \
+    || (( ${#key_suffix} > 80 )); then
+    warn "密钥文件名后缀无效。只能使用英文字母、数字、点、下划线和连字符，最长 80 个字符。"
+    return 1
+  fi
+
+  key_name="id_ed25519_${key_suffix}"
+  private_key="${admin_home}/.ssh/${key_name}"
+  public_key="${private_key}.pub"
+  if [[ -e "${private_key}" || -e "${public_key}" ]]; then
+    warn "密钥文件已经存在，为避免覆盖已停止：${private_key}"
+    return 1
+  fi
+  command -v ssh-keygen >/dev/null 2>&1 \
+    || { warn "缺少 ssh-keygen，请先运行初始化安装基础工具。"; return 1; }
+
+  if [[ "${EUID}" -eq 0 ]]; then
+    install -d -o "${admin_user}" -g "${admin_group}" -m 700 "${admin_home}/.ssh"
+  else
+    mkdir -p "${admin_home}/.ssh"
+    chmod 700 "${admin_home}/.ssh"
+  fi
+
+  keygen_cmd=(ssh-keygen -t ed25519 -a 64 -f "${private_key}" -C "${key_comment}")
+  if prompt_yes_no "是否为私钥设置密码" "0"; then
+    printf '接下来由 ssh-keygen 询问并确认私钥密码。\n'
+  else
+    keygen_cmd+=(-N "")
+  fi
+
+  if [[ "${EUID}" -eq 0 && "${admin_user}" != "root" ]]; then
+    command -v runuser >/dev/null 2>&1 \
+      || { warn "缺少 runuser，无法以 ${admin_user} 身份生成密钥。"; return 1; }
+    runuser -u "${admin_user}" -- "${keygen_cmd[@]}" \
+      || { warn "ssh-keygen 执行失败。"; return 1; }
+  else
+    "${keygen_cmd[@]}" || { warn "ssh-keygen 执行失败。"; return 1; }
+  fi
+
+  [[ -f "${private_key}" && -f "${public_key}" ]] \
+    || { warn "ssh-keygen 没有生成预期的公钥和私钥。"; return 1; }
+  printf '\nSSH 密钥生成完成。\n私钥：%s\n公钥：%s\n\n公钥内容：\n' \
+    "${private_key}" "${public_key}"
+  cat "${public_key}"
+  warn "私钥不要发送给任何人；需要提供给服务器的只能是 .pub 公钥。"
+
+  if ! prompt_yes_no "是否配置本机 SSH 快捷名称（以后可使用 ssh 名称连接）" "0"; then
+    return 0
+  fi
+  ssh_config="${admin_home}/.ssh/config"
+  [[ ! -L "${ssh_config}" ]] \
+    || { warn "${ssh_config} 是符号链接，为避免写错目标已停止。"; return 1; }
   while true; do
-    printf '\nSSH 密钥与加固管理：\n  1) Linux/macOS 生成并读取公钥\n  2) 校验 SSH 公钥并显示指纹\n  3) 配置 SSH 高位端口和仅密钥登录\n  4) 添加公钥到当前管理用户 authorized_keys\n  5) 查看当前管理用户 authorized_keys\n  0) 返回\n'
+    shortcut_name="$(prompt_default "SSH 快捷名称" "${key_suffix}")"
+    if [[ ! "${shortcut_name}" =~ ^[A-Za-z0-9._-]+$ \
+      || "${shortcut_name}" == "." || "${shortcut_name}" == ".." ]]; then
+      warn "SSH 快捷名称无效。只能使用英文字母、数字、点、下划线和连字符。"
+      continue
+    fi
+    if [[ -f "${ssh_config}" ]] \
+      && awk -v target="${shortcut_name}" '
+        tolower($1) == "host" {
+          for (i = 2; i <= NF; i++) {
+            if (tolower($i) == tolower(target)) found = 1
+          }
+        }
+        END { exit !found }
+      ' "${ssh_config}"; then
+      warn "SSH 快捷名称 ${shortcut_name} 已存在，不会覆盖已有 Host。"
+      if prompt_yes_no "是否重新输入其他快捷名称" "1"; then
+        continue
+      fi
+      printf '已取消写入 SSH 快捷配置，现有配置没有变化。\n'
+      return 0
+    fi
+    break
+  done
+  while true; do
+    read -r -p "服务器 IP 或域名: " shortcut_host
+    if [[ -n "${shortcut_host}" \
+      && "${shortcut_host}" != *[[:space:]]* \
+      && "${shortcut_host}" != *"/"* ]]; then
+      break
+    fi
+    warn "服务器地址不能为空，也不能包含空格或斜杠。"
+  done
+  shortcut_user="$(prompt_default "SSH 用户名" "root")"
+  [[ "${shortcut_user}" =~ ^[A-Za-z0-9._-]+$ ]] \
+    || { warn "SSH 用户名无效，未写入配置。"; return 1; }
+  while true; do
+    shortcut_port="$(prompt_default "SSH 端口" "22")"
+    validate_port "${shortcut_port}" && break
+    warn "SSH 端口必须在 1-65535 之间。"
+  done
+
+  ensure_work_dir
+  candidate="${WORK_DIR}/ssh-config.new"
+  if [[ -f "${ssh_config}" ]]; then
+    cp -a -- "${ssh_config}" "${candidate}"
+    [[ ! -s "${candidate}" ]] || printf '\n' >> "${candidate}"
+  else
+    : > "${candidate}"
+  fi
+  cat >> "${candidate}" <<EOF
+Host ${shortcut_name}
+    HostName ${shortcut_host}
+    User ${shortcut_user}
+    Port ${shortcut_port}
+    IdentityFile ~/.ssh/${key_name}
+    IdentitiesOnly yes
+EOF
+
+  staged="$(mktemp "${admin_home}/.ssh/.config.XXXXXX")" \
+    || { warn "无法创建 SSH config 临时文件。"; return 1; }
+  if [[ "${EUID}" -eq 0 ]]; then
+    install -o "${admin_user}" -g "${admin_group}" -m 600 "${candidate}" "${staged}"
+  else
+    install -m 600 "${candidate}" "${staged}"
+  fi
+  if ! mv -f -- "${staged}" "${ssh_config}"; then
+    rm -f -- "${staged}"
+    warn "无法写入 ${ssh_config}。"
+    return 1
+  fi
+  printf 'SSH 快捷名称已写入：%s\n以后可以直接连接：ssh %s\n' \
+    "${ssh_config}" "${shortcut_name}"
+}
+
+ssh_key_helper_menu() {
+  local choice public_key key_file admin_user admin_home authorized_keys
+  while true; do
+    printf '\nSSH 密钥与加固管理：\n  1) 本机 Linux 生成密钥并可配置快捷名称\n  2) 校验 SSH 公钥并显示指纹\n  3) 配置 SSH 高位端口和仅密钥登录\n  4) 添加公钥到当前管理用户 authorized_keys\n  5) 查看当前管理用户 authorized_keys\n  0) 返回\n'
     read -r -p "请选择 [0]: " choice
     case "${choice:-0}" in
       1)
-        key_suffix="$(prompt_default "密钥文件名后缀（将生成 id_ed25519_后缀）" "vps-manager")"
-        key_comment="$(prompt_default "密钥备注" "vps-manager")"
-        if [[ ! "${key_suffix}" =~ ^[A-Za-z0-9._-]+$ \
-          || "${key_suffix}" == "." || "${key_suffix}" == ".." ]] \
-          || (( ${#key_suffix} > 80 )); then
-          warn "密钥文件名后缀无效。只能使用英文字母、数字、点、下划线和连字符，最长 80 个字符。"
-          continue
-        fi
-        key_name="id_ed25519_${key_suffix}"
-        printf '\n请在需要连接 VPS 的 Linux/macOS 客户端执行：\n\n'
-        printf 'mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"\n'
-        printf 'ssh-keygen -t ed25519 -a 64 -f "$HOME/.ssh/%s" -C "%s"\n' "${key_name}" "${key_comment}"
-        printf 'cat "$HOME/.ssh/%s.pub"\n' "${key_name}"
-        warn "只粘贴 .pub 的完整一行；不要发送不带 .pub 后缀的私钥。"
+        generate_local_ssh_key || true
         ;;
       2)
         read -r -p "粘贴 SSH 公钥完整一行: " public_key
