@@ -1,0 +1,2992 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_VERSION="0.6.0-test"
+SCRIPT_NAME="VPS Manager"
+
+XRAY_BIN="/usr/local/bin/xray"
+XRAY_CONFIG="/usr/local/etc/xray/config.json"
+XRAY_INSTALL_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
+KOMARI_INSTALL_URL="https://raw.githubusercontent.com/komari-monitor/komari-agent/refs/heads/main/install.sh"
+KOMARI_DEFAULT_TEAM="your-team-name"
+KOMARI_DEFAULT_PRIVATE_URL="http://komari.example.internal:8080"
+KOMARI_TOKEN_ENV_FILE="/root/warp-token.env"
+
+SSHD_MAIN_CONFIG="/etc/ssh/sshd_config"
+SSHD_DROPIN_DIR="/etc/ssh/sshd_config.d"
+SSHD_MANAGED_CONFIG="${SSHD_DROPIN_DIR}/00-vps-manager-hardening.conf"
+
+STATE_DIR="/etc/vps-manager"
+STATE_FILE="${STATE_DIR}/state.json"
+INFO_FILE="${STATE_DIR}/last-install.txt"
+YAML_FILE="${STATE_DIR}/proxies.yaml"
+BACKUP_ROOT="/var/backups/vps-manager"
+
+DEMO_MODE=0
+WORK_DIR=""
+DEMO_CONFIG_FILE=""
+DEMO_INFO_FILE=""
+DEMO_YAML_FILE=""
+DEMO_STATE_FILE=""
+YAML_MANAGER_TARGET=""
+
+XRAY_PENDING_MODEL=""
+XRAY_CANDIDATE_CONFIG=""
+XRAY_CANDIDATE_STATE=""
+XRAY_CANDIDATE_INFO=""
+XRAY_CANDIDATE_YAML=""
+XRAY_CANDIDATE_READY=0
+XRAY_UPDATE_DIRTY=0
+
+CFG_NODE_NAME=""
+CFG_PUBLIC_ADDRESS=""
+CFG_REALITY_PORT=""
+CFG_REALITY_DEST=""
+CFG_SERVER_NAMES=""
+CFG_ENABLE_SOCKS=0
+CFG_SOCKS_LISTEN="127.0.0.1"
+CFG_SOCKS_PORT=""
+CFG_SOCKS_USER=""
+CFG_SOCKS_PASS=""
+CFG_ENABLE_SS=0
+CFG_SS_LISTEN="0.0.0.0"
+CFG_SS_PORT=""
+CFG_SS_METHOD="aes-256-gcm"
+CFG_SS_PASS=""
+declare -a CFG_PROXY_NAMES=()
+declare -a CFG_PROXY_LINKS=()
+
+
+cleanup() {
+  if [[ -n "${WORK_DIR}" && "${WORK_DIR}" == /tmp/vps-manager.* && -d "${WORK_DIR}" ]]; then
+    rm -rf -- "${WORK_DIR}"
+  fi
+}
+
+trap cleanup EXIT
+
+
+log() {
+  printf '\n[%s] %s\n' "$(date '+%F %T')" "$*"
+}
+
+
+warn() {
+  printf '\n警告: %s\n' "$*" >&2
+}
+
+
+die() {
+  printf '\n错误: %s\n' "$*" >&2
+  exit 1
+}
+
+
+pause_screen() {
+  printf '\n'
+  read -r -p "按回车返回主菜单..." _unused || true
+}
+
+
+prompt_default() {
+  local prompt="$1"
+  local default_value="$2"
+  local value
+
+  read -r -p "${prompt} [${default_value}]: " value
+  printf '%s' "${value:-${default_value}}"
+}
+
+
+prompt_secret() {
+  local prompt="$1"
+  local value
+
+  read -r -s -p "${prompt}: " value
+  printf '\n' >&2
+  printf '%s' "${value}"
+}
+
+
+prompt_yes_no() {
+  local prompt="$1"
+  local default_value="$2"
+  local suffix
+  local value
+
+  if [[ "${default_value}" == "1" ]]; then
+    suffix="Y/n"
+  else
+    suffix="y/N"
+  fi
+
+  while true; do
+    read -r -p "${prompt} [${suffix}]: " value
+    case "${value}" in
+      y|Y|yes|YES|Yes) return 0 ;;
+      n|N|no|NO|No) return 1 ;;
+      "")
+        [[ "${default_value}" == "1" ]]
+        return
+        ;;
+      *) printf '请输入 y 或 n。\n' >&2 ;;
+    esac
+  done
+}
+
+
+require_root() {
+  if [[ "${DEMO_MODE}" == "1" ]]; then
+    return 0
+  fi
+  if [[ "${EUID}" -ne 0 ]]; then
+    die "该操作需要 root 权限，请运行：sudo bash $0"
+  fi
+}
+
+
+check_supported_os() {
+  local os_id
+  local os_like
+
+  [[ -r /etc/os-release ]] || die "无法识别操作系统。"
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  os_id="${ID:-}"
+  os_like="${ID_LIKE:-}"
+  if [[ "${os_id}" != "debian" && "${os_id}" != "ubuntu" && "${os_like}" != *debian* ]]; then
+    die "当前测试版仅支持 Debian/Ubuntu。"
+  fi
+  command -v systemctl >/dev/null 2>&1 || die "当前系统未使用 systemd。"
+}
+
+
+ensure_work_dir() {
+  cleanup
+  WORK_DIR="$(mktemp -d /tmp/vps-manager.XXXXXX)"
+  chmod 700 "${WORK_DIR}"
+}
+
+
+backup_file() {
+  local source="$1"
+  local label="$2"
+  local timestamp
+  local destination_dir
+
+  [[ -e "${source}" ]] || return 0
+  timestamp="$(date -u '+%Y%m%dT%H%M%SZ')"
+  destination_dir="${BACKUP_ROOT}/${label}-${timestamp}"
+  install -d -m 700 "${destination_dir}"
+  cp -a -- "${source}" "${destination_dir}/"
+  printf '%s' "${destination_dir}"
+}
+
+
+random_password() {
+  openssl rand -base64 24 | tr -d '\n'
+}
+
+
+validate_port() {
+  local value="$1"
+  [[ "${value}" =~ ^[0-9]+$ ]] && (( value >= 1 && value <= 65535 ))
+}
+
+
+port_is_listening() {
+  local port="$1"
+  ss -ltnH 2>/dev/null | awk -v suffix=":${port}" '$4 ~ suffix "$" {found=1} END {exit !found}'
+}
+
+
+detect_public_address() {
+  local address
+
+  address="$(curl -4 -fsS --max-time 6 https://api.ipify.org 2>/dev/null || true)"
+  if [[ -z "${address}" ]]; then
+    address="$(curl -4 -fsS --max-time 6 https://ifconfig.me 2>/dev/null || true)"
+  fi
+  if [[ -z "${address}" ]]; then
+    address="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  fi
+  printf '%s' "${address:-127.0.0.1}"
+}
+
+
+show_bbr_status() {
+  local available
+  local current
+  local qdisc
+
+  available="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo unknown)"
+  current="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)"
+  qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unknown)"
+  printf '可用算法: %s\n当前算法: %s\n默认队列: %s\n' "${available}" "${current}" "${qdisc}"
+}
+
+
+enable_bbr() {
+  local config="/etc/sysctl.d/99-vps-manager-bbr.conf"
+  local backup=""
+
+  require_root
+  check_supported_os
+  log "检查 BBR"
+  show_bbr_status
+
+  if [[ "${DEMO_MODE}" == "1" ]]; then
+    printf '\n[演示] 实际运行时会加载 tcp_bbr，并写入：%s\n' "${config}"
+    return 0
+  fi
+
+  command -v modprobe >/dev/null 2>&1 || apt-get update
+  command -v modprobe >/dev/null 2>&1 || apt-get install -y kmod
+  modprobe tcp_bbr || die "当前内核无法加载 tcp_bbr。"
+
+  if [[ -e "${config}" ]]; then
+    backup="$(backup_file "${config}" "bbr")"
+  fi
+
+  ensure_work_dir
+  printf '%s\n' \
+    'net.core.default_qdisc=fq' \
+    'net.ipv4.tcp_congestion_control=bbr' \
+    > "${WORK_DIR}/bbr.conf"
+  install -o root -g root -m 644 "${WORK_DIR}/bbr.conf" "${config}"
+  sysctl --system >/dev/null
+
+  if [[ "$(sysctl -n net.ipv4.tcp_congestion_control)" != "bbr" ]]; then
+    die "BBR 配置未生效。"
+  fi
+
+  log "BBR 已启用"
+  show_bbr_status
+  [[ -n "${backup}" ]] && printf '原配置备份: %s\n' "${backup}"
+}
+
+
+default_ssh_admin_user() {
+  if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]] \
+    && id "${SUDO_USER}" >/dev/null 2>&1; then
+    printf '%s' "${SUDO_USER}"
+  else
+    id -un
+  fi
+}
+
+
+random_high_port() {
+  local candidate
+
+  while true; do
+    candidate="$(shuf -i 20000-60000 -n 1)"
+    if ! port_is_listening "${candidate}"; then
+      printf '%s' "${candidate}"
+      return 0
+    fi
+  done
+}
+
+
+ssh_service_name() {
+  if systemctl cat ssh.service >/dev/null 2>&1; then
+    printf 'ssh.service'
+  elif systemctl cat sshd.service >/dev/null 2>&1; then
+    printf 'sshd.service'
+  else
+    return 1
+  fi
+}
+
+
+rollback_ssh_hardening() {
+  local config_existed="$1"
+  local config_before="$2"
+  local authorized_existed="$3"
+  local authorized_before="$4"
+  local authorized_keys="$5"
+  local admin_user="$6"
+  local admin_group="$7"
+  local ssh_service="$8"
+
+  if [[ "${config_existed}" == "1" ]]; then
+    install -o root -g root -m 644 "${config_before}" "${SSHD_MANAGED_CONFIG}"
+  else
+    rm -f -- "${SSHD_MANAGED_CONFIG}"
+  fi
+
+  if [[ "${authorized_existed}" == "1" ]]; then
+    install -o "${admin_user}" -g "${admin_group}" -m 600 \
+      "${authorized_before}" "${authorized_keys}"
+  else
+    rm -f -- "${authorized_keys}"
+  fi
+
+  if /usr/sbin/sshd -t; then
+    systemctl reload "${ssh_service}" \
+      || warn "SSH 配置已恢复，但 reload 失败；请保持当前会话并手动检查。"
+  else
+    warn "SSH 配置恢复后的语法检查失败；请保持当前会话并立即检查。"
+  fi
+}
+
+
+configure_ssh_hardening() {
+  local admin_user
+  local admin_home
+  local admin_group
+  local default_port
+  local ssh_port
+  local public_key
+  local key_check
+  local key_type
+  local key_blob
+  local authorized_keys
+  local ssh_service
+  local public_address
+  local config_existed=0
+  local authorized_existed=0
+  local config_before
+  local authorized_before
+  local config_backup_dir=""
+  local authorized_backup_dir=""
+  local effective
+  local effective_ports
+  local effective_password
+  local effective_kbd
+  local effective_pubkey
+  local effective_methods
+  local host_name
+
+  require_root
+  check_supported_os
+
+  admin_user="$(default_ssh_admin_user)"
+  id "${admin_user}" >/dev/null 2>&1 \
+    || die "无法识别启动脚本的用户：${admin_user}"
+  printf 'SSH 管理用户：%s（自动取当前登录用户）\n' "${admin_user}"
+
+  admin_home="$(getent passwd "${admin_user}" | cut -d: -f6)"
+  admin_group="$(id -gn "${admin_user}")"
+  [[ "${admin_home}" == /* && "${admin_home}" != "/" ]] \
+    || die "用户主目录不安全或无效：${admin_home}"
+  authorized_keys="${admin_home}/.ssh/authorized_keys"
+
+  default_port="$(random_high_port)"
+  while true; do
+    ssh_port="$(prompt_default "新的 SSH 高位端口（10000-65535）" "${default_port}")"
+    if ! validate_port "${ssh_port}" || (( ssh_port < 10000 )); then
+      warn "SSH 高位端口必须在 10000-65535 之间。"
+      continue
+    fi
+    if port_is_listening "${ssh_port}"; then
+      warn "端口 ${ssh_port} 已被占用，请换一个端口。"
+      continue
+    fi
+    break
+  done
+
+  if [[ "${DEMO_MODE}" == "1" ]]; then
+    read -r -p "粘贴 SSH 公钥（预览可直接回车）: " public_key || true
+    public_key="${public_key:-ssh-ed25519 <在这里粘贴你的公钥>}"
+    log "[预览] SSH 密钥登录配置（不会修改系统）"
+    printf '将把公钥追加到：%s\n' "${authorized_keys}"
+    printf '公钥内容：%s\n' "${public_key}"
+    printf '将写入：%s\n' "${SSHD_MANAGED_CONFIG}"
+    cat <<EOF
+Port ${ssh_port}
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
+AuthenticationMethods publickey
+PermitEmptyPasswords no
+AuthorizedKeysFile .ssh/authorized_keys
+EOF
+    printf '\n实际执行时，reload 后必须在第二个终端验证新端口；失败会恢复原配置。\n'
+    return 0
+  fi
+
+  if [[ ! -x /usr/sbin/sshd ]]; then
+    apt-get update
+    apt-get install -y openssh-server
+  fi
+  command -v ssh-keygen >/dev/null 2>&1 || die "未找到 ssh-keygen。"
+  ssh_service="$(ssh_service_name)" || die "未找到 SSH systemd 服务。"
+
+  grep -Eq '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config.d/\*\.conf' \
+    "${SSHD_MAIN_CONFIG}" \
+    || die "${SSHD_MAIN_CONFIG} 未包含 sshd_config.d，已停止以避免锁死。"
+
+  ensure_work_dir
+  key_check="${WORK_DIR}/key-check.pub"
+  while true; do
+    read -r -p "粘贴 SSH 公钥（以 ssh-ed25519、ecdsa 或 ssh-rsa 开头）: " public_key
+    public_key="${public_key%$'\r'}"
+    printf '%s\n' "${public_key}" > "${key_check}"
+    chmod 600 "${key_check}"
+    key_type="$(awk '{print $1}' "${key_check}")"
+    case "${key_type}" in
+      ssh-ed25519|ssh-rsa|ecdsa-sha2-*|sk-ssh-ed25519@openssh.com|sk-ecdsa-sha2-*@openssh.com) ;;
+      *)
+        warn "公钥类型或格式不正确。请粘贴 .pub 文件中的完整一行。"
+        continue
+        ;;
+    esac
+    if ssh-keygen -l -f "${key_check}" >/dev/null 2>&1; then
+      break
+    fi
+    warn "ssh-keygen 无法验证该公钥，请重新粘贴。"
+  done
+  key_blob="$(awk '{print $2}' "${key_check}")"
+  rm -f -- "${key_check}"
+
+  warn "不要关闭当前 SSH 窗口。修改后必须用第二个终端测试，失败时脚本会回滚。"
+  printf '请先在云厂商安全组中放行：%s/tcp\n' "${ssh_port}"
+  prompt_yes_no "确认云安全组已经放行 ${ssh_port}/tcp" "0" \
+    || { printf '已取消 SSH 加固，未修改配置。\n'; return 0; }
+  prompt_yes_no "确认你持有该公钥对应的私钥" "0" \
+    || { printf '已取消 SSH 加固，未修改配置。\n'; return 0; }
+
+  if command -v ufw >/dev/null 2>&1 \
+    && ufw status 2>/dev/null | grep -q '^Status: active'; then
+    ufw allow "${ssh_port}/tcp"
+  fi
+  if command -v firewall-cmd >/dev/null 2>&1 \
+    && firewall-cmd --state >/dev/null 2>&1; then
+    firewall-cmd --permanent --add-port="${ssh_port}/tcp"
+    firewall-cmd --reload
+  fi
+
+  config_before="${WORK_DIR}/sshd-managed.before"
+  authorized_before="${WORK_DIR}/authorized_keys.before"
+
+  if [[ -e "${SSHD_MANAGED_CONFIG}" ]]; then
+    config_existed=1
+    cp -a -- "${SSHD_MANAGED_CONFIG}" "${config_before}"
+    config_backup_dir="$(backup_file "${SSHD_MANAGED_CONFIG}" "sshd-config")"
+  fi
+
+  install -d -o "${admin_user}" -g "${admin_group}" -m 700 \
+    "${admin_home}/.ssh"
+  if [[ -e "${authorized_keys}" ]]; then
+    authorized_existed=1
+    cp -a -- "${authorized_keys}" "${authorized_before}"
+    authorized_backup_dir="$(backup_file "${authorized_keys}" "authorized-keys")"
+    chown "${admin_user}:${admin_group}" "${authorized_keys}"
+    chmod 600 "${authorized_keys}"
+  else
+    install -o "${admin_user}" -g "${admin_group}" -m 600 \
+      /dev/null "${authorized_keys}"
+  fi
+
+  cp -a -- "${authorized_keys}" "${WORK_DIR}/authorized_keys.new"
+  if ! awk -v blob="${key_blob}" '$2 == blob {found=1} END {exit !found}' \
+    "${WORK_DIR}/authorized_keys.new"; then
+    printf '%s\n' "${public_key}" >> "${WORK_DIR}/authorized_keys.new"
+  fi
+  install -o "${admin_user}" -g "${admin_group}" -m 600 \
+    "${WORK_DIR}/authorized_keys.new" "${authorized_keys}"
+
+  install -d -o root -g root -m 755 "${SSHD_DROPIN_DIR}"
+  cat > "${WORK_DIR}/sshd-hardening.conf" <<EOF
+Port ${ssh_port}
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
+AuthenticationMethods publickey
+PermitEmptyPasswords no
+AuthorizedKeysFile .ssh/authorized_keys
+EOF
+  install -o root -g root -m 644 \
+    "${WORK_DIR}/sshd-hardening.conf" "${SSHD_MANAGED_CONFIG}"
+
+  if ! /usr/sbin/sshd -t; then
+    rollback_ssh_hardening \
+      "${config_existed}" "${config_before}" \
+      "${authorized_existed}" "${authorized_before}" "${authorized_keys}" \
+      "${admin_user}" "${admin_group}" "${ssh_service}"
+    die "新 SSH 配置语法检查失败，已恢复。"
+  fi
+
+  host_name="$(hostname -f 2>/dev/null || hostname)"
+  if ! effective="$(/usr/sbin/sshd -T -C \
+    "user=${admin_user},host=${host_name},addr=127.0.0.1,laddr=127.0.0.1,lport=${ssh_port}")"; then
+    rollback_ssh_hardening \
+      "${config_existed}" "${config_before}" \
+      "${authorized_existed}" "${authorized_before}" "${authorized_keys}" \
+      "${admin_user}" "${admin_group}" "${ssh_service}"
+    die "无法读取 SSH 生效配置，已恢复。"
+  fi
+  effective_ports="$(printf '%s\n' "${effective}" \
+    | awk '$1 == "port" {print $2}' | paste -sd, -)"
+  effective_password="$(printf '%s\n' "${effective}" \
+    | awk '$1 == "passwordauthentication" {print $2; exit}')"
+  effective_kbd="$(printf '%s\n' "${effective}" \
+    | awk '$1 == "kbdinteractiveauthentication" {print $2; exit}')"
+  effective_pubkey="$(printf '%s\n' "${effective}" \
+    | awk '$1 == "pubkeyauthentication" {print $2; exit}')"
+  effective_methods="$(printf '%s\n' "${effective}" \
+    | awk '$1 == "authenticationmethods" {print $2; exit}')"
+
+  if [[ "${effective_ports}" != "${ssh_port}" \
+    || "${effective_password}" != "no" \
+    || "${effective_kbd}" != "no" \
+    || "${effective_pubkey}" != "yes" \
+    || "${effective_methods}" != "publickey" ]]; then
+    rollback_ssh_hardening \
+      "${config_existed}" "${config_before}" \
+      "${authorized_existed}" "${authorized_before}" "${authorized_keys}" \
+      "${admin_user}" "${admin_group}" "${ssh_service}"
+    die "SSH 生效配置与预期不一致，已恢复。有效端口：${effective_ports:-未知}"
+  fi
+
+  if ! systemctl reload "${ssh_service}"; then
+    rollback_ssh_hardening \
+      "${config_existed}" "${config_before}" \
+      "${authorized_existed}" "${authorized_before}" "${authorized_keys}" \
+      "${admin_user}" "${admin_group}" "${ssh_service}"
+    die "SSH reload 失败，已恢复。"
+  fi
+
+  if ! port_is_listening "${ssh_port}"; then
+    rollback_ssh_hardening \
+      "${config_existed}" "${config_before}" \
+      "${authorized_existed}" "${authorized_before}" "${authorized_keys}" \
+      "${admin_user}" "${admin_group}" "${ssh_service}"
+    die "新 SSH 端口未监听，已恢复原配置。"
+  fi
+
+  public_address="$(detect_public_address)"
+  printf '\n请保持当前窗口，在第二个终端执行：\n'
+  printf 'ssh -p %s %s@%s\n\n' \
+    "${ssh_port}" "${admin_user}" "${public_address}"
+  if ! prompt_yes_no "是否已经使用对应私钥成功登录新端口" "0"; then
+    rollback_ssh_hardening \
+      "${config_existed}" "${config_before}" \
+      "${authorized_existed}" "${authorized_before}" "${authorized_keys}" \
+      "${admin_user}" "${admin_group}" "${ssh_service}"
+    warn "验证未通过，已恢复原 SSH 端口和认证配置。"
+    return 0
+  fi
+
+  log "SSH 加固完成"
+  printf '管理用户：%s\n新端口：%s\n' "${admin_user}" "${ssh_port}"
+  printf '密码登录：已关闭\n认证方式：仅公钥\n'
+  printf '请同步更新 Termark 中该服务器的端口和登录凭据。\n'
+  [[ -n "${config_backup_dir}" ]] \
+    && printf '原 SSH 配置备份：%s\n' "${config_backup_dir}"
+  [[ -n "${authorized_backup_dir}" ]] \
+    && printf '原 authorized_keys 备份：%s\n' "${authorized_backup_dir}"
+}
+
+
+install_base_tools() {
+  require_root
+  check_supported_os
+
+  if [[ "${DEMO_MODE}" == "1" ]]; then
+    log "[预览] 初始化基础工具"
+    printf '将安装：ca-certificates curl wget vim unzip python3 python3-yaml openssl iproute2 openssh-client\n'
+    return 0
+  fi
+
+  log "安装基础工具"
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update
+  apt-get install -y --no-install-recommends \
+    ca-certificates curl wget vim unzip python3 python3-yaml openssl iproute2 openssh-client
+}
+
+
+install_or_upgrade_xray() {
+  local installer
+
+  require_root
+  check_supported_os
+
+  if [[ "${DEMO_MODE}" == "1" ]]; then
+    log "[预览] 安装或升级 Xray"
+    printf '将使用 XTLS 官方安装器：\n%s\n' "${XRAY_INSTALL_URL}"
+    printf '配置路径：%s\n' "${XRAY_CONFIG}"
+    return 0
+  fi
+
+  log "安装 Xray 所需依赖"
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update
+  apt-get install -y --no-install-recommends ca-certificates curl unzip python3 openssl
+
+  ensure_work_dir
+  installer="${WORK_DIR}/install-xray.sh"
+  curl -fL --retry 3 --connect-timeout 10 -o "${installer}" "${XRAY_INSTALL_URL}"
+  chmod 700 "${installer}"
+  bash -n "${installer}"
+
+  log "使用 XTLS 官方安装器安装或升级 Xray"
+  bash "${installer}" install
+
+  [[ -x "${XRAY_BIN}" ]] || die "Xray 安装完成后未找到 ${XRAY_BIN}。"
+  "${XRAY_BIN}" version | head -n 3
+}
+
+
+collect_proxy_outbounds() {
+  local index=1
+  local name
+  local link
+
+  CFG_PROXY_NAMES=()
+  CFG_PROXY_LINKS=()
+  printf '\n出口代理支持 socks5://、http://、https:// 和 ss://。\n'
+  printf 'SOCKS5/HTTP/HTTPS 标准格式：协议://用户名:密码@IP或域名:端口\n'
+  printf '示例：socks5://user:pass@1.2.3.4:1080\n'
+  printf '兼容旧格式：协议:IP或域名:端口@用户名:密码\n'
+  printf 'Shadowsocks 标准格式：ss://BASE64(加密方式:密码)@IP或域名:端口\n'
+  printf 'SS 旧格式：ss:IP或域名:端口@加密方式:密码\n'
+  printf 'SOCKS5 会在生成配置时自动检测远程域名解析能力；异常时启用 IPv4 兜底。\n'
+  printf '直接回车跳过，即只生成本机原生出口。\n'
+
+  while prompt_yes_no "是否添加第 ${index} 个 ISP 出口代理" "0"; do
+    name="$(prompt_default "出口名称" "isp-${index}")"
+    link="$(prompt_secret "粘贴代理链接（输入不会显示）")"
+    [[ -n "${link}" ]] || {
+      warn "代理链接不能为空，本条未添加。"
+      continue
+    }
+    CFG_PROXY_NAMES+=("${name}")
+    CFG_PROXY_LINKS+=("${link}")
+    printf '已接收出口：%s\n' "${name}"
+    index=$((index + 1))
+  done
+}
+
+
+collect_optional_inbounds() {
+  local default_password
+
+  CFG_ENABLE_SOCKS=0
+  CFG_ENABLE_SS=0
+
+  if prompt_yes_no "是否开启 SOCKS5 入站端口" "0"; then
+    CFG_ENABLE_SOCKS=1
+    CFG_SOCKS_LISTEN="$(prompt_default "SOCKS5 监听地址（127.0.0.1 仅本机）" "127.0.0.1")"
+    while true; do
+      CFG_SOCKS_PORT="$(prompt_default "SOCKS5 端口" "21625")"
+      validate_port "${CFG_SOCKS_PORT}" && break
+      warn "端口必须在 1-65535 之间。"
+    done
+    CFG_SOCKS_USER="$(prompt_default "SOCKS5 用户名" "xray-socks")"
+    default_password="$(random_password)"
+    CFG_SOCKS_PASS="$(prompt_default "SOCKS5 密码" "${default_password}")"
+    if [[ "${CFG_SOCKS_LISTEN}" == "0.0.0.0" ]]; then
+      warn "SOCKS5 本身不加密，请只允许可信 IP 访问该端口。"
+    fi
+  fi
+
+  if prompt_yes_no "是否开启 Shadowsocks 入站端口" "0"; then
+    CFG_ENABLE_SS=1
+    CFG_SS_LISTEN="$(prompt_default "Shadowsocks 监听地址" "0.0.0.0")"
+    while true; do
+      CFG_SS_PORT="$(prompt_default "Shadowsocks 端口" "21626")"
+      validate_port "${CFG_SS_PORT}" && break
+      warn "端口必须在 1-65535 之间。"
+    done
+    CFG_SS_METHOD="$(prompt_default "Shadowsocks 加密方式" "aes-256-gcm")"
+    default_password="$(random_password)"
+    CFG_SS_PASS="$(prompt_default "Shadowsocks 密码" "${default_password}")"
+  fi
+}
+
+
+collect_xray_configuration() {
+  local default_name
+
+  default_name="$(hostname)"
+  CFG_NODE_NAME="$(prompt_default "节点名称（用于生成 AWS YAML）" "${default_name}")"
+  CFG_PUBLIC_ADDRESS="$(detect_public_address)"
+  printf '自动检测到节点地址：%s（仅用于生成 AWS YAML）\n' "${CFG_PUBLIC_ADDRESS}"
+
+  while true; do
+    CFG_REALITY_PORT="$(prompt_default "VLESS-Reality 端口" "58403")"
+    validate_port "${CFG_REALITY_PORT}" && break
+    warn "端口必须在 1-65535 之间。"
+  done
+
+  CFG_REALITY_DEST="$(prompt_default "Reality dest" "www.example.com:443")"
+  [[ -n "${CFG_REALITY_DEST}" && "${CFG_REALITY_DEST}" != *" "* ]] \
+    || die "Reality dest 格式不正确。"
+  CFG_SERVER_NAMES="$(prompt_default "Reality serverNames（逗号分隔）" "www.example.com,example.com")"
+  [[ -n "${CFG_SERVER_NAMES}" ]] || die "Reality serverNames 不能为空。"
+
+  if port_is_listening "${CFG_REALITY_PORT}"; then
+    warn "端口 ${CFG_REALITY_PORT} 当前已有程序监听。"
+    prompt_yes_no "仍然继续生成配置" "0" || die "已取消配置。"
+  fi
+
+  collect_proxy_outbounds
+  collect_optional_inbounds
+
+  local ports=("${CFG_REALITY_PORT}")
+  [[ "${CFG_ENABLE_SOCKS}" == "1" ]] && ports+=("${CFG_SOCKS_PORT}")
+  [[ "${CFG_ENABLE_SS}" == "1" ]] && ports+=("${CFG_SS_PORT}")
+  if [[ "$(printf '%s\n' "${ports[@]}" | sort -u | wc -l)" -ne "${#ports[@]}" ]]; then
+    die "VLESS、SOCKS5 和 Shadowsocks 端口不能重复。"
+  fi
+}
+
+
+write_proxy_input_file() {
+  local destination="$1"
+  local index
+  local encoded_name
+  local encoded_link
+
+  : > "${destination}"
+  chmod 600 "${destination}"
+  for ((index = 0; index < ${#CFG_PROXY_NAMES[@]}; index++)); do
+    encoded_name="$(printf '%s' "${CFG_PROXY_NAMES[index]}" | base64 | tr -d '\n')"
+    encoded_link="$(printf '%s' "${CFG_PROXY_LINKS[index]}" | base64 | tr -d '\n')"
+    printf '%s\t%s\n' "${encoded_name}" "${encoded_link}" >> "${destination}"
+  done
+}
+
+
+generate_xray_files() {
+  local private_key="$1"
+  local public_key="$2"
+  local short_id="$3"
+  local proxy_input="$4"
+  local generated_config="$5"
+  local generated_state="$6"
+  local generated_info="$7"
+  local generated_yaml="$8"
+  local pending_model="${9:-}"
+
+  CFG_NODE_NAME="${CFG_NODE_NAME}" \
+  CFG_PUBLIC_ADDRESS="${CFG_PUBLIC_ADDRESS}" \
+  CFG_REALITY_PORT="${CFG_REALITY_PORT}" \
+  CFG_REALITY_DEST="${CFG_REALITY_DEST}" \
+  CFG_SERVER_NAMES="${CFG_SERVER_NAMES}" \
+  CFG_PRIVATE_KEY="${private_key}" \
+  CFG_PUBLIC_KEY="${public_key}" \
+  CFG_SHORT_ID="${short_id}" \
+  CFG_ENABLE_SOCKS="${CFG_ENABLE_SOCKS}" \
+  CFG_SOCKS_LISTEN="${CFG_SOCKS_LISTEN}" \
+  CFG_SOCKS_PORT="${CFG_SOCKS_PORT}" \
+  CFG_SOCKS_USER="${CFG_SOCKS_USER}" \
+  CFG_SOCKS_PASS="${CFG_SOCKS_PASS}" \
+  CFG_ENABLE_SS="${CFG_ENABLE_SS}" \
+  CFG_SS_LISTEN="${CFG_SS_LISTEN}" \
+  CFG_SS_PORT="${CFG_SS_PORT}" \
+  CFG_SS_METHOD="${CFG_SS_METHOD}" \
+  CFG_SS_PASS="${CFG_SS_PASS}" \
+  CFG_PENDING_MODEL="${pending_model}" \
+  python3 - "${proxy_input}" "${generated_config}" "${generated_state}" "${generated_info}" "${generated_yaml}" <<'PY'
+from __future__ import annotations
+
+import base64
+from datetime import datetime, timezone
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+from urllib.parse import unquote, urlsplit
+import uuid
+
+
+proxy_input = Path(sys.argv[1])
+config_path = Path(sys.argv[2])
+state_path = Path(sys.argv[3])
+info_path = Path(sys.argv[4])
+yaml_path = Path(sys.argv[5])
+
+
+def env(name: str, default: str = "") -> str:
+    return os.environ.get(name, default)
+
+
+SOCKS_PROBE_TARGETS = [
+    ("IPLark", "https://iplark.com/"),
+    ("Cloudflare", "https://cp.cloudflare.com/generate_204"),
+    ("Google", "https://www.gstatic.com/generate_204"),
+]
+
+
+def decode_urlsafe(value: str) -> str:
+    value += "=" * (-len(value) % 4)
+    return base64.urlsafe_b64decode(value.encode()).decode()
+
+
+def parse_host_port(server: str) -> tuple[str, int]:
+    parsed = urlsplit("dummy://" + server)
+    if not parsed.hostname or parsed.port is None:
+        raise ValueError("缺少代理地址或端口")
+    if not (1 <= parsed.port <= 65535):
+        raise ValueError("代理端口超出范围")
+    return parsed.hostname, parsed.port
+
+
+def parse_shadowsocks(link: str) -> dict:
+    payload = link.split("://", 1)[1]
+    payload = payload.split("#", 1)[0].split("?", 1)[0]
+
+    if "@" not in payload:
+        try:
+            payload = decode_urlsafe(payload)
+        except Exception as error:
+            raise ValueError("无法解析 Shadowsocks Base64 链接") from error
+
+    if "@" not in payload:
+        raise ValueError("Shadowsocks 链接缺少服务器部分")
+
+    userinfo, server = payload.rsplit("@", 1)
+    if ":" not in userinfo:
+        try:
+            userinfo = decode_urlsafe(userinfo)
+        except Exception as error:
+            raise ValueError("无法解析 Shadowsocks 用户信息") from error
+
+    if ":" not in userinfo:
+        raise ValueError("Shadowsocks 链接缺少加密方式或密码")
+    method, password = userinfo.split(":", 1)
+    method = unquote(method)
+    password = unquote(password)
+    host, port = parse_host_port(server)
+    if not method or not password:
+        raise ValueError("Shadowsocks 加密方式和密码不能为空")
+    return {
+        "scheme": "ss",
+        "host": host,
+        "port": port,
+        "method": method,
+        "password": password,
+    }
+
+
+def parse_proxy_link(link: str) -> dict:
+    link = link.strip()
+    legacy = re.fullmatch(
+        r"(socks5|socks|http|https|ss):([^:]+):([0-9]+)@([^:]*):(.*)",
+        link,
+        flags=re.IGNORECASE,
+    )
+    if legacy:
+        scheme, host, port, first, second = legacy.groups()
+        scheme = scheme.lower()
+        port_number = int(port)
+        if not (1 <= port_number <= 65535):
+            raise ValueError("代理端口超出范围")
+        if scheme == "ss":
+            return {
+                "scheme": "ss",
+                "host": host,
+                "port": port_number,
+                "method": first,
+                "password": second,
+            }
+        return {
+            "scheme": "socks5" if scheme == "socks" else scheme,
+            "host": host,
+            "port": port_number,
+            "username": first,
+            "password": second,
+        }
+
+    if "://" not in link:
+        raise ValueError("代理链接必须包含协议")
+    scheme = link.split("://", 1)[0].lower()
+    if scheme == "ss":
+        return parse_shadowsocks(link)
+    if scheme not in {"socks", "socks5", "http", "https"}:
+        raise ValueError(f"暂不支持代理协议：{scheme}")
+
+    parsed = urlsplit(link)
+    if not parsed.hostname or parsed.port is None:
+        raise ValueError("代理链接缺少地址或端口")
+    if not (1 <= parsed.port <= 65535):
+        raise ValueError("代理端口超出范围")
+    return {
+        "scheme": "socks5" if scheme == "socks" else scheme,
+        "host": parsed.hostname,
+        "port": parsed.port,
+        "username": unquote(parsed.username or ""),
+        "password": unquote(parsed.password or ""),
+    }
+
+
+def proxy_endpoint(host: str, port: int) -> str:
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    return f"{host}:{port}"
+
+
+def probe_with_curl(parsed: dict, url: str, remote_dns: bool) -> dict:
+    username = parsed.get("username", "")
+    password = parsed.get("password", "")
+    if ":" in username:
+        raise ValueError("SOCKS5 用户名不能包含冒号")
+    if any(ord(character) < 32 or ord(character) == 127 for character in username + password):
+        raise ValueError("SOCKS5 用户名和密码不能包含控制字符")
+
+    curl_config = ""
+    if username or password:
+        curl_config = (
+            "proxy-user = "
+            + json.dumps(f"{username}:{password}", ensure_ascii=False)
+            + "\n"
+        )
+
+    dns_option = "--socks5-hostname" if remote_dns else "--socks5"
+    command = [
+        "curl",
+        "--disable",
+        "--config",
+        "-",
+        "--silent",
+        "--show-error",
+        "--output",
+        "/dev/null",
+        "--noproxy",
+        "",
+        "--connect-timeout",
+        "5",
+        "--max-time",
+        "12",
+        "--ipv4",
+        "--write-out",
+        "%{http_code}",
+        "--socks5-basic",
+        dns_option,
+        proxy_endpoint(parsed["host"], parsed["port"]),
+        url,
+    ]
+    completed = subprocess.run(
+        command,
+        input=curl_config,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    status = completed.stdout.strip()[-3:]
+    if not status.isdigit():
+        status = "000"
+    return {
+        "ok": completed.returncode == 0,
+        "exitCode": completed.returncode,
+        "httpStatus": status,
+    }
+
+
+def probe_socks_resolution(parsed: dict, name: str) -> dict:
+    checked_at = (
+        datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    attempts = []
+    print(
+        f"[出口检测] {name}: 正在对照检测远程域名与本地 IPv4 连接...",
+        file=sys.stderr,
+    )
+
+    for target_name, target_url in SOCKS_PROBE_TARGETS:
+        remote = probe_with_curl(parsed, target_url, remote_dns=True)
+        attempt = {
+            "target": target_name,
+            "remoteDomain": remote,
+        }
+        attempts.append(attempt)
+        if remote["ok"]:
+            summary = f"SOCKS 远程解析正常（{target_name}）"
+            print(f"[出口检测] {name}: {summary}，保持 AsIs。", file=sys.stderr)
+            return {
+                "result": "remote-ok",
+                "mode": "remote-domain",
+                "targetStrategy": "AsIs",
+                "checkedAt": checked_at,
+                "summary": summary,
+                "attempts": attempts,
+            }
+
+        local = probe_with_curl(parsed, target_url, remote_dns=False)
+        attempt["localIPv4"] = local
+        if not local["ok"]:
+            continue
+
+        # 同一目标再验证一次，避免瞬时网络错误导致误判。
+        confirm_remote = probe_with_curl(parsed, target_url, remote_dns=True)
+        confirm_local = probe_with_curl(parsed, target_url, remote_dns=False)
+        attempt["confirmation"] = {
+            "remoteDomain": confirm_remote,
+            "localIPv4": confirm_local,
+        }
+        if not confirm_remote["ok"] and confirm_local["ok"]:
+            summary = f"远程域名异常，Xray 先解析 IPv4（{target_name}）"
+            print(
+                f"[出口检测] {name}: {summary}，启用 UseIPv4 兜底。",
+                file=sys.stderr,
+            )
+            return {
+                "result": "fallback-ipv4",
+                "mode": "xray-ipv4",
+                "targetStrategy": "UseIPv4",
+                "checkedAt": checked_at,
+                "summary": summary,
+                "attempts": attempts,
+            }
+        if confirm_remote["ok"]:
+            summary = f"SOCKS 远程解析正常（{target_name}，首次检测为瞬时失败）"
+            print(f"[出口检测] {name}: {summary}，保持 AsIs。", file=sys.stderr)
+            return {
+                "result": "remote-ok",
+                "mode": "remote-domain",
+                "targetStrategy": "AsIs",
+                "checkedAt": checked_at,
+                "summary": summary,
+                "attempts": attempts,
+            }
+
+    raise RuntimeError(
+        f"出口「{name}」的 SOCKS 域名模式和 IPv4 模式均未通过 HTTPS 检测；"
+        "请检查地址、端口、认证或代理服务状态。"
+    )
+
+
+def proxy_outbound(parsed: dict, tag: str, resolution_check: dict | None) -> dict:
+    scheme = parsed["scheme"]
+    if scheme == "socks5":
+        settings = {
+            "address": parsed["host"],
+            "port": parsed["port"],
+        }
+        if parsed["username"] or parsed["password"]:
+            settings["user"] = parsed["username"]
+            settings["pass"] = parsed["password"]
+        outbound = {"protocol": "socks", "tag": tag, "settings": settings}
+        if resolution_check and resolution_check["targetStrategy"] == "UseIPv4":
+            outbound["targetStrategy"] = "UseIPv4"
+        return outbound
+
+    if scheme in {"http", "https"}:
+        settings = {
+            "address": parsed["host"],
+            "port": parsed["port"],
+        }
+        if parsed["username"] or parsed["password"]:
+            settings["user"] = parsed["username"]
+            settings["pass"] = parsed["password"]
+        outbound = {"protocol": "http", "tag": tag, "settings": settings}
+        if scheme == "https":
+            outbound["streamSettings"] = {
+                "security": "tls",
+                "tlsSettings": {
+                    "serverName": parsed["host"],
+                    "allowInsecure": False,
+                },
+            }
+        return outbound
+
+    if scheme == "ss":
+        return {
+            "protocol": "shadowsocks",
+            "tag": tag,
+            "settings": {
+                "address": parsed["host"],
+                "port": parsed["port"],
+                "method": parsed["method"],
+                "password": parsed["password"],
+            },
+        }
+    raise ValueError(f"不支持的代理协议：{scheme}")
+
+
+def yaml_scalar(value: str) -> str:
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+pending_model_path = env("CFG_PENDING_MODEL")
+pending_model = None
+if pending_model_path:
+    try:
+        pending_model = json.loads(Path(pending_model_path).read_text())
+    except Exception as error:
+        raise SystemExit(f"无法读取待更新模型：{error}")
+    if pending_model.get("version") != 3 or pending_model.get("managedBy") != "vps-manager":
+        raise SystemExit("待更新模型不是 VPS Manager v3 受管结构")
+
+if pending_model:
+    node_name = str(pending_model["nodeName"])
+    public_address = str(pending_model["publicAddress"])
+    reality = pending_model["reality"]
+    reality_port = int(reality["port"])
+    reality_dest = str(reality["dest"])
+    server_names = list(
+        dict.fromkeys(
+            str(value).strip()
+            for value in reality["serverNames"]
+            if str(value).strip()
+        )
+    )
+    private_key = str(reality["privateKey"])
+    public_key = str(reality["publicKey"])
+    short_id = str(reality["shortId"])
+else:
+    node_name = env("CFG_NODE_NAME")
+    public_address = env("CFG_PUBLIC_ADDRESS")
+    reality_port = int(env("CFG_REALITY_PORT"))
+    reality_dest = env("CFG_REALITY_DEST")
+    server_names = list(
+        dict.fromkeys(
+            value.strip()
+            for value in env("CFG_SERVER_NAMES").split(",")
+            if value.strip()
+        )
+    )
+    private_key = env("CFG_PRIVATE_KEY")
+    public_key = env("CFG_PUBLIC_KEY")
+    short_id = env("CFG_SHORT_ID")
+
+if not server_names:
+    raise SystemExit("Reality serverNames 不能为空")
+server_name = server_names[0]
+
+proxy_entries = []
+if pending_model:
+    for index, item in enumerate(pending_model.get("proxies", []), 1):
+        try:
+            if item.get("sourceLink"):
+                parsed = parse_proxy_link(str(item["sourceLink"]))
+            else:
+                parsed = dict(item["proxy"])
+            resolution_check = item.get("resolutionCheck")
+            if parsed["scheme"] == "socks5" and item.get("needsProbe"):
+                resolution_check = probe_socks_resolution(parsed, str(item["name"]))
+            proxy_entries.append({
+                "name": str(item["name"]), "parsed": parsed,
+                "resolutionCheck": resolution_check,
+                "identity": {key: str(item[key]) for key in ("id", "tag", "email", "uuid")},
+            })
+        except Exception as error:
+            raise SystemExit(f"第 {index} 个出口代理处理失败：{error}")
+else:
+    for line_number, line in enumerate(proxy_input.read_text().splitlines(), 1):
+        if not line:
+            continue
+        try:
+            encoded_name, encoded_link = line.split("\t", 1)
+            name = base64.b64decode(encoded_name).decode()
+            link = base64.b64decode(encoded_link).decode()
+            parsed = parse_proxy_link(link)
+        except Exception as error:
+            raise SystemExit(f"第 {line_number} 个出口代理解析失败：{error}")
+        resolution_check = None
+        if parsed["scheme"] == "socks5":
+            try:
+                resolution_check = probe_socks_resolution(parsed, name)
+            except Exception as error:
+                raise SystemExit(f"第 {line_number} 个出口代理检测失败：{error}")
+        proxy_entries.append({
+            "name": name, "parsed": parsed,
+            "resolutionCheck": resolution_check, "identity": None,
+        })
+
+needs_shared_dns = any(
+    entry["resolutionCheck"]
+    and entry["resolutionCheck"]["targetStrategy"] == "UseIPv4"
+    for entry in proxy_entries
+)
+
+clients = []
+routing_rules = []
+outbounds = [
+    {
+        "protocol": "freedom",
+        "tag": "direct",
+        "settings": {"domainStrategy": "UseIPv4"},
+    }
+]
+
+native_identity = pending_model.get("native", {}) if pending_model else {}
+local_email = str(native_identity.get("email", "local@vps-manager.local"))
+local_uuid = str(native_identity.get("uuid") or uuid.uuid4())
+local_name = str(native_identity.get("name", "native"))
+clients.append(
+    {
+        "id": local_uuid,
+        "flow": "xtls-rprx-vision",
+        "email": local_email,
+    }
+)
+routing_rules.append(
+    {"type": "field", "user": [local_email], "outboundTag": "direct"}
+)
+
+state_proxies = []
+display_clients = [
+    {
+        "name": local_name,
+        "uuid": local_uuid,
+        "email": local_email,
+        "outbound": "direct",
+        "resolution": "VPS 本机 IPv4 解析",
+    }
+]
+
+for index, entry in enumerate(proxy_entries, 1):
+    identity = entry.get("identity") or {}
+    tag = str(identity.get("tag") or f"proxy_{index}")
+    email = str(identity.get("email") or f"proxy-{index}@vps-manager.local")
+    client_uuid = str(identity.get("uuid") or uuid.uuid4())
+    stable_id = str(identity.get("id") or uuid.uuid4())
+    clients.append(
+        {
+            "id": client_uuid,
+            "flow": "xtls-rprx-vision",
+            "email": email,
+        }
+    )
+    outbounds.append(
+        proxy_outbound(entry["parsed"], tag, entry["resolutionCheck"])
+    )
+    routing_rules.append(
+        {"type": "field", "user": [email], "outboundTag": tag}
+    )
+    display_clients.append(
+        {
+            "name": entry["name"],
+            "uuid": client_uuid,
+            "email": email,
+            "outbound": tag,
+            "resolution": (
+                entry["resolutionCheck"]["summary"]
+                if entry["resolutionCheck"]
+                else "由上游代理解析域名"
+            ),
+        }
+    )
+    parsed = entry["parsed"]
+    state_proxies.append(
+        {
+            "id": stable_id,
+            "name": entry["name"],
+            "protocol": parsed["scheme"],
+            "address": parsed["host"],
+            "port": parsed["port"],
+            "tag": tag,
+            "email": email,
+            "uuid": client_uuid,
+            "proxy": parsed,
+            "resolutionCheck": entry["resolutionCheck"],
+        }
+    )
+
+inbounds = [
+    {
+        "port": reality_port,
+        "protocol": "vless",
+        "settings": {
+            "clients": clients,
+            "decryption": "none",
+        },
+        "streamSettings": {
+            "network": "tcp",
+            "security": "reality",
+            "realitySettings": {
+                "show": False,
+                "dest": reality_dest,
+                "xver": 0,
+                "serverNames": server_names,
+                "privateKey": private_key,
+                "shortIds": [short_id],
+            },
+        },
+    }
+]
+
+optional_inbounds = {}
+pending_optional = pending_model.get("optionalInbounds", {}) if pending_model else {}
+socks_input = pending_optional.get("socks5") if pending_model else None
+if socks_input or (not pending_model and env("CFG_ENABLE_SOCKS") == "1"):
+    socks_port = int(socks_input["port"]) if socks_input else int(env("CFG_SOCKS_PORT"))
+    socks_user = str(socks_input["username"]) if socks_input else env("CFG_SOCKS_USER")
+    socks_pass = str(socks_input["password"]) if socks_input else env("CFG_SOCKS_PASS")
+    socks_listen = str(socks_input["listen"]) if socks_input else env("CFG_SOCKS_LISTEN")
+    inbounds.append(
+        {
+            "tag": "socks-in",
+            "listen": socks_listen,
+            "port": socks_port,
+            "protocol": "socks",
+            "settings": {
+                "auth": "password",
+                "users": [{"user": socks_user, "pass": socks_pass}],
+                "udp": False,
+            },
+        }
+    )
+    routing_rules.append(
+        {"type": "field", "inboundTag": ["socks-in"], "outboundTag": "direct"}
+    )
+    optional_inbounds["socks5"] = {
+        "listen": socks_listen,
+        "port": socks_port,
+        "username": socks_user,
+        "password": socks_pass,
+    }
+
+ss_input = pending_optional.get("shadowsocks") if pending_model else None
+if ss_input or (not pending_model and env("CFG_ENABLE_SS") == "1"):
+    ss_port = int(ss_input["port"]) if ss_input else int(env("CFG_SS_PORT"))
+    ss_method = str(ss_input["method"]) if ss_input else env("CFG_SS_METHOD")
+    ss_pass = str(ss_input["password"]) if ss_input else env("CFG_SS_PASS")
+    ss_listen = str(ss_input["listen"]) if ss_input else env("CFG_SS_LISTEN")
+    inbounds.append(
+        {
+            "tag": "shadowsocks-in",
+            "listen": ss_listen,
+            "port": ss_port,
+            "protocol": "shadowsocks",
+            "settings": {
+                "network": "tcp,udp",
+                "method": ss_method,
+                "password": ss_pass,
+            },
+        }
+    )
+    routing_rules.append(
+        {
+            "type": "field",
+            "inboundTag": ["shadowsocks-in"],
+            "outboundTag": "direct",
+        }
+    )
+    optional_inbounds["shadowsocks"] = {
+        "listen": ss_listen,
+        "port": ss_port,
+        "method": ss_method,
+        "password": ss_pass,
+    }
+
+config = {"log": {"loglevel": "warning"}}
+if needs_shared_dns:
+    config["dns"] = {
+        "servers": ["https+local://1.1.1.1/dns-query"],
+        "queryStrategy": "UseIPv4",
+    }
+config.update(
+    {
+        "inbounds": inbounds,
+        "outbounds": outbounds,
+        "routing": {"domainStrategy": "AsIs", "rules": routing_rules},
+    }
+)
+config_text = json.dumps(config, ensure_ascii=False, indent=2) + "\n"
+config_path.write_text(config_text)
+
+yaml_lines = []
+for client in display_clients:
+    label = f"{node_name}-{client['name']}"
+    yaml_lines.extend(
+        [
+            f"- name: {yaml_scalar(label)}",
+            "  type: vless",
+            f"  server: {yaml_scalar(public_address)}",
+            f"  port: {reality_port}",
+            f"  uuid: {yaml_scalar(client['uuid'])}",
+            "  udp: false",
+            "  tls: true",
+            "  flow: xtls-rprx-vision",
+            f"  servername: {yaml_scalar(server_name)}",
+            "  reality-opts:",
+            f"    public-key: {yaml_scalar(public_key)}",
+            f"    short-id: {yaml_scalar(short_id)}",
+            "  client-fingerprint: chrome",
+            "  network: tcp",
+        ]
+    )
+
+state = {
+    "version": 3,
+    "managedBy": "vps-manager",
+    "configSha256": hashlib.sha256(config_text.encode()).hexdigest(),
+    "nodeName": node_name,
+    "publicAddress": public_address,
+    "reality": {
+        "port": reality_port,
+        "dest": reality_dest,
+        "serverNames": server_names,
+        "privateKey": private_key,
+        "publicKey": public_key,
+        "shortId": short_id,
+    },
+    "native": {
+        "name": local_name,
+        "uuid": local_uuid,
+        "email": local_email,
+        "outbound": "direct",
+    },
+    "clients": display_clients,
+    "proxies": state_proxies,
+    "dnsFallback": {
+        "enabled": needs_shared_dns,
+        "server": (
+            "https+local://1.1.1.1/dns-query"
+            if needs_shared_dns
+            else None
+        ),
+        "route": "VPS direct",
+    },
+    "optionalInbounds": optional_inbounds,
+}
+state_path.write_text(
+    json.dumps(state, ensure_ascii=False, indent=2) + "\n"
+)
+
+lines = [
+    f"节点名称: {node_name}",
+    f"自动检测地址: {public_address}:{reality_port}",
+    f"Reality dest: {reality_dest}",
+    f"Reality serverNames: {', '.join(server_names)}",
+    f"YAML servername: {server_name}",
+    f"Reality PrivateKey: {private_key}",
+    f"Reality PublicKey/Password: {public_key}",
+    f"Reality Short ID: {short_id}",
+    "",
+    "VLESS 客户端:",
+]
+for client in display_clients:
+    lines.extend(
+        [
+            f"- {client['name']}",
+            f"  UUID: {client['uuid']}",
+            f"  出口: {client['outbound']}",
+            f"  域名处理: {client['resolution']}",
+        ]
+    )
+
+if needs_shared_dns:
+    lines.extend(
+        [
+            "",
+            "共享 IPv4 DNS 兜底:",
+            "  DoH: https+local://1.1.1.1/dns-query",
+            "  路径: VPS 直连（供本配置中所有 UseIPv4 出站解析域名）",
+        ]
+    )
+
+if "socks5" in optional_inbounds:
+    item = optional_inbounds["socks5"]
+    lines.extend(
+        [
+            "",
+            "SOCKS5 入站:",
+            f"  监听: {item['listen']}:{item['port']}",
+            f"  用户名: {item['username']}",
+            f"  密码: {item['password']}",
+        ]
+    )
+    if item["listen"] not in {"127.0.0.1", "::1"}:
+        yaml_lines.extend(
+            [
+                f"- name: {yaml_scalar(f'{node_name}-socks5')}",
+                "  type: socks5",
+                f"  server: {yaml_scalar(public_address)}",
+                f"  port: {item['port']}",
+                f"  username: {yaml_scalar(item['username'])}",
+                f"  password: {yaml_scalar(item['password'])}",
+                "  udp: false",
+            ]
+        )
+    else:
+        lines.append("  提示: 仅监听本机，因此不生成 AWS YAML 节点。")
+
+if "shadowsocks" in optional_inbounds:
+    item = optional_inbounds["shadowsocks"]
+    lines.extend(
+        [
+            "",
+            "Shadowsocks 入站:",
+            f"  监听: {item['listen']}:{item['port']}",
+            f"  加密: {item['method']}",
+            f"  密码: {item['password']}",
+        ]
+    )
+    yaml_lines.extend(
+        [
+            f"- name: {yaml_scalar(f'{node_name}-ss')}",
+            "  type: ss",
+            f"  server: {yaml_scalar(public_address)}",
+            f"  port: {item['port']}",
+            f"  cipher: {yaml_scalar(item['method'])}",
+            f"  password: {yaml_scalar(item['password'])}",
+            "  udp: true",
+        ]
+    )
+
+lines.extend(
+    [
+        "",
+        "提醒: 云厂商安全组端口需要单独开放。",
+    ]
+)
+info_path.write_text("\n".join(lines) + "\n")
+yaml_path.write_text("\n".join(yaml_lines) + "\n")
+PY
+}
+
+
+generate_reality_keys() {
+  local key_output
+  local private_key
+  local public_key
+
+  key_output="$("${XRAY_BIN}" x25519)"
+  private_key="$(printf '%s\n' "${key_output}" | sed -n 's/^PrivateKey:[[:space:]]*//p' | head -n 1)"
+  public_key="$(printf '%s\n' "${key_output}" | sed -n 's/^Password (PublicKey):[[:space:]]*//p' | head -n 1)"
+  if [[ -z "${public_key}" ]]; then
+    public_key="$(printf '%s\n' "${key_output}" | sed -n -E 's/^(PublicKey|Public key):[[:space:]]*//p' | head -n 1)"
+  fi
+  [[ -n "${private_key}" && -n "${public_key}" ]] \
+    || die "无法解析 Xray x25519 输出。"
+  printf '%s\t%s' "${private_key}" "${public_key}"
+}
+
+
+xray_service_user() {
+  local user
+  user="$(systemctl show xray.service --property=User --value 2>/dev/null || true)"
+  printf '%s' "${user:-root}"
+}
+
+
+validate_xray_config() {
+  local path="$1"
+  local service_user
+
+  service_user="$(xray_service_user)"
+  if [[ "${service_user}" == "root" ]]; then
+    "${XRAY_BIN}" run -test -config "${path}"
+  else
+    runuser -u "${service_user}" -- "${XRAY_BIN}" run -test -config "${path}"
+  fi
+}
+
+
+rollback_xray_config() {
+  local backup_file="$1"
+
+  if [[ -n "${backup_file}" && -f "${backup_file}" ]]; then
+    cp -a -- "${backup_file}" "${XRAY_CONFIG}"
+    systemctl restart xray.service || true
+    warn "新配置启动失败，已恢复原配置。"
+  else
+    warn "新配置启动失败，且没有可恢复的旧配置。"
+  fi
+}
+
+
+maybe_open_ufw_port() {
+  local port="$1"
+  local protocol="$2"
+
+  command -v ufw >/dev/null 2>&1 || return 0
+  ufw status 2>/dev/null | grep -q '^Status: active' || return 0
+  if prompt_yes_no "检测到 UFW，是否开放 ${port}/${protocol}" "1"; then
+    ufw allow "${port}/${protocol}"
+  fi
+}
+
+
+configure_xray() {
+  local key_pair
+  local private_key
+  local public_key
+  local short_id
+  local proxy_input
+  local generated_config
+  local generated_state
+  local generated_info
+  local generated_yaml
+  local service_user
+  local service_group
+  local staged_config="" staged_state="" staged_info="" staged_yaml=""
+  local bundle=""
+  local failed=0
+
+  require_root
+  check_supported_os
+  command -v python3 >/dev/null 2>&1 || die "需要 python3。"
+  command -v openssl >/dev/null 2>&1 || die "需要 openssl。"
+  command -v curl >/dev/null 2>&1 || die "需要 curl 来检测 SOCKS5 出站兼容性。"
+
+  if [[ "${DEMO_MODE}" != "1" && ! -x "${XRAY_BIN}" ]]; then
+    die "尚未安装 Xray，请先选择“安装或升级 Xray”。"
+  fi
+
+  log "收集 Xray 配置"
+  collect_xray_configuration
+  ensure_work_dir
+  proxy_input="${WORK_DIR}/proxies.tsv"
+  generated_config="${WORK_DIR}/config.json"
+  generated_state="${WORK_DIR}/state.json"
+  generated_info="${WORK_DIR}/last-install.txt"
+  generated_yaml="${WORK_DIR}/proxies.yaml"
+  write_proxy_input_file "${proxy_input}"
+
+  if [[ "${DEMO_MODE}" == "1" ]]; then
+    private_key="DEMO_PRIVATE_KEY"
+    public_key="DEMO_PUBLIC_KEY"
+    short_id="0123456789abcdef"
+  else
+    key_pair="$(generate_reality_keys)"
+    private_key="${key_pair%%$'\t'*}"
+    public_key="${key_pair#*$'\t'}"
+    short_id="$(openssl rand -hex 8)"
+  fi
+
+  generate_xray_files \
+    "${private_key}" \
+    "${public_key}" \
+    "${short_id}" \
+    "${proxy_input}" \
+    "${generated_config}" \
+    "${generated_state}" \
+    "${generated_info}" \
+    "${generated_yaml}"
+
+  if [[ "${DEMO_MODE}" == "1" ]]; then
+    DEMO_CONFIG_FILE="${generated_config}"
+    DEMO_STATE_FILE="${generated_state}"
+    DEMO_INFO_FILE="${generated_info}"
+    DEMO_YAML_FILE="${generated_yaml}"
+    log "[预览] 完整 config.json（不会写入系统）"
+    cat "${DEMO_CONFIG_FILE}"
+    return 0
+  fi
+
+  service_user="$(xray_service_user)"
+  id "${service_user}" >/dev/null 2>&1 || die "Xray 服务用户不存在：${service_user}"
+  service_group="$(id -gn "${service_user}")"
+  install -d -o root -g root -m 755 "$(dirname "${XRAY_CONFIG}")"
+  install -d -o root -g root -m 700 "${STATE_DIR}"
+
+  staged_config="$(mktemp "$(dirname "${XRAY_CONFIG}")/.config.json.XXXXXX")"
+  staged_state="$(mktemp "${STATE_DIR}/.state.json.XXXXXX")"
+  staged_info="$(mktemp "${STATE_DIR}/.last-install.txt.XXXXXX")"
+  staged_yaml="$(mktemp "${STATE_DIR}/.proxies.yaml.XXXXXX")"
+  if ! install -o root -g "${service_group}" -m 640 "${generated_config}" "${staged_config}" \
+    || ! install -o root -g root -m 600 "${generated_state}" "${staged_state}" \
+    || ! install -o root -g root -m 600 "${generated_info}" "${staged_info}" \
+    || ! install -o root -g root -m 600 "${generated_yaml}" "${staged_yaml}"; then
+    rm -f -- "${staged_config}" "${staged_state}" "${staged_info}" "${staged_yaml}"
+    die "候选文件暂存失败，系统配置没有变化。"
+  fi
+
+  log "使用 Xray 服务用户校验新配置"
+  if ! validate_xray_config "${staged_config}"; then
+    rm -f -- "${staged_config}" "${staged_state}" "${staged_info}" "${staged_yaml}"
+    die "候选 Xray 配置校验失败，系统配置没有变化。"
+  fi
+  if ! bundle="$(backup_xray_bundle)" || [[ -z "${bundle}" || ! -d "${bundle}" ]]; then
+    rm -f -- "${staged_config}" "${staged_state}" "${staged_info}" "${staged_yaml}"
+    die "统一备份失败，拒绝替换系统配置。"
+  fi
+
+  mv -f -- "${staged_config}" "${XRAY_CONFIG}" || failed=1
+  [[ "${failed}" != 0 ]] || mv -f -- "${staged_state}" "${STATE_FILE}" || failed=1
+  [[ "${failed}" != 0 ]] || mv -f -- "${staged_info}" "${INFO_FILE}" || failed=1
+  [[ "${failed}" != 0 ]] || mv -f -- "${staged_yaml}" "${YAML_FILE}" || failed=1
+  [[ "${failed}" != 0 ]] || validate_xray_config "${XRAY_CONFIG}" || failed=1
+  [[ "${failed}" != 0 ]] || systemctl daemon-reload || failed=1
+  [[ "${failed}" != 0 ]] || systemctl enable xray.service || failed=1
+  [[ "${failed}" != 0 ]] || systemctl restart xray.service || failed=1
+  [[ "${failed}" != 0 ]] || systemctl is-active --quiet xray.service || failed=1
+  if [[ "${failed}" != 0 ]]; then
+    rm -f -- "${staged_config}" "${staged_state}" "${staged_info}" "${staged_yaml}"
+    if ! rollback_xray_bundle "${bundle}"; then
+      die "完整配置失败，且统一备份未能恢复，请立即检查 ${bundle}。"
+    fi
+    die "完整配置失败，已恢复原配置和服务。"
+  fi
+
+  maybe_open_ufw_port "${CFG_REALITY_PORT}" "tcp"
+  if [[ "${CFG_ENABLE_SOCKS}" == "1" && "${CFG_SOCKS_LISTEN}" != "127.0.0.1" && "${CFG_SOCKS_LISTEN}" != "::1" ]]; then
+    maybe_open_ufw_port "${CFG_SOCKS_PORT}" "tcp"
+  fi
+  if [[ "${CFG_ENABLE_SS}" == "1" ]]; then
+    maybe_open_ufw_port "${CFG_SS_PORT}" "tcp"
+    maybe_open_ufw_port "${CFG_SS_PORT}" "udp"
+  fi
+
+  log "Xray 配置完成"
+  printf '连接参数已保存：%s\n' "${INFO_FILE}"
+  printf 'AWS YAML 节点已保存：%s\n' "${YAML_FILE}"
+  printf '统一备份：%s\n' "${bundle}"
+}
+
+
+load_xray_model_from_paths() {
+  local config_source="$1" state_source="$2" destination="$3"
+  python3 - "${config_source}" "${state_source}" "${destination}" <<'PY'
+from __future__ import annotations
+from collections import Counter
+import hashlib, json, os, sys, uuid
+from pathlib import Path
+
+config_path, state_path, destination = map(Path, sys.argv[1:4])
+def stop(message): raise SystemExit(f"无法更新：{message}")
+try:
+    config_text = config_path.read_text(); config = json.loads(config_text)
+    state = json.loads(state_path.read_text())
+except Exception as error: stop(f"读取现有配置失败：{error}")
+version = state.get("version")
+if version not in (2, 3): stop("state.json 版本不受支持")
+if version == 3:
+    if state.get("managedBy") != "vps-manager": stop("state.json 不是 VPS Manager 受管状态")
+    if state.get("configSha256") and state["configSha256"] != hashlib.sha256(config_text.encode()).hexdigest():
+        stop("config.json 已在脚本外修改，状态指纹不一致")
+if not isinstance(config, dict) or set(config) - {"log","dns","inbounds","outbounds","routing"}: stop("config.json 包含非脚本管理的顶层配置")
+if config.get("log") != {"loglevel":"warning"}: stop("log 配置不符合脚本管理结构")
+inbounds, outbounds, routing = (config.get(x) for x in ("inbounds","outbounds","routing"))
+if not isinstance(inbounds,list) or not isinstance(outbounds,list) or not isinstance(routing,dict): stop("缺少 inbounds/outbounds/routing")
+if routing.get("domainStrategy") != "AsIs" or set(routing) != {"domainStrategy","rules"} or not isinstance(routing.get("rules"),list): stop("routing 不是脚本管理结构")
+reality_list=[x for x in inbounds if x.get("protocol")=="vless" and x.get("streamSettings",{}).get("security")=="reality"]
+if len(reality_list)!=1: stop("必须且只能存在一个受管 VLESS-Reality 入站")
+reality_inbound=reality_list[0]
+if set(reality_inbound)!={"port","protocol","settings","streamSettings"}: stop("VLESS-Reality 入站包含非脚本管理字段")
+settings=reality_inbound.get("settings",{}); stream=reality_inbound.get("streamSettings",{}); rs=stream.get("realitySettings",{})
+if set(settings)!={"clients","decryption"} or settings.get("decryption")!="none" or stream.get("network")!="tcp" or set(stream)!={"network","security","realitySettings"} or set(rs)!={"show","dest","xver","serverNames","privateKey","shortIds"} or rs.get("show") is not False or rs.get("xver")!=0: stop("VLESS-Reality 内容不是脚本生成结构")
+if len(rs.get("shortIds",[]))!=1: stop("更新器只管理一个 Reality Short ID")
+state_clients=state.get("clients"); state_proxies=state.get("proxies")
+if not isinstance(state_clients,list) or not isinstance(state_proxies,list): stop("state.json 缺少 clients/proxies")
+by_tag={}
+for x in outbounds:
+    tag=x.get("tag")
+    if not isinstance(tag,str) or not tag or tag in by_tag: stop("出口 tag 缺失或重复")
+    by_tag[tag]=x
+proxy_tags=[str(x.get("tag","")) for x in state_proxies]
+if not all(proxy_tags) or len(set(proxy_tags))!=len(proxy_tags): stop("state.json 的 ISP tag 无效")
+if set(by_tag)!={"direct",*proxy_tags}: stop("发现 state.json 未登记出口，或受管出口缺失")
+if by_tag["direct"]!={"protocol":"freedom","tag":"direct","settings":{"domainStrategy":"UseIPv4"}}: stop("direct 出口不是脚本管理结构")
+runtime=settings.get("clients")
+if not isinstance(runtime,list): stop("VLESS clients 格式错误")
+runtime_by_email={}
+for c in runtime:
+    if set(c)!={"id","flow","email"} or c.get("flow")!="xtls-rprx-vision": stop("发现非脚本管理 VLESS client")
+    try: uuid.UUID(str(c.get("id")))
+    except Exception: stop("VLESS client UUID 无效")
+    email=c.get("email")
+    if not isinstance(email,str) or email in runtime_by_email: stop("VLESS client email 缺失或重复")
+    runtime_by_email[email]=c
+meta_by_outbound={}
+for c in state_clients:
+    tag=c.get("outbound")
+    if not isinstance(tag,str) or tag in meta_by_outbound: stop("state clients 出口缺失或重复")
+    meta_by_outbound[tag]=c
+if set(meta_by_outbound)!={"direct",*proxy_tags}: stop("state clients 与受管出口不一致")
+if set(runtime_by_email)!={str(x.get("email","")) for x in state_clients}: stop("live VLESS clients 与 state clients 不一致")
+if version==3:
+    for tag,meta in meta_by_outbound.items():
+        email=str(meta.get("email","")); live=runtime_by_email.get(email)
+        if live is None or str(meta.get("uuid",""))!=str(live["id"]): stop(f"v3 state client {tag} 与 live UUID 不一致")
+
+def parse_proxy(outbound):
+    protocol=outbound.get("protocol"); keys=set(outbound); s=outbound.get("settings")
+    if not isinstance(s,dict): stop("ISP 出口 settings 无效")
+    if protocol=="socks":
+        if keys-{"protocol","tag","settings","targetStrategy"} or set(s)-{"address","port","user","pass"}: stop("SOCKS 出口包含非脚本管理字段")
+        strategy=outbound.get("targetStrategy","AsIs")
+        if strategy not in {"AsIs","UseIPv4"}: stop("SOCKS targetStrategy 不受支持")
+        return {"scheme":"socks5","host":s.get("address"),"port":s.get("port"),"username":s.get("user",""),"password":s.get("pass","")},strategy
+    if protocol=="http":
+        if keys-{"protocol","tag","settings","streamSettings"} or set(s)-{"address","port","user","pass"}: stop("HTTP 出口包含非脚本管理字段")
+        scheme="http"
+        if "streamSettings" in outbound:
+            expected={"security":"tls","tlsSettings":{"serverName":s.get("address"),"allowInsecure":False}}
+            if outbound.get("streamSettings")!=expected: stop("HTTPS TLS 配置不是脚本管理结构")
+            scheme="https"
+        return {"scheme":scheme,"host":s.get("address"),"port":s.get("port"),"username":s.get("user",""),"password":s.get("pass","")},"AsIs"
+    if protocol=="shadowsocks":
+        if keys!={"protocol","tag","settings"} or set(s)!={"address","port","method","password"}: stop("Shadowsocks 出口不是脚本管理结构")
+        return {"scheme":"ss","host":s.get("address"),"port":s.get("port"),"method":s.get("method"),"password":s.get("password")},"AsIs"
+    stop(f"出口协议 {protocol!r} 不受更新器管理")
+
+model_proxies=[]
+for record in state_proxies:
+    tag=str(record["tag"]); meta=meta_by_outbound[tag]; email=str(meta.get("email","")); live=runtime_by_email.get(email)
+    if live is None: stop(f"出口 {tag} 找不到对应 live client")
+    proxy,strategy=parse_proxy(by_tag[tag])
+    if not isinstance(proxy.get("host"),str) or not proxy["host"]: stop("ISP 地址为空")
+    try: proxy["port"]=int(proxy.get("port"))
+    except Exception: stop("ISP 端口无效")
+    if not 1<=proxy["port"]<=65535: stop("ISP 端口超出范围")
+    resolution=record.get("resolutionCheck")
+    if proxy["scheme"]=="socks5" and (not isinstance(resolution,dict) or resolution.get("targetStrategy")!=strategy):
+        resolution={"result":"imported-live-config","mode":"xray-ipv4" if strategy=="UseIPv4" else "remote-domain","targetStrategy":strategy,"checkedAt":None,"summary":"从现有 Xray 配置迁移，未重新检测","attempts":[]}
+    elif proxy["scheme"]!="socks5": resolution=None
+    if version==3:
+        if record.get("email")!=email or record.get("uuid")!=live["id"] or record.get("name")!=meta.get("name"): stop(f"v3 状态中 {tag} 的稳定身份与 live config 不一致")
+        stable_id=record.get("id")
+    else: stable_id=f"legacy-{tag}"
+    if not isinstance(stable_id,str) or not stable_id: stop(f"出口 {tag} 缺少稳定 ID")
+    model_proxies.append({"id":stable_id,"name":str(record.get("name","")),"tag":tag,"email":email,"uuid":str(live["id"]),"proxy":proxy,"resolutionCheck":resolution,"needsProbe":False})
+native_meta=meta_by_outbound["direct"]; native_email=str(native_meta.get("email","")); native_live=runtime_by_email.get(native_email)
+if native_live is None: stop("找不到 native live client")
+if version==3:
+    native_state=state.get("native")
+    expected_native={"name":str(native_meta.get("name","native")),"uuid":str(native_live["id"]),"email":native_email,"outbound":"direct"}
+    if native_state!=expected_native: stop("v3 state.native 与 state.clients/live config 不一致")
+optional={}
+for inbound in inbounds:
+    if inbound is reality_inbound: continue
+    tag=inbound.get("tag"); s=inbound.get("settings",{})
+    if tag=="socks-in" and inbound.get("protocol")=="socks":
+        users=s.get("users")
+        if set(inbound)!={"tag","listen","port","protocol","settings"} or set(s)!={"auth","users","udp"} or s.get("auth")!="password" or s.get("udp") is not False or not isinstance(users,list) or len(users)!=1 or set(users[0])!={"user","pass"}: stop("SOCKS5 入站不是脚本管理结构")
+        optional["socks5"]={"listen":str(inbound.get("listen")),"port":int(inbound.get("port")),"username":str(users[0]["user"]),"password":str(users[0]["pass"])}
+    elif tag=="shadowsocks-in" and inbound.get("protocol")=="shadowsocks":
+        if set(inbound)!={"tag","listen","port","protocol","settings"} or set(s)!={"network","method","password"} or s.get("network")!="tcp,udp": stop("Shadowsocks 入站不是脚本管理结构")
+        optional["shadowsocks"]={"listen":str(inbound.get("listen")),"port":int(inbound.get("port")),"method":str(s.get("method")),"password":str(s.get("password"))}
+    else: stop("发现非脚本管理的额外入站")
+expected=[{"type":"field","user":[str(c["email"])],"outboundTag":str(c["outbound"])} for c in state_clients]
+if "socks5" in optional: expected.append({"type":"field","inboundTag":["socks-in"],"outboundTag":"direct"})
+if "shadowsocks" in optional: expected.append({"type":"field","inboundTag":["shadowsocks-in"],"outboundTag":"direct"})
+norm=lambda x:json.dumps(x,ensure_ascii=False,sort_keys=True)
+if Counter(map(norm,routing["rules"]))!=Counter(map(norm,expected)): stop("routing.rules 与受管 clients/inbounds 不一致")
+needs_dns=any((x.get("resolutionCheck") or {}).get("targetStrategy")=="UseIPv4" for x in model_proxies)
+expected_dns={"servers":["https+local://1.1.1.1/dns-query"],"queryStrategy":"UseIPv4"}
+if needs_dns and config.get("dns")!=expected_dns: stop("UseIPv4 出口需要的共享 DNS 已漂移")
+if not needs_dns and "dns" in config: stop("发现非脚本管理 DNS 配置")
+sr=state.get("reality",{}); live_reality={"port":int(reality_inbound["port"]),"dest":str(rs["dest"]),"serverNames":[str(x) for x in rs["serverNames"]],"privateKey":str(rs["privateKey"]),"publicKey":str(sr.get("publicKey","")),"shortId":str(rs["shortIds"][0])}
+if not live_reality["publicKey"]: stop("state.json 缺少 Reality publicKey")
+for field in ("port","dest","serverNames","shortId"):
+    if sr.get(field)!=live_reality[field]: stop(f"Reality {field} 在 state 与 live config 间不一致")
+if version==3 and sr.get("privateKey")!=live_reality["privateKey"]: stop("Reality privateKey 在 v3 state 与 live config 间不一致")
+names=[str(x.get("name","")) for x in model_proxies]
+if not all(names) or len(set(names))!=len(names): stop("ISP 名称为空或重复")
+model={"version":3,"managedBy":"vps-manager","nodeName":str(state.get("nodeName","")),"publicAddress":str(state.get("publicAddress","")),"reality":live_reality,"native":{"name":str(native_meta.get("name","native")),"uuid":str(native_live["id"]),"email":native_email,"outbound":"direct"},"proxies":model_proxies,"optionalInbounds":optional}
+if not model["nodeName"] or not model["publicAddress"]: stop("state.json 缺少节点名称或客户端连接地址")
+destination.write_text(json.dumps(model,ensure_ascii=False,indent=2)+"\n"); os.chmod(destination,0o600)
+PY
+}
+
+
+pending_model_query() {
+  local path="$1"
+  python3 - "${XRAY_PENDING_MODEL}" "${path}" <<'PY'
+import json, sys
+value=json.load(open(sys.argv[1]))
+for part in sys.argv[2].split("."): value=value[int(part)] if isinstance(value,list) else value[part]
+if isinstance(value,bool): print("1" if value else "0")
+elif value is None: print("")
+elif isinstance(value,(dict,list)): print(json.dumps(value,ensure_ascii=False))
+else: print(value)
+PY
+}
+
+pending_model_mutate() {
+  local action="$1"; shift
+  if python3 - "${XRAY_PENDING_MODEL}" "${action}" "$@" <<'PY'
+from __future__ import annotations
+import json, os, re, sys, uuid
+from pathlib import Path
+path=Path(sys.argv[1]); action=sys.argv[2]; args=sys.argv[3:]; model=json.loads(path.read_text())
+def unique_name(name,skip=None):
+    if not name: raise SystemExit("ISP 名称不能为空")
+    if any(i!=skip and x["name"]==name for i,x in enumerate(model["proxies"])): raise SystemExit("ISP 名称不能重复")
+if action=="set":
+    field,value=args
+    allowed={"nodeName","publicAddress","reality.port","reality.dest","reality.serverNames","reality.privateKey","reality.publicKey","reality.shortId"}
+    if field not in allowed: raise SystemExit("不允许更新该字段")
+    if field=="nodeName": model["nodeName"]=value
+    elif field=="publicAddress": model["publicAddress"]=value
+    elif field=="reality.port": model["reality"]["port"]=int(value)
+    elif field=="reality.serverNames":
+        values=list(dict.fromkeys(x.strip() for x in value.split(",") if x.strip()))
+        if not values: raise SystemExit("serverNames 不能为空")
+        model["reality"]["serverNames"]=values
+    else: model["reality"][field.split(".",1)[1]]=value
+elif action=="proxy-add":
+    name,link=args; unique_name(name); used=[]
+    for item in model["proxies"]:
+        m=re.fullmatch(r"proxy_([0-9]+)",item["tag"])
+        if m: used.append(int(m.group(1)))
+    number=max(used,default=0)+1
+    model["proxies"].append({"id":str(uuid.uuid4()),"name":name,"tag":f"proxy_{number}","email":f"proxy-{number}@vps-manager.local","uuid":str(uuid.uuid4()),"sourceLink":link,"resolutionCheck":None,"needsProbe":True})
+elif action=="proxy-name":
+    index,name=int(args[0]),args[1]; unique_name(name,index); model["proxies"][index]["name"]=name
+elif action=="proxy-link":
+    index,link=int(args[0]),args[1]; item=model["proxies"][index]; item.pop("proxy",None); item["sourceLink"]=link; item["resolutionCheck"]=None; item["needsProbe"]=True
+elif action=="proxy-delete": del model["proxies"][int(args[0])]
+elif action=="proxy-retest":
+    item=model["proxies"][int(args[0])]
+    if item.get("proxy",{}).get("scheme")!="socks5" and not item.get("sourceLink"): raise SystemExit("只有 SOCKS5 出口需要域名能力检测")
+    item["needsProbe"]=True
+elif action=="inbound-enable":
+    kind=args[0]
+    if kind=="socks5": model["optionalInbounds"][kind]={"listen":args[1],"port":int(args[2]),"username":args[3],"password":args[4]}
+    elif kind=="shadowsocks": model["optionalInbounds"][kind]={"listen":args[1],"port":int(args[2]),"method":args[3],"password":args[4]}
+    else: raise SystemExit("未知入站类型")
+elif action=="inbound-set":
+    kind,field,value=args
+    if kind not in model["optionalInbounds"]: raise SystemExit("该入站尚未开启")
+    model["optionalInbounds"][kind][field]=int(value) if field=="port" else value
+elif action=="inbound-disable": model["optionalInbounds"].pop(args[0],None)
+elif action=="rotate-uuid":
+    if args[0]=="native": model["native"]["uuid"]=str(uuid.uuid4())
+    else: model["proxies"][int(args[0])]["uuid"]=str(uuid.uuid4())
+elif action=="reality-key": model["reality"].update({"privateKey":args[0],"publicKey":args[1]})
+elif action=="short-id": model["reality"]["shortId"]=args[0]
+else: raise SystemExit("未知模型操作")
+tmp=path.with_name(path.name+".new"); tmp.write_text(json.dumps(model,ensure_ascii=False,indent=2)+"\n"); os.chmod(tmp,0o600); os.replace(tmp,path)
+PY
+  then
+    XRAY_UPDATE_DIRTY=1
+    XRAY_CANDIDATE_READY=0
+  else
+    warn "输入无效，待更新配置没有变化。"
+  fi
+  return 0
+}
+
+validate_pending_model() {
+  python3 - "${XRAY_PENDING_MODEL}" <<'PY'
+import json,re,sys,uuid
+model=json.load(open(sys.argv[1]))
+if model.get("version")!=3 or model.get("managedBy")!="vps-manager": raise SystemExit("待更新模型不是 v3 受管结构")
+for field in ("nodeName","publicAddress"):
+    if not isinstance(model.get(field),str) or not model[field].strip(): raise SystemExit(f"{field} 不能为空")
+r=model.get("reality",{})
+for field in ("dest","privateKey","publicKey","shortId"):
+    if not isinstance(r.get(field),str) or not r[field]: raise SystemExit(f"Reality {field} 不能为空")
+if " " in r["dest"]: raise SystemExit("Reality dest 不能包含空格")
+if not isinstance(r.get("serverNames"),list) or not all(isinstance(x,str) and x for x in r["serverNames"]): raise SystemExit("Reality serverNames 无效")
+if not re.fullmatch(r"[0-9a-fA-F]+",r["shortId"]) or len(r["shortId"])%2: raise SystemExit("Reality Short ID 必须是偶数长度十六进制")
+try: ports=[int(r.get("port"))]
+except Exception: raise SystemExit("Reality 端口无效")
+if not 1<=ports[0]<=65535: raise SystemExit("Reality 端口超出范围")
+ids={k:[] for k in ("tag","email","uuid","id")}; names=[]
+for item in model.get("proxies",[]):
+    names.append(item.get("name"))
+    for key in ids: ids[key].append(item.get(key))
+    if not item.get("sourceLink") and not isinstance(item.get("proxy"),dict): raise SystemExit("ISP 出口缺少受管输入")
+for key,values in ids.items():
+    if not all(isinstance(x,str) and x for x in values) or len(set(values))!=len(values): raise SystemExit(f"ISP {key} 缺失或重复")
+for value in [model["native"]["uuid"],*ids["uuid"]]:
+    try: uuid.UUID(value)
+    except Exception: raise SystemExit("client UUID 无效")
+if not all(isinstance(x,str) and x for x in names) or len(set(names))!=len(names): raise SystemExit("ISP 名称为空或重复")
+for kind,item in model.get("optionalInbounds",{}).items():
+    if kind not in {"socks5","shadowsocks"}: raise SystemExit("存在未知可选入站")
+    try: port=int(item.get("port",0))
+    except Exception: raise SystemExit(f"{kind} 端口无效")
+    if not 1<=port<=65535: raise SystemExit(f"{kind} 端口无效")
+    ports.append(port)
+    if not item.get("listen") or not item.get("password"): raise SystemExit(f"{kind} 监听地址或密码为空")
+    if kind=="socks5" and not item.get("username"): raise SystemExit("SOCKS5 用户名为空")
+    if kind=="shadowsocks" and not item.get("method"): raise SystemExit("Shadowsocks 加密方式为空")
+if len(ports)!=len(set(ports)): raise SystemExit("Reality、SOCKS5 和 Shadowsocks 端口不能重复")
+PY
+}
+
+show_pending_xray_summary() {
+  python3 - "${XRAY_PENDING_MODEL}" <<'PY'
+import json,sys
+m=json.load(open(sys.argv[1])); r=m["reality"]; o=m["optionalInbounds"]
+print(f"节点：{m['nodeName']}  客户端地址：{m['publicAddress']}")
+print(f"Reality：{r['port']} -> {r['dest']}  serverNames={','.join(r['serverNames'])}")
+print(f"ISP 出口：{len(m['proxies'])} 个")
+print("SOCKS5 入站："+(f"{o['socks5']['listen']}:{o['socks5']['port']}" if "socks5" in o else "关闭"))
+print("Shadowsocks 入站："+(f"{o['shadowsocks']['listen']}:{o['shadowsocks']['port']}" if "shadowsocks" in o else "关闭"))
+PY
+}
+
+list_pending_proxies() {
+  python3 - "${XRAY_PENDING_MODEL}" <<'PY'
+import json,sys
+m=json.load(open(sys.argv[1]))
+if not m["proxies"]: print("  （无 ISP 出口）")
+for i,item in enumerate(m["proxies"],1):
+    p=item.get("proxy") or {}; print(f"  {i}) {item['name']} [{p.get('scheme','待解析')}] {p.get('host','新链接')}:{p.get('port','')} tag={item['tag']}")
+PY
+}
+
+
+update_node_info_menu() {
+  local choice current value
+  while true; do
+    printf '\n节点与客户端 YAML 信息：\n  1) 节点名称：%s\n  2) 客户端连接地址：%s\n  0) 返回\n' "$(pending_model_query nodeName)" "$(pending_model_query publicAddress)"
+    read -r -p "请选择 [0]: " choice
+    case "${choice:-0}" in
+      1) current="$(pending_model_query nodeName)"; value="$(prompt_default "新节点名称" "${current}")"; [[ "${value}" == "${current}" ]] || pending_model_mutate set nodeName "${value}" ;;
+      2) current="$(pending_model_query publicAddress)"; value="$(prompt_default "新公网 IP 或域名（仅用于客户端 YAML）" "${current}")"; [[ "${value}" == "${current}" ]] || pending_model_mutate set publicAddress "${value}" ;;
+      0) return 0;; *) warn "未知选项。";;
+    esac
+  done
+}
+
+update_reality_menu() {
+  local choice current value key_pair private_key public_key
+  while true; do
+    printf '\nReality 更新：\n  1) 端口：%s\n  2) dest：%s\n  3) serverNames\n  4) 轮换密钥对\n  5) 轮换 Short ID\n  0) 返回\n' "$(pending_model_query reality.port)" "$(pending_model_query reality.dest)"
+    read -r -p "请选择 [0]: " choice
+    case "${choice:-0}" in
+      1) current="$(pending_model_query reality.port)"; while true; do value="$(prompt_default "新 Reality 端口" "${current}")"; validate_port "${value}" && break; warn "端口必须在 1-65535 之间。"; done; [[ "${value}" == "${current}" ]] || pending_model_mutate set reality.port "${value}";;
+      2) current="$(pending_model_query reality.dest)"; value="$(prompt_default "新 Reality dest" "${current}")"; [[ -n "${value}" && "${value}" != *" "* ]] || { warn "dest 格式无效。"; continue; }; [[ "${value}" == "${current}" ]] || pending_model_mutate set reality.dest "${value}";;
+      3) current="$(python3 - "${XRAY_PENDING_MODEL}" <<'PY'
+import json,sys
+print(",".join(json.load(open(sys.argv[1]))["reality"]["serverNames"]))
+PY
+)"; value="$(prompt_default "新 serverNames（逗号分隔）" "${current}")"; [[ "${value}" == "${current}" ]] || pending_model_mutate set reality.serverNames "${value}";;
+      4) prompt_yes_no "轮换密钥会要求所有客户端更新，确认继续" "0" || continue; [[ "${DEMO_MODE}" == 1 ]] && { warn "预览模式不生成真实 Reality 密钥。"; continue; }; key_pair="$(generate_reality_keys)"; private_key="${key_pair%%$'\t'*}"; public_key="${key_pair#*$'\t'}"; pending_model_mutate reality-key "${private_key}" "${public_key}";;
+      5) prompt_yes_no "轮换 Short ID 会要求所有客户端更新，确认继续" "0" || continue; pending_model_mutate short-id "$(openssl rand -hex 8)";;
+      0) return 0;; *) warn "未知选项。";;
+    esac
+  done
+}
+
+manage_isp_outbounds_menu() {
+  local choice selected index subchoice name link current count
+  while true; do
+    printf '\nISP 出口：\n'; list_pending_proxies
+    printf '  a) 增加出口\n  e) 编辑出口\n  d) 删除出口\n  r) 重新检测 SOCKS5 出口\n  0) 返回\n'
+    read -r -p "请选择 [0]: " choice
+    case "${choice:-0}" in
+      a|A) count="$(python3 - "${XRAY_PENDING_MODEL}" <<'PY'
+import json,sys
+print(len(json.load(open(sys.argv[1]))["proxies"])+1)
+PY
+)"; name="$(prompt_default "出口名称" "isp-${count}")"; link="$(prompt_secret "粘贴代理链接")"; [[ -n "${link}" ]] || { warn "代理链接不能为空。"; continue; }; pending_model_mutate proxy-add "${name}" "${link}";;
+      e|E)
+        read -r -p "要编辑的编号: " selected; [[ "${selected}" =~ ^[0-9]+$ ]] || { warn "编号无效。"; continue; }; index=$((selected-1)); name="$(pending_model_query "proxies.${index}.name" 2>/dev/null || true)"; [[ -n "${name}" ]] || { warn "编号不存在。"; continue; }
+        printf '  1) 修改名称（保留 UUID/tag/email）\n  2) 替换链接（保留 UUID/tag/email）\n  0) 返回\n'; read -r -p "请选择 [0]: " subchoice
+        case "${subchoice:-0}" in
+          1) current="${name}"; name="$(prompt_default "新出口名称" "${current}")"; [[ "${name}" == "${current}" ]] || pending_model_mutate proxy-name "${index}" "${name}";;
+          2) link="$(prompt_secret "粘贴新的代理链接")"; [[ -n "${link}" ]] || { warn "链接为空，保持原样。"; continue; }; pending_model_mutate proxy-link "${index}" "${link}";;
+        esac;;
+      d|D) read -r -p "要删除的编号: " selected; [[ "${selected}" =~ ^[0-9]+$ ]] || { warn "编号无效。"; continue; }; index=$((selected-1)); name="$(pending_model_query "proxies.${index}.name" 2>/dev/null || true)"; [[ -n "${name}" ]] || { warn "编号不存在。"; continue; }; prompt_yes_no "确认删除出口 ${name}；其他出口身份不会改变" 0 && pending_model_mutate proxy-delete "${index}";;
+      r|R) read -r -p "要重新检测的编号: " selected; [[ "${selected}" =~ ^[0-9]+$ ]] || { warn "编号无效。"; continue; }; index=$((selected-1)); name="$(pending_model_query "proxies.${index}.name" 2>/dev/null || true)"; [[ -n "${name}" ]] || { warn "编号不存在。"; continue; }; pending_model_mutate proxy-retest "${index}";;
+      0) return 0;; *) warn "未知选项。";;
+    esac
+  done
+}
+
+manage_socks_inbound_menu() {
+  local choice current value listen port user password
+  while true; do
+    if ! current="$(pending_model_query optionalInbounds.socks5.port 2>/dev/null)"; then
+      printf '\nSOCKS5 入站当前关闭。\n  1) 开启\n  0) 返回\n'; read -r -p "请选择 [0]: " choice
+      case "${choice:-0}" in 1) listen="$(prompt_default "监听地址" 127.0.0.1)"; while true; do port="$(prompt_default "端口" 21625)"; validate_port "${port}" && break; warn "端口无效。"; done; user="$(prompt_default "用户名" xray-socks)"; password="$(prompt_secret "密码（留空自动生成）")"; [[ -n "${password}" ]] || password="$(random_password)"; pending_model_mutate inbound-enable socks5 "${listen}" "${port}" "${user}" "${password}";; 0) return 0;; esac; continue
+    fi
+    printf '\nSOCKS5 入站：\n  1) 监听地址\n  2) 端口\n  3) 用户名\n  4) 替换密码\n  5) 关闭\n  0) 返回\n'; read -r -p "请选择 [0]: " choice
+    case "${choice:-0}" in
+      1) current="$(pending_model_query optionalInbounds.socks5.listen)"; value="$(prompt_default "监听地址" "${current}")"; [[ "${value}" == "${current}" ]] || pending_model_mutate inbound-set socks5 listen "${value}";;
+      2) current="$(pending_model_query optionalInbounds.socks5.port)"; while true; do value="$(prompt_default "端口" "${current}")"; validate_port "${value}" && break; warn "端口无效。"; done; [[ "${value}" == "${current}" ]] || pending_model_mutate inbound-set socks5 port "${value}";;
+      3) current="$(pending_model_query optionalInbounds.socks5.username)"; value="$(prompt_default "用户名" "${current}")"; [[ "${value}" == "${current}" ]] || pending_model_mutate inbound-set socks5 username "${value}";;
+      4) value="$(prompt_secret "新密码（留空保持原样）")"; [[ -z "${value}" ]] || pending_model_mutate inbound-set socks5 password "${value}";;
+      5) prompt_yes_no "确认关闭 SOCKS5 入站" 0 && pending_model_mutate inbound-disable socks5;; 0) return 0;; *) warn "未知选项。";;
+    esac
+  done
+}
+
+manage_ss_inbound_menu() {
+  local choice current value listen port method password
+  while true; do
+    if ! current="$(pending_model_query optionalInbounds.shadowsocks.port 2>/dev/null)"; then
+      printf '\nShadowsocks 入站当前关闭。\n  1) 开启\n  0) 返回\n'; read -r -p "请选择 [0]: " choice
+      case "${choice:-0}" in 1) listen="$(prompt_default "监听地址" 0.0.0.0)"; while true; do port="$(prompt_default "端口" 21626)"; validate_port "${port}" && break; warn "端口无效。"; done; method="$(prompt_default "加密方式" aes-256-gcm)"; password="$(prompt_secret "密码（留空自动生成）")"; [[ -n "${password}" ]] || password="$(random_password)"; pending_model_mutate inbound-enable shadowsocks "${listen}" "${port}" "${method}" "${password}";; 0) return 0;; esac; continue
+    fi
+    printf '\nShadowsocks 入站：\n  1) 监听地址\n  2) 端口\n  3) 加密方式\n  4) 替换密码\n  5) 关闭\n  0) 返回\n'; read -r -p "请选择 [0]: " choice
+    case "${choice:-0}" in
+      1) current="$(pending_model_query optionalInbounds.shadowsocks.listen)"; value="$(prompt_default "监听地址" "${current}")"; [[ "${value}" == "${current}" ]] || pending_model_mutate inbound-set shadowsocks listen "${value}";;
+      2) current="$(pending_model_query optionalInbounds.shadowsocks.port)"; while true; do value="$(prompt_default "端口" "${current}")"; validate_port "${value}" && break; warn "端口无效。"; done; [[ "${value}" == "${current}" ]] || pending_model_mutate inbound-set shadowsocks port "${value}";;
+      3) current="$(pending_model_query optionalInbounds.shadowsocks.method)"; value="$(prompt_default "加密方式" "${current}")"; [[ "${value}" == "${current}" ]] || pending_model_mutate inbound-set shadowsocks method "${value}";;
+      4) value="$(prompt_secret "新密码（留空保持原样）")"; [[ -z "${value}" ]] || pending_model_mutate inbound-set shadowsocks password "${value}";;
+      5) prompt_yes_no "确认关闭 Shadowsocks 入站" 0 && pending_model_mutate inbound-disable shadowsocks;; 0) return 0;; *) warn "未知选项。";;
+    esac
+  done
+}
+
+manage_xray_credentials_menu() {
+  local choice selected index name key_pair private_key public_key
+  while true; do
+    printf '\n高级凭据：\n  1) 轮换 native UUID\n  2) 轮换指定 ISP UUID\n  3) 轮换 Reality 密钥对\n  4) 轮换 Reality Short ID\n  0) 返回\n'; read -r -p "请选择 [0]: " choice
+    case "${choice:-0}" in
+      1) prompt_yes_no "确认轮换 native UUID" 0 && pending_model_mutate rotate-uuid native;;
+      2) list_pending_proxies; read -r -p "要轮换 UUID 的编号: " selected; [[ "${selected}" =~ ^[0-9]+$ ]] || { warn "编号无效。"; continue; }; index=$((selected-1)); name="$(pending_model_query "proxies.${index}.name" 2>/dev/null || true)"; [[ -n "${name}" ]] || { warn "编号不存在。"; continue; }; prompt_yes_no "确认轮换 ${name} 的 UUID" 0 && pending_model_mutate rotate-uuid "${index}";;
+      3) prompt_yes_no "确认轮换 Reality 密钥；所有 YAML 节点都需要更新" 0 || continue; [[ "${DEMO_MODE}" == 1 ]] && { warn "预览模式不生成真实 Reality 密钥。"; continue; }; key_pair="$(generate_reality_keys)"; private_key="${key_pair%%$'\t'*}"; public_key="${key_pair#*$'\t'}"; pending_model_mutate reality-key "${private_key}" "${public_key}";;
+      4) prompt_yes_no "确认轮换 Short ID；所有 YAML 节点都需要更新" 0 && pending_model_mutate short-id "$(openssl rand -hex 8)";;
+      0) return 0;; *) warn "未知选项。";;
+    esac
+  done
+}
+
+
+prepare_xray_candidate() {
+  local proxy_input generated
+
+  if [[ "${XRAY_CANDIDATE_READY}" == 1 ]]; then
+    for generated in "${XRAY_CANDIDATE_CONFIG}" "${XRAY_CANDIDATE_STATE}" "${XRAY_CANDIDATE_INFO}" "${XRAY_CANDIDATE_YAML}"; do
+      [[ -s "${generated}" ]] || XRAY_CANDIDATE_READY=0
+    done
+    [[ "${XRAY_CANDIDATE_READY}" == 1 ]] && return 0
+  fi
+
+  validate_pending_model || return 1
+  proxy_input="${WORK_DIR}/update-empty-proxies.tsv"
+  install -m 600 /dev/null "${proxy_input}" || return 1
+  rm -f -- "${XRAY_CANDIDATE_CONFIG}" "${XRAY_CANDIDATE_STATE}" "${XRAY_CANDIDATE_INFO}" "${XRAY_CANDIDATE_YAML}"
+  if ! generate_xray_files "" "" "" "${proxy_input}" \
+    "${XRAY_CANDIDATE_CONFIG}" "${XRAY_CANDIDATE_STATE}" \
+    "${XRAY_CANDIDATE_INFO}" "${XRAY_CANDIDATE_YAML}" \
+    "${XRAY_PENDING_MODEL}"; then
+    warn "候选配置生成失败，系统配置没有变化。"
+    return 1
+  fi
+  for generated in "${XRAY_CANDIDATE_CONFIG}" "${XRAY_CANDIDATE_STATE}" "${XRAY_CANDIDATE_INFO}" "${XRAY_CANDIDATE_YAML}"; do
+    [[ -s "${generated}" ]] || {
+      warn "候选文件不完整：${generated}"
+      return 1
+    }
+  done
+  install -m 600 "${XRAY_CANDIDATE_STATE}" "${XRAY_PENDING_MODEL}" || return 1
+  XRAY_CANDIDATE_READY=1
+}
+
+validate_candidate_as_service_user() {
+  local service_user service_group staged=""
+  [[ "${DEMO_MODE}" == 1 ]] && return 0
+  service_user="$(xray_service_user)" || return 1
+  id "${service_user}" >/dev/null 2>&1 || {
+    warn "Xray 服务用户不存在：${service_user}"
+    return 1
+  }
+  service_group="$(id -gn "${service_user}")" || return 1
+  staged="$(mktemp "$(dirname "${XRAY_CONFIG}")/.vps-manager-check.XXXXXX")" || return 1
+  if ! install -o root -g "${service_group}" -m 640 "${XRAY_CANDIDATE_CONFIG}" "${staged}"; then
+    rm -f -- "${staged}"
+    return 1
+  fi
+  if ! validate_xray_config "${staged}"; then
+    rm -f -- "${staged}"
+    return 1
+  fi
+  rm -f -- "${staged}" || return 1
+}
+
+preview_xray_candidate() {
+  prepare_xray_candidate || return 1
+  validate_candidate_as_service_user || return 1
+  warn "以下是完整 config.json，包含 privateKey 和代理密码，请勿公开。"
+  printf '\n----- 完整候选 config.json -----\n'
+  cat "${XRAY_CANDIDATE_CONFIG}" || return 1
+  printf '%s\n' '----- 候选 config.json 结束 -----'
+}
+
+backup_xray_bundle() {
+  local timestamp destination key target
+  install -d -m 700 "${BACKUP_ROOT}" || return 1
+  timestamp="$(date -u '+%Y%m%dT%H%M%SZ')" || return 1
+  destination="$(mktemp -d "${BACKUP_ROOT}/xray-bundle-${timestamp}.XXXXXX")" || return 1
+  chmod 700 "${destination}" || return 1
+  while IFS='|' read -r key target; do
+    if [[ -e "${target}" ]]; then
+      cp -a -- "${target}" "${destination}/${key}" || return 1
+    else
+      install -m 600 /dev/null "${destination}/.missing-${key}" || return 1
+    fi
+  done <<EOF
+config|${XRAY_CONFIG}
+state|${STATE_FILE}
+info|${INFO_FILE}
+yaml|${YAML_FILE}
+EOF
+  printf '%s' "${destination}"
+}
+
+rollback_xray_bundle() {
+  local bundle="$1" key target restore_failed=0
+  while IFS='|' read -r key target; do
+    if [[ -e "${bundle}/${key}" ]]; then
+      cp -a -- "${bundle}/${key}" "${target}" || restore_failed=1
+    elif [[ -e "${bundle}/.missing-${key}" ]]; then
+      rm -f -- "${target}" || restore_failed=1
+    else
+      restore_failed=1
+    fi
+  done <<EOF
+config|${XRAY_CONFIG}
+state|${STATE_FILE}
+info|${INFO_FILE}
+yaml|${YAML_FILE}
+EOF
+  if [[ "${restore_failed}" != 0 ]]; then
+    warn "严重错误：统一备份恢复不完整，请立即检查 ${bundle}。"
+    return 1
+  fi
+  if systemctl restart xray.service && systemctl is-active --quiet xray.service; then
+    warn "应用失败，已恢复 config/state/info/yaml，旧 Xray 服务已恢复 active。"
+    return 0
+  fi
+  warn "严重错误：文件已恢复，但旧 Xray 服务未恢复 active，请立即检查。"
+  return 1
+}
+
+apply_xray_candidate() {
+  local service_user service_group bundle="" failed=0
+  local staged_config="" staged_state="" staged_info="" staged_yaml=""
+  local reality_port socks_port socks_listen ss_port
+
+  preview_xray_candidate || {
+    warn "候选预览或校验失败，系统配置没有变化。"
+    return 1
+  }
+  if [[ "${DEMO_MODE}" == 1 ]]; then
+    DEMO_CONFIG_FILE="${XRAY_CANDIDATE_CONFIG}"; DEMO_STATE_FILE="${XRAY_CANDIDATE_STATE}"; DEMO_INFO_FILE="${XRAY_CANDIDATE_INFO}"; DEMO_YAML_FILE="${XRAY_CANDIDATE_YAML}"
+    printf '\n[预览] 不会覆盖系统配置或重启 Xray。\n'; XRAY_UPDATE_DIRTY=0; return 0
+  fi
+  printf '\n将统一替换以下文件：\n  %s\n  %s\n  %s\n  %s\n' "${XRAY_CONFIG}" "${STATE_FILE}" "${INFO_FILE}" "${YAML_FILE}"
+  prompt_yes_no "确认应用以上候选配置并重启 Xray" 0 || { printf '已取消应用；系统配置没有变化，待编辑内容仍保留在当前会话。\n'; return 0; }
+
+  service_user="$(xray_service_user)" || return 1
+  service_group="$(id -gn "${service_user}")" || return 1
+  install -d -o root -g root -m 700 "${STATE_DIR}" || return 1
+  staged_config="$(mktemp "$(dirname "${XRAY_CONFIG}")/.config.json.XXXXXX")" || return 1
+  staged_state="$(mktemp "${STATE_DIR}/.state.json.XXXXXX")" || { rm -f -- "${staged_config}"; return 1; }
+  staged_info="$(mktemp "${STATE_DIR}/.last-install.txt.XXXXXX")" || { rm -f -- "${staged_config}" "${staged_state}"; return 1; }
+  staged_yaml="$(mktemp "${STATE_DIR}/.proxies.yaml.XXXXXX")" || { rm -f -- "${staged_config}" "${staged_state}" "${staged_info}"; return 1; }
+
+  if ! install -o root -g "${service_group}" -m 640 "${XRAY_CANDIDATE_CONFIG}" "${staged_config}" \
+    || ! install -o root -g root -m 600 "${XRAY_CANDIDATE_STATE}" "${staged_state}" \
+    || ! install -o root -g root -m 600 "${XRAY_CANDIDATE_INFO}" "${staged_info}" \
+    || ! install -o root -g root -m 600 "${XRAY_CANDIDATE_YAML}" "${staged_yaml}"; then
+    rm -f -- "${staged_config}" "${staged_state}" "${staged_info}" "${staged_yaml}"
+    warn "候选文件暂存失败，系统配置没有变化。"
+    return 1
+  fi
+  if ! validate_xray_config "${staged_config}"; then
+    rm -f -- "${staged_config}" "${staged_state}" "${staged_info}" "${staged_yaml}"
+    return 1
+  fi
+  if ! bundle="$(backup_xray_bundle)" || [[ -z "${bundle}" || ! -d "${bundle}" ]]; then
+    rm -f -- "${staged_config}" "${staged_state}" "${staged_info}" "${staged_yaml}"
+    warn "统一备份失败，拒绝替换系统配置。"
+    return 1
+  fi
+
+  mv -f -- "${staged_config}" "${XRAY_CONFIG}" || failed=1
+  [[ "${failed}" != 0 ]] || mv -f -- "${staged_state}" "${STATE_FILE}" || failed=1
+  [[ "${failed}" != 0 ]] || mv -f -- "${staged_info}" "${INFO_FILE}" || failed=1
+  [[ "${failed}" != 0 ]] || mv -f -- "${staged_yaml}" "${YAML_FILE}" || failed=1
+  if [[ "${failed}" == 0 ]] && ! systemctl restart xray.service; then failed=1; fi
+  if [[ "${failed}" == 0 ]] && ! systemctl is-active --quiet xray.service; then failed=1; fi
+  if [[ "${failed}" != 0 ]]; then
+    rm -f -- "${staged_config}" "${staged_state}" "${staged_info}" "${staged_yaml}"
+    if ! rollback_xray_bundle "${bundle}"; then
+      warn "严重错误：候选配置应用失败，且统一备份恢复未完成。"
+    fi
+    return 1
+  fi
+
+  XRAY_UPDATE_DIRTY=0
+  log "Xray 更新配置已应用"
+  printf '统一备份：%s\n连接参数：%s\nAWS YAML：%s\n' "${bundle}" "${INFO_FILE}" "${YAML_FILE}"
+  reality_port="$(pending_model_query reality.port)"
+  maybe_open_ufw_port "${reality_port}" "tcp"
+  if socks_port="$(pending_model_query optionalInbounds.socks5.port 2>/dev/null)"; then
+    socks_listen="$(pending_model_query optionalInbounds.socks5.listen)"
+    if [[ "${socks_listen}" != "127.0.0.1" && "${socks_listen}" != "::1" ]]; then
+      maybe_open_ufw_port "${socks_port}" "tcp"
+    fi
+  fi
+  if ss_port="$(pending_model_query optionalInbounds.shadowsocks.port 2>/dev/null)"; then
+    maybe_open_ufw_port "${ss_port}" "tcp"
+    maybe_open_ufw_port "${ss_port}" "udp"
+  fi
+  warn "若关闭或修改了旧入站端口，已有 UFW 放行规则不会自动删除。"
+}
+
+xray_update_workflow() {
+  local choice source_config source_state update_dir
+  require_root; check_supported_os; command -v python3 >/dev/null 2>&1 || die "需要 python3。"; command -v curl >/dev/null 2>&1 || die "需要 curl。"
+  if [[ "${DEMO_MODE}" == 1 ]]; then
+    [[ -r "${DEMO_CONFIG_FILE}" && -r "${DEMO_STATE_FILE}" ]] || die "预览模式下请先在当前会话生成一次 Xray 配置。"
+    source_config="${DEMO_CONFIG_FILE}"
+    source_state="${DEMO_STATE_FILE}"
+    update_dir="$(mktemp -d "${WORK_DIR}/update.XXXXXX")" || die "无法创建 demo 更新目录。"
+  else
+    [[ -r "${XRAY_CONFIG}" ]] || die "未找到现有 Xray 配置。"; [[ -r "${STATE_FILE}" ]] || die "未找到 VPS Manager state.json；拒绝更新非受管配置。"; [[ -x "${XRAY_BIN}" ]] || die "尚未安装 Xray。"
+    source_config="${XRAY_CONFIG}"
+    source_state="${STATE_FILE}"
+    ensure_work_dir
+    update_dir="${WORK_DIR}"
+  fi
+  XRAY_PENDING_MODEL="${update_dir}/pending-model.json"; XRAY_CANDIDATE_CONFIG="${update_dir}/candidate-config.json"; XRAY_CANDIDATE_STATE="${update_dir}/candidate-state.json"; XRAY_CANDIDATE_INFO="${update_dir}/candidate-info.txt"; XRAY_CANDIDATE_YAML="${update_dir}/candidate-proxies.yaml"; XRAY_CANDIDATE_READY=0; XRAY_UPDATE_DIRTY=0
+  if ! load_xray_model_from_paths "${source_config}" "${source_state}" "${XRAY_PENDING_MODEL}"; then
+    warn "现有配置未通过受管结构检查，已拒绝进入更新模式。"
+    return 0
+  fi
+  while true; do
+    printf '\n当前待更新配置：\n'; show_pending_xray_summary
+    printf '\n  1) 节点名称与客户端地址\n  2) Reality 配置\n  3) ISP 出口增删改\n  4) SOCKS5 入站\n  5) Shadowsocks 入站\n  6) UUID/密钥高级操作\n  7) 预览完整 JSON\n  8) 应用配置\n  0) 返回\n'; read -r -p "请选择 [0]: " choice
+    case "${choice:-0}" in
+      1) update_node_info_menu;;
+      2) update_reality_menu;;
+      3) manage_isp_outbounds_menu;;
+      4) manage_socks_inbound_menu;;
+      5) manage_ss_inbound_menu;;
+      6) manage_xray_credentials_menu;;
+      7) preview_xray_candidate || warn "候选预览失败，仍可继续修改。";;
+      8)
+        if apply_xray_candidate; then
+          [[ "${XRAY_UPDATE_DIRTY}" == 0 ]] && return 0
+        else
+          warn "候选配置未应用，仍可继续修改或返回。"
+        fi
+        ;;
+      0)
+        if [[ "${XRAY_UPDATE_DIRTY}" == 1 ]]; then
+          prompt_yes_no "存在未应用修改，确认丢弃并返回" 0 || continue
+        fi
+        return 0
+        ;;
+      *) warn "未知选项。";;
+    esac
+  done
+}
+
+xray_management_menu() {
+  local choice
+  while true; do
+    printf '\nXray 管理：\n  1) 安装或升级 Xray（不改配置）\n  2) 首次生成并应用完整配置\n  3) 更新现有受管配置\n  4) 显示连接参数与 AWS YAML\n  5) 查看 Xray 状态并校验配置\n  0) 返回\n'; read -r -p "请选择 [0]: " choice
+    case "${choice:-0}" in
+      1) install_or_upgrade_xray;;
+      2) if [[ "${DEMO_MODE}" != 1 && -e "${XRAY_CONFIG}" ]]; then prompt_yes_no "现有配置将被完整重建，是否继续" 0 || continue; fi; configure_xray; prompt_yes_no "是否立即显示连接参数和 AWS YAML" 1 && show_connection_info;;
+      3) xray_update_workflow;; 4) show_connection_info;;
+      5) if [[ -r "${XRAY_CONFIG}" && "${DEMO_MODE}" != 1 ]]; then validate_xray_config "${XRAY_CONFIG}" || true; systemctl status xray.service --no-pager -l | sed -n '1,60p' || true; else warn "当前没有可校验的系统 Xray 配置。"; fi;;
+      0) return 0;; *) warn "未知选项。";;
+    esac
+  done
+}
+
+
+show_connection_info() {
+  require_root
+  if [[ "${DEMO_MODE}" == "1" ]]; then
+    [[ -r "${DEMO_INFO_FILE}" && -r "${DEMO_YAML_FILE}" ]] \
+      || die "尚未生成预览配置。"
+    cat "${DEMO_INFO_FILE}"
+    printf '\n以下内容可直接粘贴到 AWS YAML 的 proxies: 列表：\n\n'
+    cat "${DEMO_YAML_FILE}"
+    return 0
+  fi
+  [[ -r "${INFO_FILE}" ]] || die "尚未找到连接信息，请先生成 Xray 配置。"
+  [[ -r "${YAML_FILE}" ]] || die "尚未找到 YAML 节点文件，请重新生成 Xray 配置。"
+  cat "${INFO_FILE}"
+  printf '\n以下内容可直接粘贴到 AWS YAML 的 proxies: 列表：\n\n'
+  cat "${YAML_FILE}"
+}
+
+
+ssh_key_helper_menu() {
+  local choice key_name key_comment public_key key_file admin_user admin_home authorized_keys
+  while true; do
+    printf '\nSSH 客户端密钥助手：\n  1) Windows PowerShell 生成并读取公钥\n  2) Linux/macOS 生成并读取公钥\n  3) 校验 SSH 公钥并显示指纹\n  4) 查看当前管理用户 authorized_keys\n  0) 返回\n'
+    read -r -p "请选择 [0]: " choice
+    case "${choice:-0}" in
+      1)
+        key_name="$(prompt_default "密钥文件名" "vps-manager-ed25519")"
+        key_comment="$(prompt_default "密钥备注" "vps-manager")"
+        [[ "${key_name}" =~ ^[A-Za-z0-9._-]+$ ]] || { warn "文件名格式无效。"; continue; }
+        printf '\n请在需要连接 VPS 的 Windows 电脑上执行：\n\n'
+        printf '$KeyPath = Join-Path $env:USERPROFILE ".ssh\\%s"\n' "${key_name}"
+        printf 'New-Item -ItemType Directory -Force (Split-Path $KeyPath) | Out-Null\n'
+        printf 'ssh-keygen -t ed25519 -a 64 -f $KeyPath -C "%s"\n' "${key_comment}"
+        printf 'Get-Content "$KeyPath.pub"\n'
+        warn "只粘贴 .pub 的完整一行；不要发送不带 .pub 后缀的私钥。"
+        ;;
+      2)
+        key_name="$(prompt_default "密钥文件名" "vps-manager-ed25519")"
+        key_comment="$(prompt_default "密钥备注" "vps-manager")"
+        [[ "${key_name}" =~ ^[A-Za-z0-9._-]+$ ]] || { warn "文件名格式无效。"; continue; }
+        printf '\n请在需要连接 VPS 的 Linux/macOS 客户端执行：\n\n'
+        printf 'mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"\n'
+        printf 'ssh-keygen -t ed25519 -a 64 -f "$HOME/.ssh/%s" -C "%s"\n' "${key_name}" "${key_comment}"
+        printf 'cat "$HOME/.ssh/%s.pub"\n' "${key_name}"
+        warn "只粘贴 .pub 的完整一行；不要发送不带 .pub 后缀的私钥。"
+        ;;
+      3)
+        read -r -p "粘贴 SSH 公钥完整一行: " public_key
+        public_key="${public_key%$'\r'}"; ensure_work_dir; key_file="${WORK_DIR}/public-key.pub"
+        printf '%s\n' "${public_key}" > "${key_file}"; chmod 600 "${key_file}"
+        command -v ssh-keygen >/dev/null 2>&1 || { warn "缺少 ssh-keygen，请先初始化基础工具。"; continue; }
+        ssh-keygen -l -f "${key_file}" && printf '公钥有效，可粘贴到 SSH 加固流程。\n' || warn "公钥格式无效。"
+        ;;
+      4)
+        admin_user="$(default_ssh_admin_user)"; admin_home="$(getent passwd "${admin_user}" 2>/dev/null | cut -d: -f6)"
+        authorized_keys="${admin_home}/.ssh/authorized_keys"
+        printf '管理用户：%s\n文件：%s\n\n' "${admin_user}" "${authorized_keys}"
+        [[ -r "${authorized_keys}" ]] && cat "${authorized_keys}" || warn "文件不存在或当前用户无权读取。"
+        ;;
+      0) return 0 ;;
+      *) warn "未知选项。" ;;
+    esac
+  done
+}
+
+
+ensure_yaml_module() {
+  python3 -c 'import yaml' >/dev/null 2>&1 && return 0
+  [[ "${DEMO_MODE}" == 1 ]] && { warn "YAML 管理需要 python3-yaml，请先运行初始化。"; return 1; }
+  require_root; log "安装 YAML 安全解析组件"; apt-get update
+  apt-get install -y --no-install-recommends python3-yaml
+}
+
+
+yaml_manager_python() {
+  python3 - "$@" <<'PY'
+from __future__ import annotations
+import base64, copy, re, sys
+from pathlib import Path
+import yaml
+
+cmd=sys.argv[1]
+class Dumper(yaml.SafeDumper):
+    def ignore_aliases(self,data): return True
+def stop(msg): raise SystemExit(msg)
+def load(path):
+    try:
+        text=Path(path).read_text(encoding="utf-8"); data=yaml.safe_load(text)
+    except Exception as exc: stop(f"YAML 读取失败：{exc}")
+    if not isinstance(data,dict): stop("YAML 顶层必须是映射")
+    return text,data
+def check(data):
+    ps=data.get("proxies"); gs=data.get("proxy-groups")
+    if not isinstance(ps,list) or not isinstance(gs,list): stop("必须包含 proxies 和 proxy-groups 列表")
+    pn=[]; gn=[]
+    for p in ps:
+        if not isinstance(p,dict) or not isinstance(p.get("name"),str) or not p["name"]: stop("存在无效节点")
+        pn.append(p["name"])
+    if len(pn)!=len(set(pn)): stop("存在重复节点名称")
+    for g in gs:
+        if not isinstance(g,dict) or not isinstance(g.get("name"),str) or not g["name"]: stop("存在无效分组")
+        gn.append(g["name"]); members=g.get("proxies")
+        if members is not None and (not isinstance(members,list) or not all(isinstance(x,str) for x in members)): stop(f"分组 {g['name']} 的 proxies 无效")
+    if len(gn)!=len(set(gn)): stop("存在重复分组名称")
+    known=set(pn)|set(gn)|{"DIRECT","REJECT","REJECT-DROP","PASS","GLOBAL","COMPATIBLE"}
+    for g in gs:
+        for member in g.get("proxies",[]):
+            if member not in known: stop(f"分组 {g['name']} 引用了不存在的项目：{member}")
+    return ps,gs
+def eligible(gs): return [g for g in gs if isinstance(g.get("proxies"),list)]
+def snippet(path):
+    try: value=yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    except Exception as exc: stop(f"节点内容解析失败：{exc}")
+    nodes=value.get("proxies") if isinstance(value,dict) else value
+    if not isinstance(nodes,list) or not nodes: stop("节点内容必须是非空列表或包含 proxies 列表")
+    names=[]
+    for node in nodes:
+        if not isinstance(node,dict) or not isinstance(node.get("name"),str) or not node["name"]: stop("节点 name 无效")
+        names.append(node["name"])
+    if len(names)!=len(set(names)): stop("待导入节点名称重复")
+    return nodes
+def replace(text,key,value):
+    head=re.search(rf"(?m)^{re.escape(key)}:[^\n]*(?:\n|$)",text)
+    if not head: stop(f"缺少顶层 {key}")
+    nxt=re.search(r"(?m)^[A-Za-z0-9_.-]+:[^\n]*(?:\n|$)",text[head.end():])
+    end=head.end()+nxt.start() if nxt else len(text)
+    block=yaml.dump({key:value},Dumper=Dumper,allow_unicode=True,sort_keys=False,width=4096)
+    return text[:head.start()]+block+text[end:]
+def write(path,text,ps,gs):
+    out=replace(replace(text,"proxies",ps),"proxy-groups",gs)
+    Path(path).write_text(out,encoding="utf-8",newline="\n")
+    _,data=load(path); check(data)
+def dec(v): return base64.b64decode(v).decode()
+
+if cmd=="validate":
+    _,d=load(sys.argv[2]); ps,gs=check(d); print(f"YAML 有效：{len(ps)} 个节点，{len(gs)} 个分组")
+elif cmd=="summary":
+    _,d=load(sys.argv[2]); ps,gs=check(d); print(f"节点：{len(ps)}")
+    for i,p in enumerate(ps,1): print(f"  {i}) {p['name']}")
+    print(f"分组：{len(gs)}")
+    for i,g in enumerate(gs,1): print(f"  {i}) {g['name']} ({len(g.get('proxies',[]))} 项)")
+elif cmd in {"groups","nodes"}:
+    _,d=load(sys.argv[2]); ps,gs=check(d); values=eligible(gs) if cmd=="groups" else ps
+    for i,item in enumerate(values,1): print(f"{i}\t{item['name']}")
+elif cmd=="snippet-names":
+    for node in snippet(sys.argv[2]): print(node["name"])
+elif cmd=="recommend":
+    _,d=load(sys.argv[2]); _,gs=check(d); gs=eligible(gs); new,old=sys.argv[3:5]
+    kind="IDC" if "IDC" in new.upper() else ("ISP" if "ISP" in new.upper() else "")
+    suffix=new.rsplit("·",1)[-1] if "·" in new else ""; chosen=[]
+    for i,g in enumerate(gs,1):
+        if old in g["proxies"] or new in g["proxies"] or (kind and kind in g["name"].upper()) or (suffix and suffix in g["name"]): chosen.append(str(i))
+    print(",".join(chosen))
+elif cmd=="import":
+    target,src,mapfile,out=sys.argv[2:6]; text,d=load(target); ps,gs=check(d); incoming=snippet(src); gl=eligible(gs); maps=[]
+    for line in Path(mapfile).read_text(encoding="utf-8").splitlines():
+        a,b,c=line.split("\t"); ids=[] if not c else [int(x) for x in c.split(",")]
+        if any(x<1 or x>len(gl) for x in ids): stop("分组编号超出范围")
+        maps.append((dec(a),dec(b),ids))
+    if len(maps)!=len(incoming): stop("节点映射数量不一致")
+    for node,(old,new,ids) in zip(incoming,maps):
+        if not new: stop("节点名称不能为空")
+        positions=[i for i,x in enumerate(ps) if x["name"] in {old,new}]
+        if len(positions)>1: stop(f"旧名和新名同时存在：{old} / {new}")
+        node=copy.deepcopy(node); node["name"]=new
+        if positions: ps[positions[0]]=node
+        else: ps.append(node)
+        selected_groups={id(gl[i-1]) for i in ids}
+        for g in gl:
+            g["proxies"]=[new if x==old else x for x in g["proxies"]]
+            if id(g) in selected_groups:
+                if new not in g["proxies"]: g["proxies"].append(new)
+            else: g["proxies"]=[x for x in g["proxies"] if x!=new]
+    check(d); write(out,text,ps,gs)
+elif cmd=="rename":
+    target,num,new,out=sys.argv[2:6]; text,d=load(target); ps,gs=check(d); idx=int(num)-1
+    if not 0<=idx<len(ps): stop("节点编号不存在")
+    old=ps[idx]["name"]
+    if new!=old and any(x["name"]==new for x in ps): stop("新名称已存在")
+    ps[idx]["name"]=new
+    for g in eligible(gs): g["proxies"]=[new if x==old else x for x in g["proxies"]]
+    check(d); write(out,text,ps,gs)
+elif cmd=="set-groups":
+    target,num,chosen,out=sys.argv[2:6]; text,d=load(target); ps,gs=check(d); idx=int(num)-1; gl=eligible(gs)
+    if not 0<=idx<len(ps): stop("节点编号不存在")
+    ids=[] if not chosen else [int(x) for x in chosen.split(",")]
+    if any(x<1 or x>len(gl) for x in ids): stop("分组编号超出范围")
+    name=ps[idx]["name"]; selected_groups={id(gl[i-1]) for i in ids}
+    for g in gl:
+        if id(g) in selected_groups:
+            if name not in g["proxies"]: g["proxies"].append(name)
+        else: g["proxies"]=[x for x in g["proxies"] if x!=name]
+    check(d); write(out,text,ps,gs)
+else: stop("未知 YAML 管理操作")
+PY
+}
+
+
+yaml_choose_target() {
+  local default_path="${YAML_MANAGER_TARGET}" input resolved candidate
+  printf '\n检测到的订阅 YAML：\n'
+  if [[ -d /var/www/share/config ]]; then
+    while IFS= read -r candidate; do printf '  %s\n' "${candidate}"; [[ -n "${default_path}" ]] || default_path="${candidate}"; done < <(find /var/www/share/config -maxdepth 1 -type f \( -name '*.yaml' -o -name '*.yml' \) -print 2>/dev/null | sort)
+  fi
+  input="$(prompt_default "目标 YAML 文件路径" "${default_path}")"
+  [[ -n "${input}" && -f "${input}" ]] || { warn "目标文件不存在。"; return 1; }
+  resolved="$(readlink -f -- "${input}")" || return 1
+  ensure_yaml_module || return 1; yaml_manager_python validate "${resolved}" || { warn "该文件不适合由本工具管理。"; return 1; }
+  YAML_MANAGER_TARGET="${resolved}"; printf '已选择：%s\n' "${YAML_MANAGER_TARGET}"
+}
+
+yaml_require_target() { [[ -n "${YAML_MANAGER_TARGET}" && -r "${YAML_MANAGER_TARGET}" ]] || yaml_choose_target; }
+
+
+yaml_preview_and_apply() {
+  local candidate="$1" backup_dir timestamp target_dir staged
+  yaml_manager_python validate "${candidate}" || return 1
+  printf '\n----- YAML 变更预览 -----\n'; diff -u -- "${YAML_MANAGER_TARGET}" "${candidate}" || true; printf '%s\n' '----- 预览结束 -----'
+  prompt_yes_no "确认写入 ${YAML_MANAGER_TARGET}" 0 || { printf '已取消，原 YAML 没有变化。\n'; return 0; }
+  [[ "${DEMO_MODE}" == 1 ]] && { printf '[预览] 不会写入目标 YAML。\n'; return 0; }
+  require_root; install -d -m 700 "${BACKUP_ROOT}"; timestamp="$(date -u '+%Y%m%dT%H%M%SZ')"
+  backup_dir="$(mktemp -d "${BACKUP_ROOT}/yaml-${timestamp}.XXXXXX")" || return 1; chmod 700 "${backup_dir}"
+  cp -a -- "${YAML_MANAGER_TARGET}" "${backup_dir}/original.yaml" || return 1
+  target_dir="$(dirname "${YAML_MANAGER_TARGET}")"; staged="$(mktemp "${target_dir}/.vps-manager-yaml.XXXXXX")" || return 1
+  cp -a -- "${YAML_MANAGER_TARGET}" "${staged}" || { rm -f -- "${staged}"; return 1; }
+  if ! cp -- "${candidate}" "${staged}" || ! yaml_manager_python validate "${staged}"; then rm -f -- "${staged}"; warn "候选复检失败，原文件没有变化。"; return 1; fi
+  mv -f -- "${staged}" "${YAML_MANAGER_TARGET}" || return 1
+  log "YAML 已原子更新"; printf '备份：%s\n' "${backup_dir}/original.yaml"
+}
+
+
+yaml_import_nodes() {
+  local source_choice snippet source_file mapping candidate old new recommended selected old64 new64 line
+  local -a names=(); yaml_require_target || return 0; ensure_work_dir
+  snippet="${WORK_DIR}/nodes.yaml"; mapping="${WORK_DIR}/mapping.tsv"; candidate="${WORK_DIR}/candidate.yaml"
+  printf '\n节点来源：\n  1) 本机最近输出 %s\n  2) 粘贴节点 YAML\n  3) 指定文件\n  0) 返回\n' "${YAML_FILE}"; read -r -p "请选择 [0]: " source_choice
+  case "${source_choice:-0}" in
+    1) [[ -r "${YAML_FILE}" ]] || { warn "尚无 Xray 节点输出。"; return 0; }; cp -- "${YAML_FILE}" "${snippet}" ;;
+    2) printf '粘贴节点列表或 proxies: 内容；单独输入 __END__ 结束：\n'; : > "${snippet}"; while IFS= read -r line; do [[ "${line}" == __END__ ]] && break; printf '%s\n' "${line}" >> "${snippet}"; done ;;
+    3) source_file="$(prompt_default "节点 YAML 文件路径" "")"; [[ -r "${source_file}" ]] || { warn "文件不可读。"; return 0; }; cp -- "${source_file}" "${snippet}" ;;
+    0) return 0 ;; *) warn "未知选项。"; return 0 ;;
+  esac
+  mapfile -t names < <(yaml_manager_python snippet-names "${snippet}") || return 0
+  ((${#names[@]} > 0)) || { warn "没有读取到节点。"; return 0; }
+  printf '\n可用分组（多个编号用逗号分隔）：\n'; yaml_manager_python groups "${YAML_MANAGER_TARGET}"; : > "${mapping}"
+  for old in "${names[@]}"; do
+    new="$(prompt_default "节点名称" "${old}")"; recommended="$(yaml_manager_python recommend "${YAML_MANAGER_TARGET}" "${new}" "${old}")"
+    selected="$(prompt_default "${new} 应属于的全部分组编号" "${recommended}")"
+    old64="$(printf '%s' "${old}" | base64 | tr -d '\n')"; new64="$(printf '%s' "${new}" | base64 | tr -d '\n')"
+    printf '%s\t%s\t%s\n' "${old64}" "${new64}" "${selected}" >> "${mapping}"
+  done
+  yaml_manager_python import "${YAML_MANAGER_TARGET}" "${snippet}" "${mapping}" "${candidate}" || { warn "候选 YAML 生成失败。"; return 0; }
+  yaml_preview_and_apply "${candidate}"
+}
+
+
+yaml_rename_node() {
+  local num old new candidate; yaml_require_target || return 0; ensure_work_dir; candidate="${WORK_DIR}/candidate.yaml"
+  yaml_manager_python nodes "${YAML_MANAGER_TARGET}"; read -r -p "要重命名的节点编号: " num
+  [[ "${num}" =~ ^[0-9]+$ ]] || { warn "编号无效。"; return 0; }
+  old="$(yaml_manager_python nodes "${YAML_MANAGER_TARGET}" | awk -F '\t' -v n="${num}" '$1==n {print $2}')"; [[ -n "${old}" ]] || { warn "编号不存在。"; return 0; }
+  new="$(prompt_default "新节点名称" "${old}")"; [[ "${new}" != "${old}" ]] || { printf '名称没有变化。\n'; return 0; }
+  yaml_manager_python rename "${YAML_MANAGER_TARGET}" "${num}" "${new}" "${candidate}" && yaml_preview_and_apply "${candidate}"
+}
+
+
+yaml_update_node_groups() {
+  local num name current chosen candidate; yaml_require_target || return 0; ensure_work_dir; candidate="${WORK_DIR}/candidate.yaml"
+  yaml_manager_python nodes "${YAML_MANAGER_TARGET}"; read -r -p "要调整分组的节点编号: " num
+  [[ "${num}" =~ ^[0-9]+$ ]] || { warn "编号无效。"; return 0; }
+  name="$(yaml_manager_python nodes "${YAML_MANAGER_TARGET}" | awk -F '\t' -v n="${num}" '$1==n {print $2}')"; [[ -n "${name}" ]] || { warn "编号不存在。"; return 0; }
+  printf '\n可用分组：\n'; yaml_manager_python groups "${YAML_MANAGER_TARGET}"; current="$(yaml_manager_python recommend "${YAML_MANAGER_TARGET}" "${name}" "${name}")"
+  chosen="$(prompt_default "该节点应属于的全部分组编号" "${current}")"
+  yaml_manager_python set-groups "${YAML_MANAGER_TARGET}" "${num}" "${chosen}" "${candidate}" && yaml_preview_and_apply "${candidate}"
+}
+
+
+yaml_view_full() {
+  yaml_require_target || return 0
+  if command -v vim >/dev/null 2>&1 && [[ -t 0 && -t 1 ]] && prompt_yes_no "使用 vim 只读打开" 1; then vim -R "${YAML_MANAGER_TARGET}"; else cat "${YAML_MANAGER_TARGET}"; fi
+}
+
+
+yaml_management_menu() {
+  local choice; ensure_yaml_module || return 0
+  while true; do
+    printf '\nYAML 管理：%s\n  1) 选择/切换 YAML 文件\n  2) 查看节点与分组摘要\n  3) 查看完整 YAML（vim 只读）\n  4) 导入或更新 Xray 输出节点\n  5) 重命名节点并同步分组引用\n  6) 更新节点分组\n  7) 校验 YAML\n  0) 返回\n' "${YAML_MANAGER_TARGET:-未选择}"
+    read -r -p "请选择 [0]: " choice
+    case "${choice:-0}" in
+      1) yaml_choose_target || true ;; 2) yaml_require_target && yaml_manager_python summary "${YAML_MANAGER_TARGET}" || true ;;
+      3) yaml_view_full ;; 4) yaml_import_nodes ;; 5) yaml_rename_node ;; 6) yaml_update_node_groups ;;
+      7) yaml_require_target && yaml_manager_python validate "${YAML_MANAGER_TARGET}" || true ;; 0) return 0 ;; *) warn "未知选项。" ;;
+    esac
+  done
+}
+
+
+komari_target_home() {
+  local user="${SUDO_USER:-}" result=""
+  if [[ -n "${user}" && "${user}" != root ]] && command -v getent >/dev/null 2>&1; then result="$(getent passwd "${user}" | cut -d: -f6)"; fi
+  if [[ -z "${result}" ]] && command -v getent >/dev/null 2>&1; then result="$(getent passwd | awk -F: '$3>=1000 && $3<60000 && $1!="nobody" && $6~"^/home/" {print $6; exit}')"; fi
+  printf '%s' "${result:-/root}"
+}
+
+
+komari_install_agent() {
+  local endpoint="$1" token home install_dir day installer checksum public_ip
+  local disable_ssh=1 gpu=1 detect_ip=1
+  local -a args=()
+  home="$(komari_target_home)"
+  endpoint="$(prompt_default "Komari 连接地址" "${endpoint}")"
+  token="$(prompt_secret "Komari Client Token")"
+  [[ -n "${token}" ]] || { warn "Komari Token 不能为空。"; return 1; }
+  install_dir="$(prompt_default "Agent 安装目录" "${home}/scripts/komari-agent")"
+  [[ "${install_dir}" == /* ]] || install_dir="$(pwd -P)/${install_dir}"
+  day="$(prompt_default "流量统计重置日" "11")"
+  [[ "${day}" =~ ^([1-9]|[12][0-9]|3[01])$ ]] || { warn "重置日必须是 1-31。"; return 1; }
+  prompt_yes_no "是否禁用 Web SSH" 1 || disable_ssh=0
+  prompt_yes_no "是否启用 GPU 监控" 1 || gpu=0
+  prompt_yes_no "是否自动记录公网 IPv4" 1 || detect_ip=0
+  printf '\nAgent 配置预览：\n  Endpoint: %s\n  安装目录: %s\n  重置日: %s\n  Token: <已隐藏>\n' "${endpoint}" "${install_dir}" "${day}"
+  if [[ "${DEMO_MODE}" == 1 ]]; then printf '[演示] 将校验并调用 Komari 官方安装器：%s\n' "${KOMARI_INSTALL_URL}"; return 0; fi
+  prompt_yes_no "确认安装或重装 Komari Agent" 0 || return 0
+  ensure_work_dir; installer="${WORK_DIR}/install-komari-agent.sh"
+  curl -fL --retry 3 --connect-timeout 10 -o "${installer}" "${KOMARI_INSTALL_URL}"
+  chmod 700 "${installer}"; bash -n "${installer}"
+  checksum="$(sha256sum "${installer}" | awk '{print $1}')"; log "Komari 官方安装器 SHA-256: ${checksum}"
+  args=(-e "${endpoint}" -t "${token}" --install-dir "${install_dir}" --month-rotate "${day}")
+  [[ "${disable_ssh}" == 1 ]] && args+=(--disable-web-ssh)
+  [[ "${gpu}" == 1 ]] && args+=(--gpu)
+  if [[ "${detect_ip}" == 1 ]]; then
+    public_ip="$(curl -4 -fsS --max-time 10 https://api.ipify.org 2>/dev/null || true)"
+    [[ -n "${public_ip}" ]] && args+=(--custom-ipv4 "${public_ip}") || warn "公网 IPv4 探测失败。"
+  fi
+  bash "${installer}" "${args[@]}"
+  systemctl status komari-agent.service --no-pager -l | sed -n '1,60p' || true
+}
+
+
+komari_load_cf_token() {
+  local line key value
+  if [[ -r "${KOMARI_TOKEN_ENV_FILE}" ]]; then
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+      line="${line%$'\r'}"; [[ "${line}" == *=* ]] || continue
+      key="${line%%=*}"; value="${line#*=}"; value="${value%\"}"; value="${value#\"}"; value="${value%\'}"; value="${value#\'}"
+      case "${key}" in
+        CF_ACCESS_CLIENT_ID) [[ -n "${CF_ACCESS_CLIENT_ID:-}" ]] || CF_ACCESS_CLIENT_ID="${value}" ;;
+        CF_ACCESS_CLIENT_SECRET) [[ -n "${CF_ACCESS_CLIENT_SECRET:-}" ]] || CF_ACCESS_CLIENT_SECRET="${value}" ;;
+      esac
+    done < "${KOMARI_TOKEN_ENV_FILE}"
+  fi
+  [[ -n "${CF_ACCESS_CLIENT_ID:-}" ]] || CF_ACCESS_CLIENT_ID="$(prompt_secret "Cloudflare Access Client ID")"
+  [[ -n "${CF_ACCESS_CLIENT_SECRET:-}" ]] || CF_ACCESS_CLIENT_SECRET="$(prompt_secret "Cloudflare Access Client Secret")"
+  [[ -n "${CF_ACCESS_CLIENT_ID}" && -n "${CF_ACCESS_CLIENT_SECRET}" ]] || { warn "Cloudflare Access 凭据不能为空。"; return 1; }
+}
+
+
+komari_install_warp_client() {
+  local codename
+  # shellcheck disable=SC1091
+  . /etc/os-release; codename="${VERSION_CODENAME:-}"; [[ -n "${codename}" ]] || codename="$(lsb_release -cs)"
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update; apt-get install -y curl gpg lsb-release ca-certificates nftables
+  install -d -m 0755 /usr/share/keyrings
+  curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+  printf 'deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ %s main\n' "${codename}" > /etc/apt/sources.list.d/cloudflare-client.list
+  apt-get update; apt-get install -y cloudflare-warp
+}
+
+
+komari_check_kernel() {
+  if modprobe nf_tables >/dev/null 2>&1 && nft list ruleset >/dev/null 2>&1; then log "nftables 内核支持正常"; return 0; fi
+  warn "当前内核缺少 nftables 支持，WARP 可能无法连接。"
+  if prompt_yes_no "安装 linux-image-amd64 新内核（之后需手动重启）" 0; then apt-get update; apt-get install -y --no-install-recommends linux-image-amd64; warn "请重启后重新执行 WARP 配置。"; return 1; fi
+}
+
+
+komari_write_mdm() {
+  local team="$1" candidate backup=""
+  ensure_work_dir; candidate="${WORK_DIR}/mdm.xml"
+  cat > "${candidate}" <<EOF
+<dict>
+  <key>auth_client_id</key><string>${CF_ACCESS_CLIENT_ID}</string>
+  <key>auth_client_secret</key><string>${CF_ACCESS_CLIENT_SECRET}</string>
+  <key>auto_connect</key><integer>1</integer>
+  <key>onboarding</key><false/>
+  <key>organization</key><string>${team}</string>
+  <key>service_mode</key><string>warp</string>
+</dict>
+EOF
+  install -d -m 700 /var/lib/cloudflare-warp
+  [[ ! -e /var/lib/cloudflare-warp/mdm.xml ]] || backup="$(backup_file /var/lib/cloudflare-warp/mdm.xml warp-mdm)"
+  install -m 600 "${candidate}" /var/lib/cloudflare-warp/mdm.xml
+  [[ -z "${backup}" ]] || printf '原 MDM 备份: %s\n' "${backup}"
+}
+
+
+komari_connect_warp() {
+  systemctl enable --now warp-svc
+  warp-cli --accept-tos disconnect >/dev/null 2>&1 || true
+  warp-cli --accept-tos registration delete >/dev/null 2>&1 || true
+  systemctl restart warp-svc; sleep 3
+  warp-cli --accept-tos mdm refresh || true; sleep 3
+  warp-cli --accept-tos connect || true; sleep 8
+}
+
+
+komari_verify_warp() {
+  local endpoint="$1"
+  warp-cli --accept-tos status || true
+  log "检查 Komari 私网地址: ${endpoint}"
+  curl -i --connect-timeout 10 --max-time 20 "${endpoint}" | sed -n '1,40p' || warn "私网地址不可达，请检查 WARP、Zero Trust 路由和 Service Token。"
+}
+
+
+install_komari_warp() {
+  local team endpoint install_agent=1
+  require_root; check_supported_os
+  team="$(prompt_default "Cloudflare Zero Trust Team 名称" "${KOMARI_DEFAULT_TEAM}")"
+  endpoint="$(prompt_default "Komari 私网连接地址" "${KOMARI_DEFAULT_PRIVATE_URL}")"
+  prompt_yes_no "WARP 完成后是否继续安装/重装 Agent" 1 || install_agent=0
+  printf '\n配置预览：\n  Team: %s\n  私网地址: %s\n  MDM: /var/lib/cloudflare-warp/mdm.xml\n  Service Token: 环境变量、%s 或安全输入\n' "${team}" "${endpoint}" "${KOMARI_TOKEN_ENV_FILE}"
+  if [[ "${DEMO_MODE}" == 1 ]]; then printf '[演示] 使用主脚本内置流程，不下载 komari-warp-scripts 包装脚本。\n'; [[ "${install_agent}" == 1 ]] && komari_install_agent "${endpoint}"; return 0; fi
+  prompt_yes_no "确认配置 WARP 私网" 0 || return 0
+  log "安装 Cloudflare WARP"; komari_install_warp_client
+  komari_check_kernel || return 0
+  komari_load_cf_token || return 1
+  komari_write_mdm "${team}"
+  komari_connect_warp
+  komari_verify_warp "${endpoint}"
+  [[ "${install_agent}" == 1 ]] && komari_install_agent "${endpoint}"
+}
+
+
+install_komari_standard() { require_root; check_supported_os; komari_install_agent "https://example.com"; }
+
+
+komari_status() {
+  printf '\nKomari Agent 状态：\n'; systemctl status komari-agent.service --no-pager -l 2>/dev/null | sed -n '1,60p' || printf '未发现运行中的 komari-agent.service。\n'
+  printf '\nWARP 状态：\n'; command -v warp-cli >/dev/null 2>&1 && warp-cli --accept-tos status || printf '未安装或无法读取 warp-cli。\n'
+}
+
+
+komari_reconnect_warp() {
+  require_root
+  if [[ "${DEMO_MODE}" == 1 ]]; then printf '[演示] 将重启 warp-svc 并重新连接。\n'; return 0; fi
+  command -v warp-cli >/dev/null 2>&1 || { warn "尚未安装 WARP。"; return 0; }
+  systemctl restart warp-svc; warp-cli --accept-tos disconnect >/dev/null 2>&1 || true; warp-cli --accept-tos connect; sleep 5; warp-cli --accept-tos status || true
+}
+
+
+komari_menu() {
+  local choice
+  while true; do
+    printf '\nKomari Agent 安装/管理：\n  1) 配置/修复 WARP 私网，并可继续安装 Agent（内置流程）\n  2) 安装/重装普通公网 Agent\n  3) 查看 Agent/WARP 状态\n  4) 重连 WARP\n  0) 返回\n'
+    read -r -p "请选择 [0]: " choice
+    case "${choice:-0}" in 1) install_komari_warp ;; 2) install_komari_standard ;; 3) komari_status ;; 4) komari_reconnect_warp ;; 0) return 0 ;; *) warn "未知选项。" ;; esac
+  done
+}
+
+show_system_status() {
+  local service_user
+
+  log "系统"
+  printf 'Hostname: %s\n' "$(hostname)"
+  printf 'OS: '
+  awk -F= '/^PRETTY_NAME=/{gsub(/^"|"$/, "", $2); print $2}' /etc/os-release
+  printf 'Kernel: %s\n' "$(uname -r)"
+
+  log "BBR"
+  show_bbr_status
+
+  log "Xray"
+  if [[ -x "${XRAY_BIN}" ]]; then
+    "${XRAY_BIN}" version | head -n 2
+    printf 'Service: %s\n' "$(systemctl is-active xray.service 2>/dev/null || true)"
+    if [[ -r "${XRAY_CONFIG}" ]]; then
+      service_user="$(xray_service_user)"
+      printf 'Service user: %s\n' "${service_user}"
+      if [[ "${EUID}" -eq 0 ]]; then
+        validate_xray_config "${XRAY_CONFIG}" || true
+      else
+        printf '配置校验需要 root 权限。\n'
+      fi
+    fi
+  else
+    printf '未安装。\n'
+  fi
+
+  log "Komari/WARP"
+  printf 'Komari Agent: %s\n' "$(systemctl is-active komari-agent.service 2>/dev/null || true)"
+  printf 'WARP service: %s\n' "$(systemctl is-active warp-svc.service 2>/dev/null || true)"
+}
+
+
+initialize_environment() {
+  require_root
+  install_base_tools
+
+  if prompt_yes_no "基础工具已处理，是否继续开启 BBR" "1"; then
+    enable_bbr
+  else
+    printf '已跳过 BBR。\n'
+  fi
+
+  if prompt_yes_no "是否继续配置 SSH 高位端口和仅密钥登录" "1"; then
+    configure_ssh_hardening
+  else
+    printf '已跳过 SSH 加固。\n'
+  fi
+}
+
+
+xray_setup_workflow() {
+  require_root
+
+  log "步骤 1/3：安装或升级 Xray"
+  install_or_upgrade_xray
+  if ! prompt_yes_no "Xray 安装步骤已完成，是否继续生成并应用配置" "1"; then
+    printf '已在安装步骤结束。\n'
+    return 0
+  fi
+
+  log "步骤 2/3：配置 Xray"
+  configure_xray
+  if ! prompt_yes_no "Xray 配置步骤已完成，是否继续显示密钥和 AWS YAML" "1"; then
+    printf '已完成配置；结果保存在 %s 和 %s。\n' "${INFO_FILE}" "${YAML_FILE}"
+    return 0
+  fi
+
+  log "步骤 3/3：输出配置结果"
+  show_connection_info
+}
+
+
+show_help() {
+  cat <<EOF
+${SCRIPT_NAME} ${SCRIPT_VERSION}
+
+用法:
+  sudo bash $0          启动交互式管理菜单
+  bash $0 --demo        无需 root 的预览模式，配置时输出完整 JSON
+  bash $0 --version     显示版本
+  bash $0 --help        显示帮助
+
+测试版支持 Debian/Ubuntu + systemd。
+SSH 加固会在 reload 后要求使用第二个终端验证，失败则自动恢复。
+首次生成或更新 Xray 配置时，仅检测新增或链接变化的 SOCKS5 出口。
+SSH 密钥助手只生成客户端命令，不会在 VPS 上创建或显示私钥。
+YAML 管理仅重写 proxies 和 proxy-groups，并在确认前显示 diff。
+EOF
+}
+
+
+show_banner() {
+  printf '\n==================================================\n'
+  printf ' %s  %s\n' "${SCRIPT_NAME}" "${SCRIPT_VERSION}"
+  if [[ "${DEMO_MODE}" == "1" ]]; then
+    printf ' 预览模式：不会修改系统\n'
+  fi
+  printf '==================================================\n'
+}
+
+
+main_menu() {
+  local choice
+
+  check_supported_os
+  while true; do
+    show_banner
+    printf '  1) 初始化环境：基础工具，可选 BBR 和 SSH 加固\n'
+    printf '  2) Xray 管理：安装、首次配置或更新现有配置\n'
+    printf '  3) SSH 客户端密钥助手\n'
+    printf '  4) YAML 管理：查看、导入节点、更新名称和分组\n'
+    printf '  5) 安装/管理 Komari Agent\n'
+    printf '  6) 状态检查\n'
+    printf '  0) 退出\n'
+    read -r -p "请选择: " choice
+    case "${choice}" in
+      1) initialize_environment; pause_screen ;;
+      2) xray_management_menu; pause_screen ;;
+      3) ssh_key_helper_menu; pause_screen ;;
+      4) yaml_management_menu; pause_screen ;;
+      5) komari_menu; pause_screen ;;
+      6) show_system_status; pause_screen ;;
+      0) printf '已退出。\n'; return 0 ;;
+      *) warn "未知选项：${choice}" ;;
+    esac
+  done
+}
+
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --demo)
+      DEMO_MODE=1
+      ;;
+    --version)
+      printf '%s %s\n' "${SCRIPT_NAME}" "${SCRIPT_VERSION}"
+      exit 0
+      ;;
+    -h|--help)
+      show_help
+      exit 0
+      ;;
+    *)
+      show_help
+      die "未知参数：$1"
+      ;;
+  esac
+  shift
+done
+
+main_menu
