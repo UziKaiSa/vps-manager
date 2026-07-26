@@ -2,7 +2,7 @@
 
 `VPS Manager` 是一个面向 Debian/Ubuntu VPS 的中文交互式管理脚本，用于完成服务器初始化、SSH 加固、Xray 配置、Clash/Mihomo YAML 管理，以及 Komari Agent/WARP 私网接入。
 
-当前版本：`0.7.3-test`
+当前版本：`0.7.4-test`
 
 > 目前是测试版。首次在正式服务器上使用前，建议先运行预览模式，并保留一个已经登录的 SSH 终端。
 
@@ -262,6 +262,8 @@ ss://BASE64(加密方式:密码)@IP或域名:端口
 5) 查看当前管理用户 authorized_keys
 0) 返回
 ```
+
+Linux/macOS 密钥助手同样只要求输入文件名后缀。例如输入 `GB`，会输出生成 `~/.ssh/id_ed25519_GB` 和 `~/.ssh/id_ed25519_GB.pub` 的命令；直接回车使用默认后缀 `vps-manager`。
 
 当前管理用户自动使用运行脚本的登录用户，不需要另外填写用户名。
 

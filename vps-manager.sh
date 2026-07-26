@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.7.3-test"
+SCRIPT_VERSION="0.7.4-test"
 SCRIPT_NAME="VPS Manager"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh"
 
@@ -2605,15 +2605,21 @@ add_ssh_public_key() {
 }
 
 ssh_key_helper_menu() {
-  local choice key_name key_comment public_key key_file admin_user admin_home authorized_keys
+  local choice key_name key_suffix key_comment public_key key_file admin_user admin_home authorized_keys
   while true; do
     printf '\nSSH 密钥与加固管理：\n  1) Linux/macOS 生成并读取公钥\n  2) 校验 SSH 公钥并显示指纹\n  3) 配置 SSH 高位端口和仅密钥登录\n  4) 添加公钥到当前管理用户 authorized_keys\n  5) 查看当前管理用户 authorized_keys\n  0) 返回\n'
     read -r -p "请选择 [0]: " choice
     case "${choice:-0}" in
       1)
-        key_name="$(prompt_default "密钥文件名" "vps-manager-ed25519")"
+        key_suffix="$(prompt_default "密钥文件名后缀（将生成 id_ed25519_后缀）" "vps-manager")"
         key_comment="$(prompt_default "密钥备注" "vps-manager")"
-        [[ "${key_name}" =~ ^[A-Za-z0-9._-]+$ ]] || { warn "文件名格式无效。"; continue; }
+        if [[ ! "${key_suffix}" =~ ^[A-Za-z0-9._-]+$ \
+          || "${key_suffix}" == "." || "${key_suffix}" == ".." ]] \
+          || (( ${#key_suffix} > 80 )); then
+          warn "密钥文件名后缀无效。只能使用英文字母、数字、点、下划线和连字符，最长 80 个字符。"
+          continue
+        fi
+        key_name="id_ed25519_${key_suffix}"
         printf '\n请在需要连接 VPS 的 Linux/macOS 客户端执行：\n\n'
         printf 'mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"\n'
         printf 'ssh-keygen -t ed25519 -a 64 -f "$HOME/.ssh/%s" -C "%s"\n' "${key_name}" "${key_comment}"
