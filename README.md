@@ -58,58 +58,48 @@ cd vps-manager
 sudo ./vps-manager.sh
 ```
 
-### 方法四：Windows PowerShell + WSL
-
-在 Windows PowerShell 中下载脚本：
-
-```powershell
-Invoke-WebRequest `
-  -Uri "https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh" `
-  -OutFile ".\vps-manager.sh"
-```
-
-然后通过 WSL 赋予执行权限并运行：
-
-```powershell
-wsl chmod +x ./vps-manager.sh
-wsl sudo ./vps-manager.sh
-```
-
-预览模式：
-
-```powershell
-wsl bash ./vps-manager.sh --demo
-```
-
-### 方法五：Windows 下载后上传到 VPS
-
-先在 Windows PowerShell 中下载：
-
-```powershell
-Invoke-WebRequest `
-  -Uri "https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh" `
-  -OutFile ".\vps-manager.sh"
-```
-
-上传到 VPS：
-
-```powershell
-scp .\vps-manager.sh user@服务器地址:/tmp/vps-manager.sh
-```
-
-远程赋予执行权限并启动脚本：
-
-```powershell
-ssh -t user@服务器地址 "chmod +x /tmp/vps-manager.sh && sudo /tmp/vps-manager.sh"
-```
-
-> `user` 和 `服务器地址` 需要替换为实际 SSH 用户和 VPS IP/域名。该脚本面向 Debian/Ubuntu，不能直接在原生 Windows PowerShell 中执行；Windows 端需要使用 WSL，或者上传到 Linux VPS 后执行。
-
 如果当前已经是 root，可以直接运行：
 
 ```bash
 ./vps-manager.sh
 ```
+
+### Windows：仅生成 SSH 公钥和私钥
+
+Windows 用户可以单独下载密钥生成脚本：
+
+```powershell
+Invoke-WebRequest `
+  -Uri "https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/windows-ssh-key.ps1" `
+  -OutFile ".\windows-ssh-key.ps1"
+```
+
+运行脚本：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File ".\windows-ssh-key.ps1"
+```
+
+默认生成位置：
+
+```text
+私钥：%USERPROFILE%\.ssh\vps-manager-ed25519
+公钥：%USERPROFILE%\.ssh\vps-manager-ed25519.pub
+```
+
+也可以指定密钥文件名和备注：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File ".\windows-ssh-key.ps1" `
+  -KeyName "my-vps-ed25519" `
+  -Comment "my-vps"
+```
+
+脚本只负责生成密钥文件并显示公钥内容，不连接 VPS、不写入 `authorized_keys`，也不修改 Windows 或服务器的 SSH 配置。已有同名密钥时会停止，不会覆盖。
+
+> `vps-manager.sh` 仍然需要在 Debian/Ubuntu VPS 中运行，不能直接在原生 Windows PowerShell 中执行。
 
 ## 建议先使用预览模式
 
@@ -498,6 +488,7 @@ python3 apply-kaisa-komari-theme.py --db ./data/komari.db --no-backup
 
 ```text
 vps-manager.sh                 VPS 初始化与管理主脚本
+windows-ssh-key.ps1            Windows SSH 公钥和私钥生成脚本
 apply-kaisa-komari-theme.py    可选的 Komari 看板主题脚本
 README.md                      中文使用说明
 ```
