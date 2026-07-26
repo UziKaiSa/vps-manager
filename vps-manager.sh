@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.7.1-test"
+SCRIPT_VERSION="0.7.2-test"
 SCRIPT_NAME="VPS Manager"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh"
 
@@ -3086,7 +3086,10 @@ update_current_script() {
     return 1
   fi
   log "脚本已更新为 ${new_version}"
-  printf '请退出后重新运行：sudo %s\n' "${target}"
+  printf '正在重新启动新脚本：%s\n' "${target}"
+  cleanup
+  WORK_DIR=""
+  exec bash "${target}"
 }
 
 
@@ -3200,7 +3203,12 @@ main_menu() {
       5) komari_menu; pause_screen ;;
       6) show_system_status; pause_screen ;;
       7) update_current_script || true; pause_screen ;;
-      8) if delete_current_script; then return 0; fi ;;
+      8)
+        if delete_current_script; then
+          printf '脚本已删除，程序退出。\n'
+          exit 0
+        fi
+        ;;
       0) printf '已退出。\n'; return 0 ;;
       *) warn "未知选项：${choice}" ;;
     esac

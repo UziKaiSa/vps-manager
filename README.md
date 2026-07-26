@@ -2,7 +2,7 @@
 
 `VPS Manager` 是一个面向 Debian/Ubuntu VPS 的中文交互式管理脚本，用于完成服务器初始化、SSH 加固、Xray 配置、Clash/Mihomo YAML 管理，以及 Komari Agent/WARP 私网接入。
 
-当前版本：`0.7.1-test`
+当前版本：`0.7.2-test`
 
 > 目前是测试版。首次在正式服务器上使用前，建议先运行预览模式，并保留一个已经登录的 SSH 终端。
 
@@ -404,7 +404,7 @@ sudo chmod 600 /root/warp-token.env
 2. 校验 Bash 语法和脚本身份
 3. 校验通过后原子覆盖当前运行的 `.sh` 文件
 
-更新完成后退出脚本并重新运行，新版本才会生效。也可以手动更新：
+更新成功后，当前旧进程会立即退出，并自动启动刚覆盖的新脚本，不需要手动重新运行。也可以手动更新：
 
 ```bash
 curl -fL https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh -o vps-manager.sh
