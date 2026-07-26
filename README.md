@@ -2,7 +2,7 @@
 
 `VPS Manager` 是一个面向 Debian/Ubuntu VPS 的中文交互式管理脚本，用于完成服务器初始化、SSH 加固、Xray 配置、Clash/Mihomo YAML 管理，以及 Komari Agent/WARP 私网接入。
 
-当前版本：`0.6.1-test`
+当前版本：`0.6.2-test`
 
 > 目前是测试版。首次在正式服务器上使用前，建议先运行预览模式，并保留一个已经登录的 SSH 终端。
 
@@ -158,6 +158,7 @@ SSH 管理用户自动使用当前运行脚本的登录用户，不需要另外�
 
 - 节点名称只用于 YAML 展示和识别
 - 客户端连接地址填写 VPS 公网 IP 或已经解析到该 VPS 的域名
+- Reality target 填写裸域名或裸 IP 时会自动补全 `:443`；已经填写合法端口则保持不变
 - Reality `serverNames` 支持多个域名，用英文逗号分隔
 - UUID、Reality 密钥和 Short ID 会自动生成
 - 配置写入前会显示完整 JSON 供审核

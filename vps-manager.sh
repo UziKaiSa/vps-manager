@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.6.1-test"
+SCRIPT_VERSION="0.6.2-test"
 SCRIPT_NAME="VPS Manager"
 
 XRAY_BIN="/usr/local/bin/xray"
@@ -191,6 +191,79 @@ random_password() {
 validate_port() {
   local value="$1"
   [[ "${value}" =~ ^[0-9]+$ ]] && (( value >= 1 && value <= 65535 ))
+}
+
+
+normalize_reality_target() {
+  python3 - "$1" <<'PY'
+import ipaddress
+import re
+import sys
+
+value = sys.argv[1].strip()
+
+def fail(message):
+    raise SystemExit(message)
+
+def valid_port(text):
+    return text.isdigit() and 1 <= int(text) <= 65535
+
+def valid_host(text):
+    if not text or "/" in text:
+        return False
+    try:
+        ascii_host = text.rstrip(".").encode("idna").decode("ascii")
+    except UnicodeError:
+        return False
+    if not ascii_host or len(ascii_host) > 253:
+        return False
+    return all(re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label) for label in ascii_host.split("."))
+
+if not value or any(ch.isspace() for ch in value) or "," in value or "://" in value:
+    fail("Reality target 必须是域名或 IP，可选端口；不要填写 URL、空格或逗号列表")
+if value.startswith(("@", "/")):
+    print(value)
+    raise SystemExit(0)
+if value.isdigit():
+    if not valid_port(value):
+        fail("Reality target 端口必须在 1-65535 之间")
+    print(value)
+    raise SystemExit(0)
+try:
+    address = ipaddress.ip_address(value)
+except ValueError:
+    address = None
+if address is not None:
+    print(f"[{value}]:443" if address.version == 6 else f"{value}:443")
+    raise SystemExit(0)
+if value.startswith("["):
+    match = re.fullmatch(r"\[([^]]+)\](?::([0-9]+))?", value)
+    if not match:
+        fail("IPv6 Reality target 格式无效")
+    try:
+        address = ipaddress.ip_address(match.group(1))
+    except ValueError:
+        fail("IPv6 Reality target 地址无效")
+    if address.version != 6:
+        fail("方括号只应用于 IPv6 地址")
+    port = match.group(2) or "443"
+    if not valid_port(port):
+        fail("Reality target 端口必须在 1-65535 之间")
+    print(f"[{match.group(1)}]:{port}")
+    raise SystemExit(0)
+if value.count(":") == 0:
+    if not valid_host(value):
+        fail("Reality target 域名格式无效")
+    print(f"{value}:443")
+    raise SystemExit(0)
+if value.count(":") == 1:
+    host, port = value.rsplit(":", 1)
+    if not valid_host(host) or not valid_port(port):
+        fail("Reality target 必须使用 域名或IP:端口，端口范围 1-65535")
+    print(value)
+    raise SystemExit(0)
+fail("未加方括号的 IPv6 target 只能填写裸地址，脚本会自动补全 [IPv6]:443")
+PY
 }
 
 
@@ -715,9 +788,14 @@ collect_xray_configuration() {
     warn "端口必须在 1-65535 之间。"
   done
 
-  CFG_REALITY_DEST="$(prompt_default "Reality dest" "www.example.com:443")"
-  [[ -n "${CFG_REALITY_DEST}" && "${CFG_REALITY_DEST}" != *" "* ]] \
-    || die "Reality dest 格式不正确。"
+  local raw_reality_target normalized_reality_target
+  raw_reality_target="$(prompt_default "Reality target（裸域名/IP 自动补全 :443）" "www.example.com:443")"
+  normalized_reality_target="$(normalize_reality_target "${raw_reality_target}")" \
+    || die "Reality target 格式不正确。"
+  if [[ "${normalized_reality_target}" != "${raw_reality_target}" ]]; then
+    printf '已自动补全 Reality target：%s\n' "${normalized_reality_target}"
+  fi
+  CFG_REALITY_DEST="${normalized_reality_target}"
   CFG_SERVER_NAMES="$(prompt_default "Reality serverNames（逗号分隔）" "www.example.com,example.com")"
   [[ -n "${CFG_SERVER_NAMES}" ]] || die "Reality serverNames 不能为空。"
 
@@ -2033,13 +2111,13 @@ update_node_info_menu() {
 }
 
 update_reality_menu() {
-  local choice current value key_pair private_key public_key
+  local choice current value normalized_value key_pair private_key public_key
   while true; do
-    printf '\nReality 更新：\n  1) 端口：%s\n  2) dest：%s\n  3) serverNames\n  4) 轮换密钥对\n  5) 轮换 Short ID\n  0) 返回\n' "$(pending_model_query reality.port)" "$(pending_model_query reality.dest)"
+    printf '\nReality 更新：\n  1) 端口：%s\n  2) target：%s\n  3) serverNames\n  4) 轮换密钥对\n  5) 轮换 Short ID\n  0) 返回\n' "$(pending_model_query reality.port)" "$(pending_model_query reality.dest)"
     read -r -p "请选择 [0]: " choice
     case "${choice:-0}" in
       1) current="$(pending_model_query reality.port)"; while true; do value="$(prompt_default "新 Reality 端口" "${current}")"; validate_port "${value}" && break; warn "端口必须在 1-65535 之间。"; done; [[ "${value}" == "${current}" ]] || pending_model_mutate set reality.port "${value}";;
-      2) current="$(pending_model_query reality.dest)"; value="$(prompt_default "新 Reality dest" "${current}")"; [[ -n "${value}" && "${value}" != *" "* ]] || { warn "dest 格式无效。"; continue; }; [[ "${value}" == "${current}" ]] || pending_model_mutate set reality.dest "${value}";;
+      2) current="$(pending_model_query reality.dest)"; value="$(prompt_default "新 Reality target（裸域名/IP 自动补全 :443）" "${current}")"; if ! normalized_value="$(normalize_reality_target "${value}")"; then warn "Reality target 格式无效。"; continue; fi; [[ "${normalized_value}" == "${value}" ]] || printf '已自动补全 Reality target：%s\n' "${normalized_value}"; [[ "${normalized_value}" == "${current}" ]] || pending_model_mutate set reality.dest "${normalized_value}";;
       3) current="$(python3 - "${XRAY_PENDING_MODEL}" <<'PY'
 import json,sys
 print(",".join(json.load(open(sys.argv[1]))["reality"]["serverNames"]))
