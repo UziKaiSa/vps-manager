@@ -1,6 +1,6 @@
 ﻿param(
-    [ValidatePattern('^[A-Za-z0-9._-]+$')]
-    [string]$KeyName = 'vps-manager-ed25519',
+    [Alias('KeyName')]
+    [string]$KeyNameSuffix,
 
     [string]$Comment = 'vps-manager',
 
@@ -9,13 +9,31 @@
 
 $ErrorActionPreference = 'Stop'
 
+$defaultKeyNameSuffix = 'vps-manager'
+if ([string]::IsNullOrWhiteSpace($KeyNameSuffix)) {
+    $inputKeyNameSuffix = Read-Host "密钥文件名后缀（将生成 id_ed25519_后缀）[$defaultKeyNameSuffix]"
+    $KeyNameSuffix = if ([string]::IsNullOrWhiteSpace($inputKeyNameSuffix)) {
+        $defaultKeyNameSuffix
+    }
+    else {
+        $inputKeyNameSuffix.Trim()
+    }
+}
+
+if ($KeyNameSuffix -notmatch '^[A-Za-z0-9._-]+$' -or
+    $KeyNameSuffix -in @('.', '..') -or
+    $KeyNameSuffix.Length -gt 80) {
+    throw '密钥文件名后缀无效。只能使用英文字母、数字、点、下划线和连字符，最长 80 个字符。'
+}
+$keyFileName = "id_ed25519_${KeyNameSuffix}"
+
 $sshKeygen = Get-Command 'ssh-keygen.exe' -ErrorAction SilentlyContinue
 if (-not $sshKeygen) {
     throw '未找到 ssh-keygen.exe。请先在 Windows“可选功能”中安装 OpenSSH 客户端。'
 }
 
 $sshDirectory = Join-Path $env:USERPROFILE '.ssh'
-$privateKeyPath = Join-Path $sshDirectory $KeyName
+$privateKeyPath = Join-Path $sshDirectory $keyFileName
 $publicKeyPath = "$privateKeyPath.pub"
 
 New-Item -ItemType Directory -Force -Path $sshDirectory | Out-Null

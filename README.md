@@ -82,21 +82,23 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
   -File ".\windows-ssh-key.ps1"
 ```
 
+运行后只需输入密钥文件名后缀。例如输入 `GB`，会生成 `id_ed25519_GB` 和 `id_ed25519_GB.pub`；直接回车使用默认后缀 `vps-manager`。
+
 Windows 不需要执行 `chmod +x`。上面的 `-ExecutionPolicy Bypass` 只对这一次 PowerShell 进程生效，用于执行刚下载的脚本，不会永久修改系统执行策略。
 
 默认生成位置：
 
 ```text
-私钥：%USERPROFILE%\.ssh\vps-manager-ed25519
-公钥：%USERPROFILE%\.ssh\vps-manager-ed25519.pub
+私钥：%USERPROFILE%\.ssh\id_ed25519_vps-manager
+公钥：%USERPROFILE%\.ssh\id_ed25519_vps-manager.pub
 ```
 
-也可以指定密钥文件名和备注：
+也可以直接指定密钥文件名后缀和备注：
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass `
   -File ".\windows-ssh-key.ps1" `
-  -KeyName "my-vps-ed25519" `
+  -KeyNameSuffix "my-vps" `
   -Comment "my-vps"
 ```
 
