@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.7.0-test"
+SCRIPT_VERSION="0.7.1-test"
 SCRIPT_NAME="VPS Manager"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh"
 
@@ -2563,21 +2563,10 @@ add_ssh_public_key() {
 ssh_key_helper_menu() {
   local choice key_name key_comment public_key key_file admin_user admin_home authorized_keys
   while true; do
-    printf '\nSSH 密钥与加固管理：\n  1) Windows PowerShell 生成并读取公钥\n  2) Linux/macOS 生成并读取公钥\n  3) 校验 SSH 公钥并显示指纹\n  4) 添加公钥到当前管理用户 authorized_keys\n  5) 配置 SSH 高位端口和仅密钥登录\n  6) 查看当前管理用户 authorized_keys\n  0) 返回\n'
+    printf '\nSSH 密钥与加固管理：\n  1) Linux/macOS 生成并读取公钥\n  2) 校验 SSH 公钥并显示指纹\n  3) 添加公钥到当前管理用户 authorized_keys\n  4) 配置 SSH 高位端口和仅密钥登录\n  5) 查看当前管理用户 authorized_keys\n  0) 返回\n'
     read -r -p "请选择 [0]: " choice
     case "${choice:-0}" in
       1)
-        key_name="$(prompt_default "密钥文件名" "vps-manager-ed25519")"
-        key_comment="$(prompt_default "密钥备注" "vps-manager")"
-        [[ "${key_name}" =~ ^[A-Za-z0-9._-]+$ ]] || { warn "文件名格式无效。"; continue; }
-        printf '\n请在需要连接 VPS 的 Windows 电脑上执行：\n\n'
-        printf '$KeyPath = Join-Path $env:USERPROFILE ".ssh\\%s"\n' "${key_name}"
-        printf 'New-Item -ItemType Directory -Force (Split-Path $KeyPath) | Out-Null\n'
-        printf 'ssh-keygen -t ed25519 -a 64 -f $KeyPath -C "%s"\n' "${key_comment}"
-        printf 'Get-Content "$KeyPath.pub"\n'
-        warn "只粘贴 .pub 的完整一行；不要发送不带 .pub 后缀的私钥。"
-        ;;
-      2)
         key_name="$(prompt_default "密钥文件名" "vps-manager-ed25519")"
         key_comment="$(prompt_default "密钥备注" "vps-manager")"
         [[ "${key_name}" =~ ^[A-Za-z0-9._-]+$ ]] || { warn "文件名格式无效。"; continue; }
@@ -2587,20 +2576,20 @@ ssh_key_helper_menu() {
         printf 'cat "$HOME/.ssh/%s.pub"\n' "${key_name}"
         warn "只粘贴 .pub 的完整一行；不要发送不带 .pub 后缀的私钥。"
         ;;
-      3)
+      2)
         read -r -p "粘贴 SSH 公钥完整一行: " public_key
         public_key="${public_key%$'\r'}"; ensure_work_dir; key_file="${WORK_DIR}/public-key.pub"
         printf '%s\n' "${public_key}" > "${key_file}"; chmod 600 "${key_file}"
         command -v ssh-keygen >/dev/null 2>&1 || { warn "缺少 ssh-keygen，请先初始化基础工具。"; continue; }
         ssh-keygen -l -f "${key_file}" && printf '公钥有效，可粘贴到 SSH 加固流程。\n' || warn "公钥格式无效。"
         ;;
-      4)
+      3)
         add_ssh_public_key || true
         ;;
-      5)
+      4)
         configure_ssh_hardening || true
         ;;
-      6)
+      5)
         admin_user="$(default_ssh_admin_user)"; admin_home="$(getent passwd "${admin_user}" 2>/dev/null | cut -d: -f6)"
         authorized_keys="${admin_home}/.ssh/authorized_keys"
         printf '管理用户：%s\n文件：%s\n\n' "${admin_user}" "${authorized_keys}"
@@ -2611,7 +2600,6 @@ ssh_key_helper_menu() {
     esac
   done
 }
-
 
 ensure_yaml_module() {
   python3 -c 'import yaml' >/dev/null 2>&1 && return 0
