@@ -2,7 +2,7 @@
 
 `VPS Manager` 是一个面向 Debian/Ubuntu VPS 的中文交互式管理脚本，用于完成服务器初始化、SSH 加固、Xray 配置、Clash/Mihomo YAML 管理，以及 Komari Agent/WARP 私网接入。
 
-当前版本：`0.7.6-test`
+当前版本：`0.7.7-test`
 
 > 目前是测试版。首次在正式服务器上使用前，建议先运行预览模式，并保留一个已经登录的 SSH 终端。
 
@@ -370,7 +370,15 @@ Cloudflare Access Service Token 的读取顺序：
 建议根分区：4 GiB 或更大
 ```
 
-不满足条件时会在下载 WARP 前停止，不会继续占满磁盘。小磁盘机器可以选择“安装/重装普通公网 Komari Agent”；如果 Komari 只能通过 WARP 私网访问，则需要先扩容磁盘。
+不满足新版空间条件时，Debian 12 amd64 机器如果仍有至少 400 MiB 可用空间，可以选择安装 Cloudflare 官方 `2026.1.150.0` 轻量稳定版。该版本是新版 Linux GUI 引入前的官方版本，下载约 53 MiB、安装后约 152 MiB，仍支持 `mdm.xml`、Zero Trust Team 和 Service Token。
+
+脚本会校验官方安装包的 SHA-256，并在安装后执行 `apt-mark hold cloudflare-warp`，防止系统升级时重新拉入带 WebKit/GTK 的大型新版。锁定期间不会获得新版功能和修复；磁盘扩容后应手动解除锁定并升级：
+
+```bash
+apt-mark unhold cloudflare-warp
+apt update
+apt install cloudflare-warp
+```
 
 `/root/warp-token.env` 示例：
 

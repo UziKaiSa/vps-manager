@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.7.6-test"
+SCRIPT_VERSION="0.7.7-test"
 SCRIPT_NAME="VPS Manager"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh"
 
@@ -14,6 +14,10 @@ KOMARI_DEFAULT_PRIVATE_URL="http://komari.example.internal:8080"
 KOMARI_TOKEN_ENV_FILE="/root/warp-token.env"
 KOMARI_WARP_MIN_ROOT_MIB=3072
 KOMARI_WARP_MIN_FREE_MIB=1536
+KOMARI_WARP_LEGACY_MIN_FREE_MIB=400
+KOMARI_WARP_LEGACY_VERSION="2026.1.150.0"
+KOMARI_WARP_LEGACY_URL="https://downloads.cloudflareclient.com/v1/download/bookworm-intel/version/2026.1.150.0"
+KOMARI_WARP_LEGACY_SHA256="049ad669140ac0f428a980ebd8b4bca7949307076d7cf51f6e5668c239d6ad87"
 
 SSHD_MAIN_CONFIG="/etc/ssh/sshd_config"
 SSHD_DROPIN_DIR="/etc/ssh/sshd_config.d"
@@ -3090,21 +3094,68 @@ komari_check_warp_disk() {
     printf 'Cloudflare WARP 当前会强制安装 WebKit/GTK 等大型依赖。\n'
     printf '脚本要求：根分区至少 %s MiB、可用空间至少 %s MiB；建议扩容到 4 GiB 以上。\n' \
       "${KOMARI_WARP_MIN_ROOT_MIB}" "${KOMARI_WARP_MIN_FREE_MIB}"
-    printf '这台机器可以返回 Komari 菜单，选择“安装/重装普通公网 Agent”；如果 Komari 只有私网地址，则必须先扩容。\n'
+    printf '如果是 Debian 12 amd64 且至少还有 400 MiB 可用空间，脚本可以改装 Cloudflare 官方旧版轻量客户端并锁定版本。\n'
     return 1
   fi
 }
 
+komari_install_warp_legacy() {
+  local codename arch root_free_kib root_free_mib package_file installed_version
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  codename="${VERSION_CODENAME:-}"
+  arch="$(dpkg --print-architecture)"
+  if [[ "${codename}" != "bookworm" || "${arch}" != "amd64" ]]; then
+    warn "官方轻量旧版自动安装目前只支持 Debian 12 amd64；当前为 ${codename:-unknown} ${arch}."
+    return 1
+  fi
+
+  root_free_kib="$(df -Pk / | awk 'NR == 2 {print $4}')"
+  [[ "${root_free_kib:-}" =~ ^[0-9]+$ ]] \
+    || { warn "无法读取根分区可用空间。"; return 1; }
+  root_free_mib=$((root_free_kib / 1024))
+  if (( root_free_mib < KOMARI_WARP_LEGACY_MIN_FREE_MIB )); then
+    warn "安装官方轻量旧版 WARP 至少需要 ${KOMARI_WARP_LEGACY_MIN_FREE_MIB} MiB 可用空间；当前只有 ${root_free_mib} MiB。"
+    return 1
+  fi
+
+  printf '\n可用的低磁盘方案：\n'
+  printf '  Cloudflare 官方 WARP: %s（新 Linux GUI 引入前）\n' "${KOMARI_WARP_LEGACY_VERSION}"
+  printf '  下载约 53 MiB，安装后约 152 MiB；安装完成后会锁定版本。\n'
+  printf '  锁定期间不会获得新版功能和修复；扩容后可解除锁定并升级。\n'
+  prompt_yes_no "是否安装并锁定这个官方轻量版本" 1 || return 1
+
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update
+  apt-get install -y curl ca-certificates gnupg2 iproute2 nftables libcap2-bin
+  ensure_work_dir
+  package_file="${WORK_DIR}/cloudflare-warp_${KOMARI_WARP_LEGACY_VERSION}_amd64.deb"
+  curl -fL --retry 2 --connect-timeout 10 --max-time 180 \
+    -o "${package_file}" "${KOMARI_WARP_LEGACY_URL}"
+  printf '%s  %s\n' "${KOMARI_WARP_LEGACY_SHA256}" "${package_file}" | sha256sum -c -
+  apt-get install -y "${package_file}"
+
+  installed_version="$(dpkg-query -W -f='${Version}' cloudflare-warp 2>/dev/null || true)"
+  [[ "${installed_version}" == "${KOMARI_WARP_LEGACY_VERSION}" ]] \
+    || { warn "WARP 版本校验失败：${installed_version:-未安装}"; return 1; }
+  command -v warp-cli >/dev/null 2>&1 \
+    || { warn "WARP 已安装但找不到 warp-cli。"; return 1; }
+  apt-mark hold cloudflare-warp >/dev/null
+  log "已安装并锁定 Cloudflare WARP ${installed_version}"
+}
+
 komari_install_warp_client() {
   local codename
-  if dpkg-query -W -f='${db:Status-Abbrev}' cloudflare-warp 2>/dev/null \
-      | grep -q '^ii' \
+  if [[ "$(dpkg-query -W -f='${db:Status-Status}' cloudflare-warp 2>/dev/null || true)" == "installed" ]] \
     && command -v warp-cli >/dev/null 2>&1; then
     log "Cloudflare WARP 已安装，跳过重复安装"
     return 0
   fi
 
-  komari_check_warp_disk || return 1
+  if ! komari_check_warp_disk; then
+    komari_install_warp_legacy
+    return $?
+  fi
   # shellcheck disable=SC1091
   . /etc/os-release; codename="${VERSION_CODENAME:-}"; [[ -n "${codename}" ]] || codename="$(lsb_release -cs)"
   export DEBIAN_FRONTEND=noninteractive
@@ -3150,7 +3201,12 @@ komari_connect_warp() {
   warp-cli --accept-tos disconnect >/dev/null 2>&1 || true
   warp-cli --accept-tos registration delete >/dev/null 2>&1 || true
   systemctl restart warp-svc; sleep 3
-  warp-cli --accept-tos mdm refresh || true; sleep 3
+  if warp-cli mdm refresh --help >/dev/null 2>&1; then
+    warp-cli --accept-tos mdm refresh || true
+  else
+    log "当前 WARP 版本会在服务重启时加载 MDM 配置"
+  fi
+  sleep 3
   warp-cli --accept-tos connect || true; sleep 8
 }
 
