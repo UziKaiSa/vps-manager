@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.7.8-test"
+SCRIPT_VERSION="0.7.9-test"
 SCRIPT_NAME="VPS Manager"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh"
 
@@ -22,6 +22,9 @@ KOMARI_WARP_LEGACY_SHA256="049ad669140ac0f428a980ebd8b4bca7949307076d7cf51f6e566
 SSHD_MAIN_CONFIG="/etc/ssh/sshd_config"
 SSHD_DROPIN_DIR="/etc/ssh/sshd_config.d"
 SSHD_MANAGED_CONFIG="${SSHD_DROPIN_DIR}/00-vps-manager-hardening.conf"
+SSH_SOCKET_TRANSITIONED=0
+SSH_SOCKET_WAS_ENABLED=0
+SSH_SOCKET_WAS_ACTIVE=0
 
 STATE_DIR="/etc/vps-manager"
 STATE_FILE="${STATE_DIR}/state.json"
@@ -393,6 +396,49 @@ ssh_service_name() {
 }
 
 
+
+switch_ssh_socket_to_service() {
+  local ssh_service="$1"
+
+  SSH_SOCKET_TRANSITIONED=0
+  SSH_SOCKET_WAS_ENABLED=0
+  SSH_SOCKET_WAS_ACTIVE=0
+  systemctl cat ssh.socket >/dev/null 2>&1 || return 0
+  systemctl is-active --quiet ssh.socket || return 0
+
+  SSH_SOCKET_WAS_ACTIVE=1
+  if systemctl is-enabled --quiet ssh.socket; then
+    SSH_SOCKET_WAS_ENABLED=1
+  fi
+  SSH_SOCKET_TRANSITIONED=1
+  log "Detected ssh.socket with a fixed listener; switching SSH to ssh.service/sshd_config"
+
+  systemctl disable ssh.socket >/dev/null \
+    && systemctl stop "${ssh_service}" \
+    && systemctl stop ssh.socket \
+    && systemctl daemon-reload \
+    && systemctl start "${ssh_service}"
+}
+
+
+restore_ssh_socket_state() {
+  local ssh_service="$1"
+  [[ "${SSH_SOCKET_TRANSITIONED}" == "1" ]] || return 0
+
+  systemctl stop "${ssh_service}" >/dev/null 2>&1 || true
+  if [[ "${SSH_SOCKET_WAS_ENABLED}" == "1" ]]; then
+    systemctl enable ssh.socket >/dev/null 2>&1 || true
+  else
+    systemctl disable ssh.socket >/dev/null 2>&1 || true
+  fi
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  if [[ "${SSH_SOCKET_WAS_ACTIVE}" == "1" ]]; then
+    systemctl start ssh.socket >/dev/null 2>&1 || return 1
+  fi
+  systemctl start "${ssh_service}" >/dev/null 2>&1
+}
+
+
 restore_ssh_port_configs() {
   local backup_dir="$1"
   local backup_name target
@@ -485,11 +531,15 @@ rollback_ssh_hardening() {
     rm -f -- "${authorized_keys}"
   fi
 
+  if [[ "${SSH_SOCKET_TRANSITIONED}" == "1" ]]; then
+    restore_ssh_socket_state "${ssh_service}" || warn "Failed to restore ssh.socket; keep this session open and check immediately."
+  else
   if /usr/sbin/sshd -t; then
     systemctl reload "${ssh_service}" \
       || warn "SSH 配置已恢复，但 reload 失败；请保持当前会话并手动检查。"
   else
     warn "SSH 配置恢复后的语法检查失败；请保持当前会话并立即检查。"
+  fi
   fi
 }
 
@@ -523,6 +573,10 @@ configure_ssh_hardening() {
   local effective_methods
   local host_name
   local port_config_backup_dir=""
+
+  SSH_SOCKET_TRANSITIONED=0
+  SSH_SOCKET_WAS_ENABLED=0
+  SSH_SOCKET_WAS_ACTIVE=0
 
   require_root
   check_supported_os
@@ -745,12 +799,23 @@ EOF
     die "SSH 生效配置与预期不一致，已恢复。有效端口：${effective_ports:-未知}"
   fi
 
+  if ! switch_ssh_socket_to_service "${ssh_service}"; then
+    rollback_ssh_hardening \
+      "${config_existed}" "${config_before}" \
+      "${authorized_existed}" "${authorized_before}" "${authorized_keys}" \
+      "${admin_user}" "${admin_group}" "${ssh_service}" "${port_config_backup_dir}"
+    die "Failed to switch SSH listener mode; previous configuration was restored."
+  fi
+
+  if [[ "${SSH_SOCKET_TRANSITIONED}" != "1" ]]; then
+
   if ! systemctl reload "${ssh_service}"; then
     rollback_ssh_hardening \
       "${config_existed}" "${config_before}" \
       "${authorized_existed}" "${authorized_before}" "${authorized_keys}" \
       "${admin_user}" "${admin_group}" "${ssh_service}" "${port_config_backup_dir}"
     die "SSH reload 失败，已恢复。"
+  fi
   fi
 
   if ! wait_for_port_listening "${ssh_port}" 10; then
