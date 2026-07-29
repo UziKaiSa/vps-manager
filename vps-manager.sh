@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.7.5-test"
+SCRIPT_VERSION="0.7.6-test"
 SCRIPT_NAME="VPS Manager"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh"
 
@@ -12,6 +12,8 @@ KOMARI_INSTALL_URL="https://raw.githubusercontent.com/komari-monitor/komari-agen
 KOMARI_DEFAULT_TEAM="your-team-name"
 KOMARI_DEFAULT_PRIVATE_URL="http://komari.example.internal:8080"
 KOMARI_TOKEN_ENV_FILE="/root/warp-token.env"
+KOMARI_WARP_MIN_ROOT_MIB=3072
+KOMARI_WARP_MIN_FREE_MIB=1536
 
 SSHD_MAIN_CONFIG="/etc/ssh/sshd_config"
 SSHD_DROPIN_DIR="/etc/ssh/sshd_config.d"
@@ -3074,8 +3076,35 @@ komari_load_cf_token() {
 }
 
 
+komari_check_warp_disk() {
+  local root_total_kib root_free_kib root_total_mib root_free_mib
+  read -r root_total_kib root_free_kib < <(df -Pk / | awk 'NR == 2 {print $2, $4}')
+  [[ "${root_total_kib:-}" =~ ^[0-9]+$ && "${root_free_kib:-}" =~ ^[0-9]+$ ]] \
+    || { warn "无法读取根分区容量，为避免安装中途写满，已停止安装 WARP。"; return 1; }
+  root_total_mib=$((root_total_kib / 1024))
+  root_free_mib=$((root_free_kib / 1024))
+
+  if (( root_total_mib < KOMARI_WARP_MIN_ROOT_MIB \
+    || root_free_mib < KOMARI_WARP_MIN_FREE_MIB )); then
+    warn "当前根分区共 ${root_total_mib} MiB、可用 ${root_free_mib} MiB，不满足官方 WARP 客户端的安装空间要求。"
+    printf 'Cloudflare WARP 当前会强制安装 WebKit/GTK 等大型依赖。\n'
+    printf '脚本要求：根分区至少 %s MiB、可用空间至少 %s MiB；建议扩容到 4 GiB 以上。\n' \
+      "${KOMARI_WARP_MIN_ROOT_MIB}" "${KOMARI_WARP_MIN_FREE_MIB}"
+    printf '这台机器可以返回 Komari 菜单，选择“安装/重装普通公网 Agent”；如果 Komari 只有私网地址，则必须先扩容。\n'
+    return 1
+  fi
+}
+
 komari_install_warp_client() {
   local codename
+  if dpkg-query -W -f='${db:Status-Abbrev}' cloudflare-warp 2>/dev/null \
+      | grep -q '^ii' \
+    && command -v warp-cli >/dev/null 2>&1; then
+    log "Cloudflare WARP 已安装，跳过重复安装"
+    return 0
+  fi
+
+  komari_check_warp_disk || return 1
   # shellcheck disable=SC1091
   . /etc/os-release; codename="${VERSION_CODENAME:-}"; [[ -n "${codename}" ]] || codename="$(lsb_release -cs)"
   export DEBIAN_FRONTEND=noninteractive
@@ -3083,7 +3112,9 @@ komari_install_warp_client() {
   install -d -m 0755 /usr/share/keyrings
   curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
   printf 'deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ %s main\n' "${codename}" > /etc/apt/sources.list.d/cloudflare-client.list
-  apt-get update; apt-get install -y cloudflare-warp
+  apt-get update
+  komari_check_warp_disk || return 1
+  apt-get install -y cloudflare-warp
 }
 
 
@@ -3141,7 +3172,11 @@ install_komari_warp() {
   printf '\n配置预览：\n  Team: %s\n  私网地址: %s\n  MDM: /var/lib/cloudflare-warp/mdm.xml\n  Service Token: 环境变量、%s 或安全输入\n' "${team}" "${endpoint}" "${KOMARI_TOKEN_ENV_FILE}"
   if [[ "${DEMO_MODE}" == 1 ]]; then printf '[演示] 使用主脚本内置流程，不下载 komari-warp-scripts 包装脚本。\n'; [[ "${install_agent}" == 1 ]] && komari_install_agent "${endpoint}"; return 0; fi
   prompt_yes_no "确认配置 WARP 私网" 0 || return 0
-  log "安装 Cloudflare WARP"; komari_install_warp_client
+  log "安装 Cloudflare WARP"
+  if ! komari_install_warp_client; then
+    warn "WARP 未安装，未继续写入 MDM 或安装私网 Agent。"
+    return 0
+  fi
   komari_check_kernel || return 0
   komari_load_cf_token || return 1
   komari_write_mdm "${team}"
