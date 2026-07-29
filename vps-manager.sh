@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.7.7-test"
+SCRIPT_VERSION="0.7.8-test"
 SCRIPT_NAME="VPS Manager"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh"
 
@@ -393,6 +393,72 @@ ssh_service_name() {
 }
 
 
+restore_ssh_port_configs() {
+  local backup_dir="$1"
+  local backup_name target
+  [[ -n "${backup_dir}" && -r "${backup_dir}/manifest" ]] || return 0
+  while IFS=$'\t' read -r backup_name target; do
+    [[ -n "${backup_name}" && "${target}" == /* ]] || continue
+    cp -a -- "${backup_dir}/${backup_name}" "${target}"
+  done < "${backup_dir}/manifest"
+}
+
+backup_and_disable_ssh_ports() {
+  local backup_dir path backup_name candidate
+  local index=0
+  local -a config_files=("${SSHD_MAIN_CONFIG}")
+  while IFS= read -r -d '' path; do
+    config_files+=("${path}")
+  done < <(find "${SSHD_DROPIN_DIR}" -maxdepth 1 -type f -name '*.conf' -print0 2>/dev/null)
+  install -d -o root -g root -m 700 "${BACKUP_ROOT}"
+  backup_dir="$(mktemp -d "${BACKUP_ROOT}/sshd-port-sources-$(date -u '+%Y%m%dT%H%M%SZ').XXXXXX")"
+  chmod 700 "${backup_dir}"
+  : > "${backup_dir}/manifest"
+  for path in "${config_files[@]}"; do
+    [[ -f "${path}" && "${path}" != "${SSHD_MANAGED_CONFIG}" ]] || continue
+    grep -Eqi '^[[:space:]]*port[[:space:]]+[0-9]+([[:space:]]*(#.*)?)?$' "${path}" || continue
+    if [[ -L "${path}" || "${path}" == *$'\n'* || "${path}" == *$'\t'* ]]; then
+      warn "SSH 端口来源文件不安全，未修改：${path}"
+      restore_ssh_port_configs "${backup_dir}"
+      return 1
+    fi
+    index=$((index + 1))
+    backup_name="$(printf '%04d.conf' "${index}")"
+    if ! cp -a -- "${path}" "${backup_dir}/${backup_name}"; then
+      restore_ssh_port_configs "${backup_dir}"
+      return 1
+    fi
+    printf '%s\t%s\n' "${backup_name}" "${path}" >> "${backup_dir}/manifest"
+    candidate="${WORK_DIR}/sshd-port-source-${index}.new"
+    if ! awk '
+      /^[[:space:]]*[Pp][Oo][Rr][Tt][[:space:]]+[0-9]+([[:space:]]*(#.*)?)?$/ {
+        print "# VPS Manager replaced old SSH port: " $0
+        next
+      }
+      { print }
+    ' "${path}" > "${candidate}"; then
+      restore_ssh_port_configs "${backup_dir}"
+      return 1
+    fi
+    if ! chmod --reference="${path}" "${candidate}" \
+      || ! chown --reference="${path}" "${candidate}"; then
+      restore_ssh_port_configs "${backup_dir}"
+      return 1
+    fi
+    if ! mv -f -- "${candidate}" "${path}"; then
+      restore_ssh_port_configs "${backup_dir}"
+      return 1
+    fi
+  done
+  if (( index == 0 )); then
+    rm -f -- "${backup_dir}/manifest"
+    rmdir -- "${backup_dir}"
+    printf ''
+  else
+    printf '%s' "${backup_dir}"
+  fi
+}
+
 rollback_ssh_hardening() {
   local config_existed="$1"
   local config_before="$2"
@@ -402,6 +468,9 @@ rollback_ssh_hardening() {
   local admin_user="$6"
   local admin_group="$7"
   local ssh_service="$8"
+  local port_config_backup_dir="${9:-}"
+
+  restore_ssh_port_configs "${port_config_backup_dir}"
 
   if [[ "${config_existed}" == "1" ]]; then
     install -o root -g root -m 644 "${config_before}" "${SSHD_MANAGED_CONFIG}"
@@ -453,6 +522,7 @@ configure_ssh_hardening() {
   local effective_pubkey
   local effective_methods
   local host_name
+  local port_config_backup_dir=""
 
   require_root
   check_supported_os
@@ -491,6 +561,7 @@ configure_ssh_hardening() {
     else
       printf '将沿用 %s 中已有的有效公钥。\n' "${authorized_keys}"
     fi
+    printf '将停用现有 SSH 配置中的所有显式 Port，并仅保留新端口。\n'
     printf '将写入：%s\n' "${SSHD_MANAGED_CONFIG}"
     cat <<EOF
 Port ${ssh_port}
@@ -614,6 +685,13 @@ EOF
     "${WORK_DIR}/authorized_keys.new" "${authorized_keys}"
 
   install -d -o root -g root -m 755 "${SSHD_DROPIN_DIR}"
+  if ! port_config_backup_dir="$(backup_and_disable_ssh_ports)"; then
+    rollback_ssh_hardening \
+      "${config_existed}" "${config_before}" \
+      "${authorized_existed}" "${authorized_before}" "${authorized_keys}" \
+      "${admin_user}" "${admin_group}" "${ssh_service}" "${port_config_backup_dir}"
+    die "无法安全替换现有 SSH Port 配置，已恢复。"
+  fi
   cat > "${WORK_DIR}/sshd-hardening.conf" <<EOF
 Port ${ssh_port}
 PubkeyAuthentication yes
@@ -631,7 +709,7 @@ EOF
     rollback_ssh_hardening \
       "${config_existed}" "${config_before}" \
       "${authorized_existed}" "${authorized_before}" "${authorized_keys}" \
-      "${admin_user}" "${admin_group}" "${ssh_service}"
+      "${admin_user}" "${admin_group}" "${ssh_service}" "${port_config_backup_dir}"
     die "新 SSH 配置语法检查失败，已恢复。"
   fi
 
@@ -641,7 +719,7 @@ EOF
     rollback_ssh_hardening \
       "${config_existed}" "${config_before}" \
       "${authorized_existed}" "${authorized_before}" "${authorized_keys}" \
-      "${admin_user}" "${admin_group}" "${ssh_service}"
+      "${admin_user}" "${admin_group}" "${ssh_service}" "${port_config_backup_dir}"
     die "无法读取 SSH 生效配置，已恢复。"
   fi
   effective_ports="$(printf '%s\n' "${effective}" \
@@ -663,7 +741,7 @@ EOF
     rollback_ssh_hardening \
       "${config_existed}" "${config_before}" \
       "${authorized_existed}" "${authorized_before}" "${authorized_keys}" \
-      "${admin_user}" "${admin_group}" "${ssh_service}"
+      "${admin_user}" "${admin_group}" "${ssh_service}" "${port_config_backup_dir}"
     die "SSH 生效配置与预期不一致，已恢复。有效端口：${effective_ports:-未知}"
   fi
 
@@ -671,7 +749,7 @@ EOF
     rollback_ssh_hardening \
       "${config_existed}" "${config_before}" \
       "${authorized_existed}" "${authorized_before}" "${authorized_keys}" \
-      "${admin_user}" "${admin_group}" "${ssh_service}"
+      "${admin_user}" "${admin_group}" "${ssh_service}" "${port_config_backup_dir}"
     die "SSH reload 失败，已恢复。"
   fi
 
@@ -679,7 +757,7 @@ EOF
     rollback_ssh_hardening \
       "${config_existed}" "${config_before}" \
       "${authorized_existed}" "${authorized_before}" "${authorized_keys}" \
-      "${admin_user}" "${admin_group}" "${ssh_service}"
+      "${admin_user}" "${admin_group}" "${ssh_service}" "${port_config_backup_dir}"
     die "新 SSH 端口未监听，已恢复原配置。"
   fi
 
@@ -691,7 +769,7 @@ EOF
     rollback_ssh_hardening \
       "${config_existed}" "${config_before}" \
       "${authorized_existed}" "${authorized_before}" "${authorized_keys}" \
-      "${admin_user}" "${admin_group}" "${ssh_service}"
+      "${admin_user}" "${admin_group}" "${ssh_service}" "${port_config_backup_dir}"
     warn "验证未通过，已恢复原 SSH 端口和认证配置。"
     return 0
   fi
@@ -704,6 +782,8 @@ EOF
     && printf '原 SSH 配置备份：%s\n' "${config_backup_dir}"
   [[ -n "${authorized_backup_dir}" ]] \
     && printf '原 authorized_keys 备份：%s\n' "${authorized_backup_dir}"
+  [[ -n "${port_config_backup_dir}" ]] \
+    && printf '原 SSH Port 来源文件备份：%s\n' "${port_config_backup_dir}"
 }
 
 
