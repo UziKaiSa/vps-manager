@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.8.2-test"
+SCRIPT_VERSION="0.8.3-test"
 SCRIPT_NAME="VPS Manager"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh"
 
@@ -1084,7 +1084,7 @@ write_proxy_input_file() {
 }
 
 
-generate_xray_files() {
+generate_xray_files_once() {
   local private_key="$1"
   local public_key="$2"
   local short_id="$3"
@@ -1094,6 +1094,8 @@ generate_xray_files() {
   local generated_info="$7"
   local generated_yaml="$8"
   local pending_model="${9:-}"
+  local allow_failed_socks="${10:-0}"
+  local probe_failure_marker="${11:-}"
 
   CFG_NODE_NAME="${CFG_NODE_NAME}" \
   CFG_PUBLIC_ADDRESS="${CFG_PUBLIC_ADDRESS}" \
@@ -1114,7 +1116,7 @@ generate_xray_files() {
   CFG_SS_METHOD="${CFG_SS_METHOD}" \
   CFG_SS_PASS="${CFG_SS_PASS}" \
   CFG_PENDING_MODEL="${pending_model}" \
-  python3 - "${proxy_input}" "${generated_config}" "${generated_state}" "${generated_info}" "${generated_yaml}" <<'PY'
+  python3 - "${proxy_input}" "${generated_config}" "${generated_state}" "${generated_info}" "${generated_yaml}" "${allow_failed_socks}" "${probe_failure_marker}" <<'PY'
 from __future__ import annotations
 
 import base64
@@ -1132,6 +1134,8 @@ import uuid
 
 proxy_input = Path(sys.argv[1])
 config_path = Path(sys.argv[2])
+allow_failed_socks = sys.argv[6] == "1"
+probe_failure_marker = sys.argv[7]
 state_path = Path(sys.argv[3])
 info_path = Path(sys.argv[4])
 yaml_path = Path(sys.argv[5])
@@ -1387,18 +1391,9 @@ def probe_socks_resolution(parsed: dict, name: str) -> dict:
         f"出口「{name}」的 SOCKS 域名模式和 IPv4 模式均未通过 HTTPS 检测；"
         "请检查地址、端口、认证或代理服务状态。"
     )
-    print(f"警告: {failure}", file=sys.stderr)
-    try:
-        with open("/dev/tty", "r+", encoding="utf-8") as terminal:
-            terminal.write(
-                f"仍要忽略风险并写入出口「{name}」吗？"
-                "该节点可能完全无法连接 [y/N]: "
-            )
-            terminal.flush()
-            answer = terminal.readline().strip().lower()
-    except OSError:
-        answer = ""
-    if answer not in {"y", "yes"}:
+    if not allow_failed_socks:
+        if probe_failure_marker:
+            Path(probe_failure_marker).write_text(failure, encoding="utf-8")
         raise RuntimeError(failure)
 
     summary = "检测失败，用户已确认忽略风险并强制写入（保持 AsIs）"
@@ -1893,6 +1888,38 @@ lines.extend(
 info_path.write_text("\n".join(lines) + "\n")
 yaml_path.write_text("\n".join(yaml_lines) + "\n")
 PY
+}
+
+
+generate_xray_files() {
+  local private_key="$1"
+  local public_key="$2"
+  local short_id="$3"
+  local proxy_input="$4"
+  local generated_config="$5"
+  local generated_state="$6"
+  local generated_info="$7"
+  local generated_yaml="$8"
+  local pending_model="${9:-}"
+  local failure_marker="${generated_config}.socks-probe-failed"
+  local failure_message=""
+
+  rm -f -- "${failure_marker}"
+  if generate_xray_files_once "${private_key}" "${public_key}" "${short_id}" "${proxy_input}" "${generated_config}" "${generated_state}" "${generated_info}" "${generated_yaml}" "${pending_model}" "0" "${failure_marker}"; then
+    rm -f -- "${failure_marker}"
+    return 0
+  fi
+  [[ -s "${failure_marker}" ]] || return 1
+  failure_message="$(cat "${failure_marker}")"
+  warn "${failure_message}"
+  prompt_yes_no "仍要忽略风险并写入失败的 SOCKS 出口（节点可能完全无法连接）" "0" || { rm -f -- "${failure_marker}"; return 1; }
+  rm -f -- "${generated_config}" "${generated_state}" "${generated_info}" "${generated_yaml}"
+  if generate_xray_files_once "${private_key}" "${public_key}" "${short_id}" "${proxy_input}" "${generated_config}" "${generated_state}" "${generated_info}" "${generated_yaml}" "${pending_model}" "1" "${failure_marker}"; then
+    rm -f -- "${failure_marker}"
+    return 0
+  fi
+  rm -f -- "${failure_marker}"
+  return 1
 }
 
 
