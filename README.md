@@ -16,6 +16,7 @@
 - 增量更新已有 Xray 配置
 - 添加 SOCKS5、HTTP、HTTPS 或 Shadowsocks 出口
 - 检查部分 SOCKS5 域名解析/连接问题并应用 IPv4 兜底
+- SOCKS5 两种检测均失败时，默认停止；用户可明确确认风险后强制写入，并在状态中标记为未验证
 - 输出可直接放进 Clash/Mihomo YAML 的节点内容
 - 查看、导入、重命名和重新分组 YAML 节点
 - 提供独立的 Windows SSH 公钥和私钥生成脚本

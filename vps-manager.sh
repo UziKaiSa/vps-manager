@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.8.1-test"
+SCRIPT_VERSION="0.8.2-test"
 SCRIPT_NAME="VPS Manager"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh"
 
@@ -1383,10 +1383,34 @@ def probe_socks_resolution(parsed: dict, name: str) -> dict:
                 "attempts": attempts,
             }
 
-    raise RuntimeError(
+    failure = (
         f"出口「{name}」的 SOCKS 域名模式和 IPv4 模式均未通过 HTTPS 检测；"
         "请检查地址、端口、认证或代理服务状态。"
     )
+    print(f"警告: {failure}", file=sys.stderr)
+    try:
+        with open("/dev/tty", "r+", encoding="utf-8") as terminal:
+            terminal.write(
+                f"仍要忽略风险并写入出口「{name}」吗？"
+                "该节点可能完全无法连接 [y/N]: "
+            )
+            terminal.flush()
+            answer = terminal.readline().strip().lower()
+    except OSError:
+        answer = ""
+    if answer not in {"y", "yes"}:
+        raise RuntimeError(failure)
+
+    summary = "检测失败，用户已确认忽略风险并强制写入（保持 AsIs）"
+    print(f"[出口检测] {name}: {summary}。", file=sys.stderr)
+    return {
+        "result": "forced-unverified",
+        "mode": "remote-domain",
+        "targetStrategy": "AsIs",
+        "checkedAt": checked_at,
+        "summary": summary,
+        "attempts": attempts,
+    }
 
 
 def proxy_outbound(parsed: dict, tag: str, resolution_check: dict | None) -> dict:
