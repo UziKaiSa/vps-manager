@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.8.0-test"
+SCRIPT_VERSION="0.8.1-test"
 SCRIPT_NAME="VPS Manager"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh"
 
@@ -221,7 +221,7 @@ repair_debian_bullseye_apt_sources() {
     [[ -f "${source_file}" && ! -L "${source_file}" ]] || continue
     candidate="$(mktemp "${source_file}.vps-manager.XXXXXX")"
     sed -E \
-      -e 's#https?://security\.debian\.org(/debian-security)?([[:space:]]+)bullseye/updates#http://security.debian.org/debian-security\2bullseye-security#g' \
+      -e 's#https?://security\.debian\.org(/debian-security)?/?([[:space:]]+)bullseye/updates#http://security.debian.org/debian-security\2bullseye-security#g' \
       -e 's#https?://deb\.debian\.org/debian-security([[:space:]]+)bullseye/updates#http://security.debian.org/debian-security\1bullseye-security#g' \
       -e '/^[[:space:]]*deb(-src)?([[:space:]]+\[[^]]+\])?[[:space:]]+https?:\/\/deb\.debian\.org\/debian[[:space:]]+bullseye-backports([[:space:]]|$)/ s/^/# VPS Manager disabled EOL repository: /' \
       "${source_file}" > "${candidate}"
