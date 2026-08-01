@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.8.3-test"
+SCRIPT_VERSION="0.9.0-test"
 SCRIPT_NAME="VPS Manager"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh"
 
@@ -18,6 +18,11 @@ KOMARI_WARP_LEGACY_MIN_FREE_MIB=400
 KOMARI_WARP_LEGACY_VERSION="2026.1.150.0"
 KOMARI_WARP_LEGACY_URL="https://downloads.cloudflareclient.com/v1/download/bookworm-intel/version/2026.1.150.0"
 KOMARI_WARP_LEGACY_SHA256="049ad669140ac0f428a980ebd8b4bca7949307076d7cf51f6e5668c239d6ad87"
+ALPINE_WARP_ROOT="/opt/cloudflare-warp"
+ALPINE_WARP_MIN_FREE_MIB=300
+
+OS_ID=""
+INIT_SYSTEM=""
 
 SSHD_MAIN_CONFIG="/etc/ssh/sshd_config"
 SSHD_DROPIN_DIR="/etc/ssh/sshd_config.d"
@@ -164,10 +169,52 @@ check_supported_os() {
   . /etc/os-release
   os_id="${ID:-}"
   os_like="${ID_LIKE:-}"
-  if [[ "${os_id}" != "debian" && "${os_id}" != "ubuntu" && "${os_like}" != *debian* ]]; then
-    die "当前测试版仅支持 Debian/Ubuntu。"
+  OS_ID="${os_id}"
+  if [[ "${os_id}" == "alpine" ]]; then
+    command -v apk >/dev/null 2>&1 || die "Alpine 系统缺少 apk。"
+    command -v rc-service >/dev/null 2>&1 || die "Alpine 系统缺少 OpenRC。"
+    INIT_SYSTEM="openrc"
+    return 0
   fi
-  command -v systemctl >/dev/null 2>&1 || die "当前系统未使用 systemd。"
+  if [[ "${os_id}" != "debian" && "${os_id}" != "ubuntu" && "${os_like}" != *debian* ]]; then
+    die "当前测试版仅支持 Debian/Ubuntu，以及受限功能的 Alpine。"
+  fi
+  command -v systemctl >/dev/null 2>&1 || die "当前 Debian/Ubuntu 未使用 systemd。"
+  INIT_SYSTEM="systemd"
+}
+
+
+is_alpine() {
+  [[ "${OS_ID:-}" == "alpine" ]]
+}
+
+
+service_restart() {
+  local service="$1"
+  if is_alpine; then rc-service "${service}" restart; else systemctl restart "${service}.service"; fi
+}
+
+
+service_enable_start() {
+  local service="$1"
+  if is_alpine; then
+    rc-update add "${service}" default >/dev/null 2>&1 || true
+    rc-service "${service}" start
+  else
+    systemctl enable --now "${service}.service"
+  fi
+}
+
+
+service_is_active() {
+  local service="$1"
+  if is_alpine; then rc-service "${service}" status >/dev/null 2>&1; else systemctl is-active --quiet "${service}.service"; fi
+}
+
+
+service_status_text() {
+  local service="$1"
+  if is_alpine; then rc-service "${service}" status 2>&1; else systemctl status "${service}.service" --no-pager -l 2>&1; fi
 }
 
 
@@ -391,19 +438,31 @@ enable_bbr() {
     return 0
   fi
 
-  command -v modprobe >/dev/null 2>&1 || apt-get update
-  command -v modprobe >/dev/null 2>&1 || apt-get install -y kmod
-  modprobe tcp_bbr || die "当前内核无法加载 tcp_bbr。"
+  if is_alpine; then
+    apk add --no-cache kmod procps >/dev/null
+  else
+    command -v modprobe >/dev/null 2>&1 || apt-get update
+    command -v modprobe >/dev/null 2>&1 || apt-get install -y kmod
+  fi
+  if ! grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+    modprobe tcp_bbr >/dev/null 2>&1 || true
+  fi
+  if ! grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+    warn "当前内核没有提供 BBR。容器/NAT VPS 无法自行安装宿主机内核模块，需要服务商在宿主机加载 tcp_bbr。"
+    printf '未修改拥塞控制配置；当前仍为：%s\n' "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)"
+    return 0
+  fi
 
   if [[ -e "${config}" ]]; then
     backup="$(backup_file "${config}" "bbr")"
   fi
 
   ensure_work_dir
-  printf '%s\n' \
-    'net.core.default_qdisc=fq' \
-    'net.ipv4.tcp_congestion_control=bbr' \
-    > "${WORK_DIR}/bbr.conf"
+  : > "${WORK_DIR}/bbr.conf"
+  if [[ -e /proc/sys/net/core/default_qdisc ]]; then
+    printf '%s\n' 'net.core.default_qdisc=fq' >> "${WORK_DIR}/bbr.conf"
+  fi
+  printf '%s\n' 'net.ipv4.tcp_congestion_control=bbr' >> "${WORK_DIR}/bbr.conf"
   install -o root -g root -m 644 "${WORK_DIR}/bbr.conf" "${config}"
   sysctl --system >/dev/null
 
@@ -916,6 +975,11 @@ install_base_tools() {
     printf '将安装：ca-certificates curl wget vim unzip python3 python3-yaml openssl iproute2 openssh-client\n'
     return 0
   fi
+  if is_alpine; then
+    log "安装 Alpine 基础工具"
+    apk add --no-cache bash ca-certificates curl wget vim unzip python3 py3-yaml openssl iproute2 openssh-client procps
+    return 0
+  fi
   repair_debian_bullseye_apt_sources
 
   log "安装基础工具"
@@ -927,7 +991,7 @@ install_base_tools() {
 
 
 install_or_upgrade_xray() {
-  local installer
+  local installer archive stage
 
   require_root
   check_supported_os
@@ -936,6 +1000,41 @@ install_or_upgrade_xray() {
     log "[预览] 安装或升级 Xray"
     printf '将使用 XTLS 官方安装器：\n%s\n' "${XRAY_INSTALL_URL}"
     printf '配置路径：%s\n' "${XRAY_CONFIG}"
+    return 0
+  fi
+
+  if is_alpine; then
+    log "安装 Alpine Xray 依赖"
+    apk add --no-cache bash ca-certificates curl unzip python3 py3-yaml openssl shadow su-exec
+    ensure_work_dir
+    archive="${WORK_DIR}/xray.zip"
+    stage="${WORK_DIR}/xray"
+    mkdir -p "${stage}"
+    curl -fL --retry 3 --connect-timeout 10 -o "${archive}" \
+      https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+    unzip -tq "${archive}" >/dev/null || die "Xray 官方压缩包校验失败。"
+    unzip -q "${archive}" -d "${stage}"
+    [[ -x "${stage}/xray" ]] || die "Xray 压缩包中缺少可执行文件。"
+    getent group xray >/dev/null 2>&1 || addgroup -S xray
+    id xray >/dev/null 2>&1 || adduser -S -D -H -h /var/empty -s /sbin/nologin -G xray xray
+    install -d -m 755 /usr/local/bin /usr/local/share/xray /usr/local/etc/xray
+    install -m 755 "${stage}/xray" "${XRAY_BIN}"
+    [[ ! -f "${stage}/geoip.dat" ]] || install -m 644 "${stage}/geoip.dat" /usr/local/share/xray/geoip.dat
+    [[ ! -f "${stage}/geosite.dat" ]] || install -m 644 "${stage}/geosite.dat" /usr/local/share/xray/geosite.dat
+    cat > /etc/init.d/xray <<'EOF'
+#!/sbin/openrc-run
+description="Xray Service"
+command="/usr/local/bin/xray"
+command_args="run -config /usr/local/etc/xray/config.json"
+command_user="xray:xray"
+supervisor="supervise-daemon"
+respawn_delay=5
+respawn_max=0
+depend() { need net; after firewall; }
+EOF
+    chmod 755 /etc/init.d/xray
+    log "Alpine Xray 已安装"
+    "${XRAY_BIN}" version | head -n 3
     return 0
   fi
 
@@ -1942,6 +2041,7 @@ generate_reality_keys() {
 
 xray_service_user() {
   local user
+  if is_alpine; then printf 'xray'; return 0; fi
   user="$(systemctl show xray.service --property=User --value 2>/dev/null || true)"
   printf '%s' "${user:-root}"
 }
@@ -1954,6 +2054,8 @@ validate_xray_config() {
   service_user="$(xray_service_user)"
   if [[ "${service_user}" == "root" ]]; then
     "${XRAY_BIN}" run -test -config "${path}"
+  elif is_alpine; then
+    su-exec "${service_user}" "${XRAY_BIN}" run -test -config "${path}"
   else
     runuser -u "${service_user}" -- "${XRAY_BIN}" run -test -config "${path}"
   fi
@@ -1965,7 +2067,7 @@ rollback_xray_config() {
 
   if [[ -n "${backup_file}" && -f "${backup_file}" ]]; then
     cp -a -- "${backup_file}" "${XRAY_CONFIG}"
-    systemctl restart xray.service || true
+    service_restart xray || true
     warn "新配置启动失败，已恢复原配置。"
   else
     warn "新配置启动失败，且没有可恢复的旧配置。"
@@ -2085,10 +2187,10 @@ configure_xray() {
   [[ "${failed}" != 0 ]] || mv -f -- "${staged_info}" "${INFO_FILE}" || failed=1
   [[ "${failed}" != 0 ]] || mv -f -- "${staged_yaml}" "${YAML_FILE}" || failed=1
   [[ "${failed}" != 0 ]] || validate_xray_config "${XRAY_CONFIG}" || failed=1
-  [[ "${failed}" != 0 ]] || systemctl daemon-reload || failed=1
-  [[ "${failed}" != 0 ]] || systemctl enable xray.service || failed=1
-  [[ "${failed}" != 0 ]] || systemctl restart xray.service || failed=1
-  [[ "${failed}" != 0 ]] || systemctl is-active --quiet xray.service || failed=1
+  if [[ "${failed}" == 0 && ! is_alpine ]]; then systemctl daemon-reload || failed=1; fi
+  [[ "${failed}" != 0 ]] || service_enable_start xray || failed=1
+  [[ "${failed}" != 0 ]] || service_restart xray || failed=1
+  [[ "${failed}" != 0 ]] || service_is_active xray || failed=1
   if [[ "${failed}" != 0 ]]; then
     rm -f -- "${staged_config}" "${staged_state}" "${staged_info}" "${staged_yaml}"
     if ! rollback_xray_bundle "${bundle}"; then
@@ -2612,7 +2714,7 @@ EOF
     warn "严重错误：统一备份恢复不完整，请立即检查 ${bundle}。"
     return 1
   fi
-  if systemctl restart xray.service && systemctl is-active --quiet xray.service; then
+  if service_restart xray && service_is_active xray; then
     warn "应用失败，已恢复 config/state/info/yaml，旧 Xray 服务已恢复 active。"
     return 0
   fi
@@ -2666,8 +2768,8 @@ apply_xray_candidate() {
   [[ "${failed}" != 0 ]] || mv -f -- "${staged_state}" "${STATE_FILE}" || failed=1
   [[ "${failed}" != 0 ]] || mv -f -- "${staged_info}" "${INFO_FILE}" || failed=1
   [[ "${failed}" != 0 ]] || mv -f -- "${staged_yaml}" "${YAML_FILE}" || failed=1
-  if [[ "${failed}" == 0 ]] && ! systemctl restart xray.service; then failed=1; fi
-  if [[ "${failed}" == 0 ]] && ! systemctl is-active --quiet xray.service; then failed=1; fi
+  if [[ "${failed}" == 0 ]] && ! service_restart xray; then failed=1; fi
+  if [[ "${failed}" == 0 ]] && ! service_is_active xray; then failed=1; fi
   if [[ "${failed}" != 0 ]]; then
     rm -f -- "${staged_config}" "${staged_state}" "${staged_info}" "${staged_yaml}"
     if ! rollback_xray_bundle "${bundle}"; then
@@ -2751,7 +2853,7 @@ xray_management_menu() {
       1) install_or_upgrade_xray;;
       2) if [[ "${DEMO_MODE}" != 1 && -e "${XRAY_CONFIG}" ]]; then prompt_yes_no "现有配置将被完整重建，是否继续" 0 || continue; fi; configure_xray; prompt_yes_no "是否立即显示连接参数和 AWS YAML" 1 && show_connection_info;;
       3) xray_update_workflow;; 4) show_connection_info;;
-      5) if [[ -r "${XRAY_CONFIG}" && "${DEMO_MODE}" != 1 ]]; then validate_xray_config "${XRAY_CONFIG}" || true; systemctl status xray.service --no-pager -l | sed -n '1,60p' || true; else warn "当前没有可校验的系统 Xray 配置。"; fi;;
+      5) if [[ -r "${XRAY_CONFIG}" && "${DEMO_MODE}" != 1 ]]; then validate_xray_config "${XRAY_CONFIG}" || true; service_status_text xray | sed -n '1,60p' || true; else warn "当前没有可校验的系统 Xray 配置。"; fi;;
       0) return 0;; *) warn "未知选项。";;
     esac
   done
@@ -3310,7 +3412,7 @@ komari_install_agent() {
     [[ -n "${public_ip}" ]] && args+=(--custom-ipv4 "${public_ip}") || warn "公网 IPv4 探测失败。"
   fi
   bash "${installer}" "${args[@]}"
-  systemctl status komari-agent.service --no-pager -l | sed -n '1,60p' || true
+  service_status_text komari-agent | sed -n '1,60p' || true
 }
 
 
@@ -3398,6 +3500,10 @@ komari_install_warp_legacy() {
 
 komari_install_warp_client() {
   local codename
+  if is_alpine; then
+    komari_install_warp_alpine
+    return $?
+  fi
   if [[ "$(dpkg-query -W -f='${db:Status-Status}' cloudflare-warp 2>/dev/null || true)" == "installed" ]] \
     && command -v warp-cli >/dev/null 2>&1; then
     log "Cloudflare WARP 已安装，跳过重复安装"
@@ -3421,7 +3527,109 @@ komari_install_warp_client() {
 }
 
 
+extract_deb_to() {
+  local package="$1" destination="$2" extract_dir data_archive
+  extract_dir="$(mktemp -d /tmp/vps-manager-deb.XXXXXX)"
+  (cd "${extract_dir}" && ar x "${package}")
+  data_archive="$(find "${extract_dir}" -maxdepth 1 -type f -name 'data.tar.*' | head -n 1)"
+  [[ -n "${data_archive}" ]] || { rm -rf -- "${extract_dir}"; return 1; }
+  tar -xf "${data_archive}" -C "${destination}"
+  rm -rf -- "${extract_dir}"
+}
+
+
+komari_install_warp_alpine() {
+  local free_kib free_mib stage package_file entry hash path url
+  local mirror="https://deb.debian.org/debian"
+  if [[ -x "${ALPINE_WARP_ROOT}/client/bin/warp-cli" && -f "${ALPINE_WARP_ROOT}/VERSION" ]] \
+    && grep -qx "${KOMARI_WARP_LEGACY_VERSION}" "${ALPINE_WARP_ROOT}/VERSION"; then
+    log "Alpine WARP ${KOMARI_WARP_LEGACY_VERSION} 已安装，跳过重复安装"
+    service_enable_start dbus >/dev/null 2>&1 || true
+    service_enable_start warp-svc
+    return 0
+  fi
+  free_kib="$(df -Pk / | awk 'NR == 2 {print $4}')"
+  free_mib=$((free_kib / 1024))
+  if (( free_mib < ALPINE_WARP_MIN_FREE_MIB )); then
+    warn "Alpine 隔离版 WARP 至少需要 ${ALPINE_WARP_MIN_FREE_MIB} MiB 可用空间；当前 ${free_mib} MiB。"
+    return 1
+  fi
+  printf '\nAlpine 没有 Cloudflare 官方 WARP 包。脚本将安装固定版本 %s，\n' "${KOMARI_WARP_LEGACY_VERSION}"
+  printf '并把官方 Debian 程序及其 glibc 依赖隔离在 %s，不替换 Alpine musl。\n' "${ALPINE_WARP_ROOT}"
+  prompt_yes_no "是否继续安装 Alpine WARP 兼容运行时" 1 || return 1
+  apk add --no-cache bash ca-certificates curl dbus iproute2 nftables libcap nss-tools libpcap binutils xz
+  service_enable_start dbus
+  ensure_work_dir
+  stage="${WORK_DIR}/cloudflare-warp"
+  mkdir -p "${stage}/runtime" "${stage}/client"
+  while IFS='|' read -r hash path; do
+    [[ -n "${hash}" ]] || continue
+    package_file="${WORK_DIR}/runtime.deb"
+    url="${mirror}/${path}"
+    curl -fL --retry 3 --connect-timeout 10 --max-time 300 -o "${package_file}" "${url}"
+    printf '%s  %s\n' "${hash}" "${package_file}" | sha256sum -c -
+    extract_deb_to "${package_file}" "${stage}/runtime"
+    rm -f -- "${package_file}"
+  done <<'EOF'
+1896a2aacf4ad681ff5eacc24a5b0ca4d5d9c9b9c9e4b6de5197bc1e116ea619|pool/main/g/gcc-12/gcc-12-base_12.2.0-14+deb12u1_amd64.deb
+ba4f88f73dbc3ae9055f3c20f4523bfdbaf1ad13ff95e258924f77d20b4fbedf|pool/main/g/glibc/libc6_2.36-9+deb12u14_amd64.deb
+8d684c673e7483802a5c447834b0df6fce006eb3a7109e1be412f5ad425bb24f|pool/main/libc/libcap2/libcap2_2.66-4+deb12u3+b1_amd64.deb
+18ee0ce5fab9f7b671e87da1e9fa18660e36e04a3402f24bdb8635e0ba1d35f6|pool/main/d/dbus/libdbus-1-3_1.14.10-1~deb12u1_amd64.deb
+3016e62cb4b7cd8038822870601f5ed131befe942774d0f745622cc77d8a88f7|pool/main/g/gcc-12/libgcc-s1_12.2.0-14+deb12u1_amd64.deb
+e7a56552139c693904a6f9712234c05fe918353273a7cbdb5e62f423ad71bb97|pool/main/libg/libgcrypt20/libgcrypt20_1.10.1-3+deb12u1_amd64.deb
+89944ee11d7370ce6ef46fc52f094c4a6512eff8943ec4c6ebefeae6360ceada|pool/main/libg/libgpg-error/libgpg-error0_1.46-1_amd64.deb
+64cde86cef1deaf828bd60297839b59710b5cd8dc50efd4f12643caaee9389d3|pool/main/l/lz4/liblz4-1_1.9.4-1_amd64.deb
+f96d8876b53ec89d76a992bc199679b818cf518225a768954d9451fb556a4eb7|pool/main/x/xz-utils/liblzma5_5.4.1-1+deb12u1_amd64.deb
+6cca09767e94e4b5d2888ef31ad797bd3e7cec27fbbe98b49b10d4884746ce77|pool/main/n/nspr/libnspr4_4.35-1_amd64.deb
+bb4339de2e76be9862225447c6c24b9d759baba5ee861d86dfb558ebf4474d14|pool/main/n/nss/libnss3_3.87.1-1+deb12u2_amd64.deb
+a8d78b40e9b4e422224aeebfe0e4dfc243f6acf3532490b0c05480d4283d41e2|pool/main/s/sqlite3/libsqlite3-0_3.40.1-2+deb12u2_amd64.deb
+013c07514a9e4933b2d5c098018695a6aa42d085dbc483ce2c094a954c8a1b0a|pool/main/s/systemd/libsystemd0_252.39-1~deb12u2_amd64.deb
+6315b5ac38b724a710fb96bf1042019398cb656718b1522279a5185ed39318fa|pool/main/libz/libzstd/libzstd1_1.5.4+dfsg2-5_amd64.deb
+EOF
+  package_file="${WORK_DIR}/cloudflare-warp.deb"
+  curl -fL --retry 3 --connect-timeout 10 --max-time 240 -o "${package_file}" "${KOMARI_WARP_LEGACY_URL}"
+  printf '%s  %s\n' "${KOMARI_WARP_LEGACY_SHA256}" "${package_file}" | sha256sum -c -
+  extract_deb_to "${package_file}" "${stage}/client"
+  [[ -x "${stage}/client/bin/warp-cli" && -x "${stage}/client/bin/warp-svc" ]] \
+    || { warn "WARP 包内缺少程序文件。"; return 1; }
+  printf '%s\n' "${KOMARI_WARP_LEGACY_VERSION}" > "${stage}/VERSION"
+  rm -rf -- "${ALPINE_WARP_ROOT}"
+  install -d -m 755 "$(dirname "${ALPINE_WARP_ROOT}")"
+  mv "${stage}" "${ALPINE_WARP_ROOT}"
+  cat > /usr/local/bin/warp-cli <<EOF
+#!/bin/sh
+exec ${ALPINE_WARP_ROOT}/runtime/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 --library-path ${ALPINE_WARP_ROOT}/runtime/lib/x86_64-linux-gnu:${ALPINE_WARP_ROOT}/runtime/usr/lib/x86_64-linux-gnu ${ALPINE_WARP_ROOT}/client/bin/warp-cli "\$@"
+EOF
+  cat > /usr/local/bin/warp-svc <<EOF
+#!/bin/sh
+exec ${ALPINE_WARP_ROOT}/runtime/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 --library-path ${ALPINE_WARP_ROOT}/runtime/lib/x86_64-linux-gnu:${ALPINE_WARP_ROOT}/runtime/usr/lib/x86_64-linux-gnu ${ALPINE_WARP_ROOT}/client/bin/warp-svc "\$@"
+EOF
+  chmod 755 /usr/local/bin/warp-cli /usr/local/bin/warp-svc
+  install -d -m 755 /var/log/cloudflare-warp
+  cat > /etc/init.d/warp-svc <<'EOF'
+#!/sbin/openrc-run
+description="Cloudflare WARP Service (isolated glibc runtime)"
+command="/usr/local/bin/warp-svc"
+supervisor="supervise-daemon"
+respawn_delay=5
+respawn_max=0
+output_log="/var/log/cloudflare-warp/warp-svc.log"
+error_log="/var/log/cloudflare-warp/warp-svc.log"
+depend() { need net dbus; after firewall; }
+EOF
+  chmod 755 /etc/init.d/warp-svc
+  service_enable_start warp-svc
+  warp-cli --version
+  log "Alpine WARP 兼容运行时安装完成并已锁定版本"
+}
+
+
 komari_check_kernel() {
+  if is_alpine; then
+    if nft list ruleset >/dev/null 2>&1; then log "Alpine nftables 接口可用"; return 0; fi
+    warn "当前容器没有可用的 nftables 内核接口，WARP 可能无法连接；这需要服务商在宿主机开放。"
+    return 1
+  fi
   if modprobe nf_tables >/dev/null 2>&1 && nft list ruleset >/dev/null 2>&1; then log "nftables 内核支持正常"; return 0; fi
   warn "当前内核缺少 nftables 支持，WARP 可能无法连接。"
   if prompt_yes_no "安装 linux-image-amd64 新内核（之后需手动重启）" 0; then apt-get update; apt-get install -y --no-install-recommends linux-image-amd64; warn "请重启后重新执行 WARP 配置。"; return 1; fi
@@ -3449,10 +3657,10 @@ EOF
 
 
 komari_connect_warp() {
-  systemctl enable --now warp-svc
+  service_enable_start warp-svc
   warp-cli --accept-tos disconnect >/dev/null 2>&1 || true
   warp-cli --accept-tos registration delete >/dev/null 2>&1 || true
-  systemctl restart warp-svc; sleep 3
+  service_restart warp-svc; sleep 3
   if warp-cli mdm refresh --help >/dev/null 2>&1; then
     warp-cli --accept-tos mdm refresh || true
   else
@@ -3498,7 +3706,7 @@ install_komari_standard() { require_root; check_supported_os; komari_install_age
 
 
 komari_status() {
-  printf '\nKomari Agent 状态：\n'; systemctl status komari-agent.service --no-pager -l 2>/dev/null | sed -n '1,60p' || printf '未发现运行中的 komari-agent.service。\n'
+  printf '\nKomari Agent 状态：\n'; service_status_text komari-agent | sed -n '1,60p' || printf '未发现运行中的 Komari Agent。\n'
   printf '\nWARP 状态：\n'; command -v warp-cli >/dev/null 2>&1 && warp-cli --accept-tos status || printf '未安装或无法读取 warp-cli。\n'
 }
 
@@ -3507,13 +3715,19 @@ komari_reconnect_warp() {
   require_root
   if [[ "${DEMO_MODE}" == 1 ]]; then printf '[演示] 将重启 warp-svc 并重新连接。\n'; return 0; fi
   command -v warp-cli >/dev/null 2>&1 || { warn "尚未安装 WARP。"; return 0; }
-  systemctl restart warp-svc; warp-cli --accept-tos disconnect >/dev/null 2>&1 || true; warp-cli --accept-tos connect; sleep 5; warp-cli --accept-tos status || true
+  service_restart warp-svc; warp-cli --accept-tos disconnect >/dev/null 2>&1 || true; warp-cli --accept-tos connect; sleep 5; warp-cli --accept-tos status || true
 }
 
 
 komari_menu() {
   local choice
   while true; do
+    if is_alpine; then
+      printf '\nAlpine Komari/WARP 管理：\n  1) 配置/修复 WARP 私网，并安装/重装 Agent\n  2) 查看 Agent/WARP 状态\n  3) 重连 WARP\n  0) 返回\n'
+      read -r -p "请选择 [0]: " choice
+      case "${choice:-0}" in 1) install_komari_warp ;; 2) komari_status ;; 3) komari_reconnect_warp ;; 0) return 0 ;; *) warn "未知选项。" ;; esac
+      continue
+    fi
     printf '\nKomari Agent 安装/管理：\n  1) 配置/修复 WARP 私网，并可继续安装 Agent（内置流程）\n  2) 安装/重装普通公网 Agent\n  3) 查看 Agent/WARP 状态\n  4) 重连 WARP\n  0) 返回\n'
     read -r -p "请选择 [0]: " choice
     case "${choice:-0}" in 1) install_komari_warp ;; 2) install_komari_standard ;; 3) komari_status ;; 4) komari_reconnect_warp ;; 0) return 0 ;; *) warn "未知选项。" ;; esac
@@ -3535,7 +3749,7 @@ show_system_status() {
   log "Xray"
   if [[ -x "${XRAY_BIN}" ]]; then
     "${XRAY_BIN}" version | head -n 2
-    printf 'Service: %s\n' "$(systemctl is-active xray.service 2>/dev/null || true)"
+    if service_is_active xray; then printf 'Service: active\n'; else printf 'Service: inactive\n'; fi
     if [[ -r "${XRAY_CONFIG}" ]]; then
       service_user="$(xray_service_user)"
       printf 'Service user: %s\n' "${service_user}"
@@ -3550,8 +3764,8 @@ show_system_status() {
   fi
 
   log "Komari/WARP"
-  printf 'Komari Agent: %s\n' "$(systemctl is-active komari-agent.service 2>/dev/null || true)"
-  printf 'WARP service: %s\n' "$(systemctl is-active warp-svc.service 2>/dev/null || true)"
+  if service_is_active komari-agent; then printf 'Komari Agent: active\n'; else printf 'Komari Agent: inactive\n'; fi
+  if service_is_active warp-svc; then printf 'WARP service: active\n'; else printf 'WARP service: inactive\n'; fi
 }
 
 
@@ -3685,7 +3899,7 @@ ${SCRIPT_NAME} ${SCRIPT_VERSION}
   bash $0 --version     显示版本
   bash $0 --help        显示帮助
 
-测试版支持 Debian/Ubuntu + systemd。
+完整模式支持 Debian/Ubuntu + systemd；Alpine + OpenRC 进入 BBR、Xray、Komari/WARP 受限模式。
 SSH 加固会在 reload 后要求使用第二个终端验证，失败则自动恢复。
 首次生成或更新 Xray 配置时，仅检测新增或链接变化的 SOCKS5 出口。
 SSH 密钥与加固管理可以写入公钥，但不会在 VPS 上创建或显示客户端私钥。
@@ -3708,6 +3922,10 @@ main_menu() {
   local choice
 
   check_supported_os
+  if is_alpine; then
+    alpine_main_menu
+    return 0
+  fi
   while true; do
     show_banner
     printf '  1) 初始化环境：基础工具和可选 BBR\n'
@@ -3734,6 +3952,33 @@ main_menu() {
           exit 0
         fi
         ;;
+      0) printf '已退出。\n'; return 0 ;;
+      *) warn "未知选项：${choice}" ;;
+    esac
+  done
+}
+
+
+alpine_main_menu() {
+  local choice
+  while true; do
+    show_banner
+    printf ' Alpine 受限模式：只提供本机需要的功能\n'
+    printf '  1) 检查/开启 BBR（仅安装必要工具）\n'
+    printf '  2) Xray 管理：安装、配置或更新\n'
+    printf '  3) Komari + WARP 管理\n'
+    printf '  4) 状态检查\n'
+    printf '  7) 从 GitHub 更新当前脚本\n'
+    printf '  8) 删除当前 .sh 脚本\n'
+    printf '  0) 退出\n'
+    read -r -p "请选择: " choice
+    case "${choice}" in
+      1) enable_bbr; pause_screen ;;
+      2) xray_management_menu; pause_screen ;;
+      3) komari_menu; pause_screen ;;
+      4) show_system_status; pause_screen ;;
+      7) update_current_script || true; pause_screen ;;
+      8) if delete_current_script; then printf '脚本已删除，程序退出。\n'; exit 0; fi ;;
       0) printf '已退出。\n'; return 0 ;;
       *) warn "未知选项：${choice}" ;;
     esac
