@@ -148,6 +148,8 @@ bash vps-manager.sh --help
 ```
 
 ## 1. 初始化环境
+在 Debian 11 Bullseye 上，初始化会先备份 APT 源文件，修正旧的 `bullseye/updates` 安全源，并禁用普通 Debian 镜像中已经下线的 `bullseye-backports`。其他系统和自定义镜像不会被改写。
+
 
 初始化会先安装：
 

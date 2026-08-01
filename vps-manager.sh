@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.7.9-test"
+SCRIPT_VERSION="0.8.0-test"
 SCRIPT_NAME="VPS Manager"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh"
 
@@ -190,6 +190,61 @@ backup_file() {
   install -d -m 700 "${destination_dir}"
   cp -a -- "${source}" "${destination_dir}/"
   printf '%s' "${destination_dir}"
+}
+
+
+
+repair_debian_bullseye_apt_sources() {
+  local os_id=""
+  local version_id=""
+  local version_codename=""
+  local backup_dir=""
+  local source_file
+  local candidate
+  local relative_path
+  local -a source_files=(/etc/apt/sources.list)
+
+  [[ -r /etc/os-release ]] || return 0
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  os_id="${ID:-}"
+  version_id="${VERSION_ID:-}"
+  version_codename="${VERSION_CODENAME:-}"
+  [[ "${os_id}" == "debian" ]] || return 0
+  [[ "${version_codename}" == "bullseye" || "${version_id}" == "11" ]] || return 0
+
+  while IFS= read -r -d '' source_file; do
+    source_files+=("${source_file}")
+  done < <(find /etc/apt/sources.list.d -maxdepth 1 -type f -name '*.list' -print0 2>/dev/null)
+
+  for source_file in "${source_files[@]}"; do
+    [[ -f "${source_file}" && ! -L "${source_file}" ]] || continue
+    candidate="$(mktemp "${source_file}.vps-manager.XXXXXX")"
+    sed -E \
+      -e 's#https?://security\.debian\.org(/debian-security)?([[:space:]]+)bullseye/updates#http://security.debian.org/debian-security\2bullseye-security#g' \
+      -e 's#https?://deb\.debian\.org/debian-security([[:space:]]+)bullseye/updates#http://security.debian.org/debian-security\1bullseye-security#g' \
+      -e '/^[[:space:]]*deb(-src)?([[:space:]]+\[[^]]+\])?[[:space:]]+https?:\/\/deb\.debian\.org\/debian[[:space:]]+bullseye-backports([[:space:]]|$)/ s/^/# VPS Manager disabled EOL repository: /' \
+      "${source_file}" > "${candidate}"
+
+    if cmp -s -- "${source_file}" "${candidate}"; then
+      rm -f -- "${candidate}"
+      continue
+    fi
+
+    if [[ -z "${backup_dir}" ]]; then
+      backup_dir="${BACKUP_ROOT}/apt-sources-$(date -u '+%Y%m%dT%H%M%SZ')"
+      install -d -o root -g root -m 700 "${backup_dir}"
+    fi
+    relative_path="${source_file#/etc/apt/}"
+    install -d -o root -g root -m 700 "${backup_dir}/$(dirname "${relative_path}")"
+    cp -a -- "${source_file}" "${backup_dir}/${relative_path}"
+    chmod --reference="${source_file}" "${candidate}"
+    chown --reference="${source_file}" "${candidate}"
+    mv -f -- "${candidate}" "${source_file}"
+    log "已修复 Debian 11 失效软件源：${source_file}"
+  done
+
+  [[ -z "${backup_dir}" ]] || printf '原 APT 软件源备份：%s\n' "${backup_dir}"
 }
 
 
@@ -861,6 +916,7 @@ install_base_tools() {
     printf '将安装：ca-certificates curl wget vim unzip python3 python3-yaml openssl iproute2 openssh-client\n'
     return 0
   fi
+  repair_debian_bullseye_apt_sources
 
   log "安装基础工具"
   export DEBIAN_FRONTEND=noninteractive
