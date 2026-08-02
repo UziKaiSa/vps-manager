@@ -2,7 +2,7 @@
 
 `VPS Manager` 是一个面向 Debian/Ubuntu VPS 的中文交互式管理脚本，并为小硬盘 Alpine/OpenRC NAT VPS 提供受限模式，用于完成服务器初始化、Xray 配置，以及 Komari Agent/WARP 私网接入。
 
-当前版本：`0.9.0-test`
+当前版本：`0.9.1-test`
 
 > 目前是测试版。首次在正式服务器上使用前，建议先运行预览模式，并保留一个已经登录的 SSH 终端。
 
@@ -158,6 +158,8 @@ bash vps-manager.sh --help
 
 ## 1. 初始化环境
 在 Debian 11 Bullseye 上，初始化会先备份 APT 源文件，修正旧的 `bullseye/updates` 安全源，并禁用普通 Debian 镜像中已经下线的 `bullseye-backports`。其他系统和自定义镜像不会被改写。
+
+如果 `apt-get update` 报告 Packages/MergeList/package cache 损坏，脚本会先检查内核日志：没有存储错误时自动清理可重新下载的 APT 索引并重试一次；如果发现 EXT4、I/O 或块设备错误，则立即停止并要求先离线检查文件系统，不会用删除缓存掩盖底层故障。
 
 
 初始化会先安装：

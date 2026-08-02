@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.9.0-test"
+SCRIPT_VERSION="0.9.1-test"
 SCRIPT_NAME="VPS Manager"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh"
 
@@ -295,6 +295,36 @@ repair_debian_bullseye_apt_sources() {
 }
 
 
+apt_update_safe() {
+  local update_log
+  update_log="$(mktemp /tmp/vps-manager-apt-update.XXXXXX.log)"
+
+  if apt-get update 2>&1 | tee "${update_log}"; then
+    rm -f -- "${update_log}"
+    return 0
+  fi
+
+  if ! grep -Eqi 'Unable to parse package file|package cache file is corrupted|Problem with MergeList|package lists or status file could not be parsed' "${update_log}"; then
+    rm -f -- "${update_log}"
+    return 1
+  fi
+
+  if dmesg 2>/dev/null | grep -Eqi 'EXT4-fs error|XFS.*corrupt|BTRFS.*error|I/O error|Buffer I/O error|bad block bitmap checksum'; then
+    rm -f -- "${update_log}"
+    die "检测到文件系统或块设备错误，APT 缓存损坏可能只是表象。请先离线执行 fsck/存储检查；脚本拒绝继续删除缓存。"
+  fi
+
+  warn "检测到可重建的 APT 索引/缓存损坏，将清理下载缓存后自动重试一次。"
+  install -d -m 0755 /var/lib/apt/lists/partial
+  find /var/lib/apt/lists -mindepth 1 -maxdepth 1 ! -name partial -exec rm -rf -- {} +
+  find /var/lib/apt/lists/partial -mindepth 1 -delete
+  rm -f -- /var/cache/apt/pkgcache.bin /var/cache/apt/srcpkgcache.bin
+  rm -f -- "${update_log}"
+  apt-get clean
+  apt-get update
+}
+
+
 random_password() {
   openssl rand -base64 24 | tr -d '\n'
 }
@@ -441,7 +471,7 @@ enable_bbr() {
   if is_alpine; then
     apk add --no-cache kmod procps >/dev/null
   else
-    command -v modprobe >/dev/null 2>&1 || apt-get update
+    command -v modprobe >/dev/null 2>&1 || apt_update_safe
     command -v modprobe >/dev/null 2>&1 || apt-get install -y kmod
   fi
   if ! grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
@@ -746,7 +776,7 @@ EOF
   fi
 
   if [[ ! -x /usr/sbin/sshd ]]; then
-    apt-get update
+    apt_update_safe
     apt-get install -y openssh-server
   fi
   command -v ssh-keygen >/dev/null 2>&1 || die "未找到 ssh-keygen。"
@@ -984,7 +1014,7 @@ install_base_tools() {
 
   log "安装基础工具"
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update
+  apt_update_safe
   apt-get install -y --no-install-recommends \
     ca-certificates curl wget vim unzip python3 python3-yaml openssl iproute2 openssh-client
 }
@@ -1040,7 +1070,7 @@ EOF
 
   log "安装 Xray 所需依赖"
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update
+  apt_update_safe
   apt-get install -y --no-install-recommends ca-certificates curl unzip python3 openssl
 
   ensure_work_dir
@@ -3146,7 +3176,7 @@ ssh_key_helper_menu() {
 ensure_yaml_module() {
   python3 -c 'import yaml' >/dev/null 2>&1 && return 0
   [[ "${DEMO_MODE}" == 1 ]] && { warn "YAML 管理需要 python3-yaml，请先运行初始化。"; return 1; }
-  require_root; log "安装 YAML 安全解析组件"; apt-get update
+  require_root; log "安装 YAML 安全解析组件"; apt_update_safe
   apt-get install -y --no-install-recommends python3-yaml
 }
 
@@ -3480,7 +3510,7 @@ komari_install_warp_legacy() {
   prompt_yes_no "是否安装并锁定这个官方轻量版本" 1 || return 1
 
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update
+  apt_update_safe
   apt-get install -y curl ca-certificates gnupg2 iproute2 nftables libcap2-bin
   ensure_work_dir
   package_file="${WORK_DIR}/cloudflare-warp_${KOMARI_WARP_LEGACY_VERSION}_amd64.deb"
@@ -3517,11 +3547,11 @@ komari_install_warp_client() {
   # shellcheck disable=SC1091
   . /etc/os-release; codename="${VERSION_CODENAME:-}"; [[ -n "${codename}" ]] || codename="$(lsb_release -cs)"
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update; apt-get install -y curl gpg lsb-release ca-certificates nftables
+  apt_update_safe; apt-get install -y curl gpg lsb-release ca-certificates nftables
   install -d -m 0755 /usr/share/keyrings
   curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
   printf 'deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ %s main\n' "${codename}" > /etc/apt/sources.list.d/cloudflare-client.list
-  apt-get update
+  apt_update_safe
   komari_check_warp_disk || return 1
   apt-get install -y cloudflare-warp
 }
@@ -3632,7 +3662,7 @@ komari_check_kernel() {
   fi
   if modprobe nf_tables >/dev/null 2>&1 && nft list ruleset >/dev/null 2>&1; then log "nftables 内核支持正常"; return 0; fi
   warn "当前内核缺少 nftables 支持，WARP 可能无法连接。"
-  if prompt_yes_no "安装 linux-image-amd64 新内核（之后需手动重启）" 0; then apt-get update; apt-get install -y --no-install-recommends linux-image-amd64; warn "请重启后重新执行 WARP 配置。"; return 1; fi
+  if prompt_yes_no "安装 linux-image-amd64 新内核（之后需手动重启）" 0; then apt_update_safe; apt-get install -y --no-install-recommends linux-image-amd64; warn "请重启后重新执行 WARP 配置。"; return 1; fi
 }
 
 
