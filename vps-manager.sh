@@ -3488,17 +3488,18 @@ komari_check_warp_disk() {
 }
 
 komari_install_warp_legacy() {
-  local os_id codename arch root_free_kib root_free_mib package_file installed_version backup=""
+  local os_id os_version codename arch root_free_kib root_free_mib package_file installed_version backup=""
   local package_url package_sha256
   # shellcheck disable=SC1091
   . /etc/os-release
   os_id="${ID:-}"
+  os_version="${VERSION_ID:-}"
   codename="${VERSION_CODENAME:-}"
   arch="$(dpkg --print-architecture)"
   if [[ "${arch}" != "amd64" ]] \
     || ! { [[ "${os_id}" == "debian" && "${codename}" =~ ^(bullseye|bookworm)$ ]] \
-      || [[ "${os_id}" == "ubuntu" && "${codename}" == "noble" ]]; }; then
-    warn "官方轻量旧版自动安装目前只支持 Debian 11/12 或 Ubuntu 24.04 amd64；当前为 ${os_id:-unknown} ${codename:-unknown} ${arch}."
+      || [[ "${os_id}" == "ubuntu" && "${os_version}" =~ ^(24|26)\.04$ ]]; }; then
+    warn "官方轻量旧版自动安装目前只支持 Debian 11/12 或 Ubuntu 24.04/26.04 amd64；当前为 ${os_id:-unknown} ${os_version:-unknown} ${codename:-unknown} ${arch}."
     return 1
   fi
 
@@ -3511,7 +3512,7 @@ komari_install_warp_legacy() {
       package_url="${KOMARI_WARP_LEGACY_URL}"
       package_sha256="${KOMARI_WARP_LEGACY_SHA256}"
       ;;
-    noble)
+    noble|resolute)
       package_url="${KOMARI_WARP_LEGACY_NOBLE_URL}"
       package_sha256="${KOMARI_WARP_LEGACY_NOBLE_SHA256}"
       ;;
@@ -3571,7 +3572,7 @@ komari_install_warp_legacy() {
 }
 
 komari_install_warp_client() {
-  local os_id codename arch
+  local os_id os_version codename arch
   if is_alpine; then
     komari_install_warp_alpine
     return $?
@@ -3580,28 +3581,18 @@ komari_install_warp_client() {
   # shellcheck disable=SC1091
   . /etc/os-release
   os_id="${ID:-}"
+  os_version="${VERSION_ID:-}"
   codename="${VERSION_CODENAME:-}"
   arch="$(dpkg --print-architecture)"
   if [[ "${arch}" == "amd64" ]] \
     && { [[ "${os_id}" == "debian" && "${codename}" =~ ^(bullseye|bookworm)$ ]] \
-      || [[ "${os_id}" == "ubuntu" && "${codename}" == "noble" ]]; }; then
+      || [[ "${os_id}" == "ubuntu" && "${os_version}" =~ ^(24|26)\.04$ ]]; }; then
     komari_install_warp_legacy
     return $?
   fi
 
-  if ! komari_check_warp_disk; then
-    komari_install_warp_legacy
-    return $?
-  fi
-  [[ -n "${codename}" ]] || codename="$(lsb_release -cs)"
-  export DEBIAN_FRONTEND=noninteractive
-  apt_update_safe; apt-get install -y curl gpg lsb-release ca-certificates nftables
-  install -d -m 0755 /usr/share/keyrings
-  curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-  printf 'deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ %s main\n' "${codename}" > /etc/apt/sources.list.d/cloudflare-client.list
-  apt_update_safe
-  komari_check_warp_disk || return 1
-  apt-get install -y cloudflare-warp
+  warn "当前系统没有经过验证的轻量 WARP 固定包；为避免拉入高内存新版，脚本不会自动安装仓库最新版。"
+  return 1
 }
 
 
