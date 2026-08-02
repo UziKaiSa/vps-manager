@@ -70,7 +70,7 @@ CFG_SOCKS_PASS=""
 CFG_ENABLE_SS=0
 CFG_SS_LISTEN="0.0.0.0"
 CFG_SS_PORT=""
-CFG_SS_METHOD="aes-256-gcm"
+CFG_SS_METHOD="2022-blake3-aes-128-gcm"
 CFG_SS_PASS=""
 declare -a CFG_PROXY_NAMES=()
 declare -a CFG_PROXY_LINKS=()
@@ -331,6 +331,14 @@ apt_update_safe() {
 
 random_password() {
   openssl rand -base64 24 | tr -d '\n'
+}
+
+shadowsocks_password_for_method() {
+  case "$1" in
+    2022-blake3-aes-128-gcm) openssl rand -base64 16 | tr -d '\n';;
+    2022-blake3-aes-256-gcm) openssl rand -base64 32 | tr -d '\n';;
+    *) random_password;;
+  esac
 }
 
 
@@ -1152,9 +1160,10 @@ collect_optional_inbounds() {
       validate_port "${CFG_SS_PORT}" && break
       warn "端口必须在 1-65535 之间。"
     done
-    CFG_SS_METHOD="$(prompt_default "Shadowsocks 加密方式" "aes-256-gcm")"
-    default_password="$(random_password)"
-    CFG_SS_PASS="$(prompt_default "Shadowsocks 密码" "${default_password}")"
+    CFG_SS_METHOD="$(prompt_default "Shadowsocks 加密方式" "2022-blake3-aes-128-gcm")"
+    default_password="$(shadowsocks_password_for_method "${CFG_SS_METHOD}")"
+    CFG_SS_PASS="$(prompt_secret "Shadowsocks 密码/PSK（留空自动生成）")"
+    [[ -n "${CFG_SS_PASS}" ]] || CFG_SS_PASS="${default_password}"
   fi
 }
 
@@ -2651,13 +2660,13 @@ manage_ss_inbound_menu() {
   while true; do
     if ! current="$(pending_model_query optionalInbounds.shadowsocks.port 2>/dev/null)"; then
       printf '\nShadowsocks 入站当前关闭。\n  1) 开启\n  0) 返回\n'; read -r -p "请选择 [0]: " choice
-      case "${choice:-0}" in 1) listen="$(prompt_default "监听地址" 0.0.0.0)"; while true; do port="$(prompt_default "端口" 21626)"; validate_port "${port}" && break; warn "端口无效。"; done; method="$(prompt_default "加密方式" aes-256-gcm)"; password="$(prompt_secret "密码（留空自动生成）")"; [[ -n "${password}" ]] || password="$(random_password)"; pending_model_mutate inbound-enable shadowsocks "${listen}" "${port}" "${method}" "${password}";; 0) return 0;; esac; continue
+      case "${choice:-0}" in 1) listen="$(prompt_default "监听地址" 0.0.0.0)"; while true; do port="$(prompt_default "端口" 21626)"; validate_port "${port}" && break; warn "端口无效。"; done; method="$(prompt_default "加密方式" 2022-blake3-aes-128-gcm)"; password="$(prompt_secret "密码/PSK（留空自动生成）")"; [[ -n "${password}" ]] || password="$(shadowsocks_password_for_method "${method}")"; pending_model_mutate inbound-enable shadowsocks "${listen}" "${port}" "${method}" "${password}";; 0) return 0;; esac; continue
     fi
     printf '\nShadowsocks 入站：\n  1) 监听地址\n  2) 端口\n  3) 加密方式\n  4) 替换密码\n  5) 关闭\n  0) 返回\n'; read -r -p "请选择 [0]: " choice
     case "${choice:-0}" in
       1) current="$(pending_model_query optionalInbounds.shadowsocks.listen)"; value="$(prompt_default "监听地址" "${current}")"; [[ "${value}" == "${current}" ]] || pending_model_mutate inbound-set shadowsocks listen "${value}";;
       2) current="$(pending_model_query optionalInbounds.shadowsocks.port)"; while true; do value="$(prompt_default "端口" "${current}")"; validate_port "${value}" && break; warn "端口无效。"; done; [[ "${value}" == "${current}" ]] || pending_model_mutate inbound-set shadowsocks port "${value}";;
-      3) current="$(pending_model_query optionalInbounds.shadowsocks.method)"; value="$(prompt_default "加密方式" "${current}")"; [[ "${value}" == "${current}" ]] || pending_model_mutate inbound-set shadowsocks method "${value}";;
+      3) current="$(pending_model_query optionalInbounds.shadowsocks.method)"; value="$(prompt_default "加密方式" "${current}")"; if [[ "${value}" != "${current}" ]]; then password="$(prompt_secret "新密码/PSK（留空按新加密方式自动生成）")"; [[ -n "${password}" ]] || password="$(shadowsocks_password_for_method "${value}")"; pending_model_mutate inbound-set shadowsocks method "${value}"; pending_model_mutate inbound-set shadowsocks password "${password}"; fi;;
       4) value="$(prompt_secret "新密码（留空保持原样）")"; [[ -z "${value}" ]] || pending_model_mutate inbound-set shadowsocks password "${value}";;
       5) prompt_yes_no "确认关闭 Shadowsocks 入站" 0 && pending_model_mutate inbound-disable shadowsocks;; 0) return 0;; *) warn "未知选项。";;
     esac
