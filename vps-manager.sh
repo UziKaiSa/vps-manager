@@ -2250,14 +2250,17 @@ configure_xray() {
 
 
 load_xray_model_from_paths() {
-  local config_source="$1" state_source="$2" destination="$3"
-  python3 - "${config_source}" "${state_source}" "${destination}" <<'PY'
+  local config_source="$1" state_source="$2" destination="$3" mode="${4:-strict}" public_key_override="${5:-}"
+  python3 - "${config_source}" "${state_source}" "${destination}" "${mode}" "${public_key_override}" <<'PY'
 from __future__ import annotations
 from collections import Counter
 import hashlib, json, os, sys, uuid
 from pathlib import Path
 
 config_path, state_path, destination = map(Path, sys.argv[1:4])
+mode, public_key_override = sys.argv[4:6]
+adopt_live = mode == "adopt-live"
+if mode not in {"strict", "adopt-live"}: raise SystemExit("未知配置加载模式")
 def stop(message): raise SystemExit(f"无法更新：{message}")
 try:
     config_text = config_path.read_text(); config = json.loads(config_text)
@@ -2267,7 +2270,7 @@ version = state.get("version")
 if version not in (2, 3): stop("state.json 版本不受支持")
 if version == 3:
     if state.get("managedBy") != "vps-manager": stop("state.json 不是 VPS Manager 受管状态")
-    if state.get("configSha256") and state["configSha256"] != hashlib.sha256(config_text.encode()).hexdigest():
+    if not adopt_live and state.get("configSha256") and state["configSha256"] != hashlib.sha256(config_text.encode()).hexdigest():
         stop("config.json 已在脚本外修改，状态指纹不一致")
 if not isinstance(config, dict) or set(config) - {"log","dns","inbounds","outbounds","routing"}: stop("config.json 包含非脚本管理的顶层配置")
 if config.get("log") != {"loglevel":"warning"}: stop("log 配置不符合脚本管理结构")
@@ -2288,7 +2291,7 @@ for x in outbounds:
     tag=x.get("tag")
     if not isinstance(tag,str) or not tag or tag in by_tag: stop("出口 tag 缺失或重复")
     by_tag[tag]=x
-proxy_tags=[str(x.get("tag","")) for x in state_proxies]
+proxy_tags=sorted(set(by_tag)-{"direct"}) if adopt_live else [str(x.get("tag","")) for x in state_proxies]
 if not all(proxy_tags) or len(set(proxy_tags))!=len(proxy_tags): stop("state.json 的 ISP tag 无效")
 if set(by_tag)!={"direct",*proxy_tags}: stop("发现 state.json 未登记出口，或受管出口缺失")
 if by_tag["direct"]!={"protocol":"freedom","tag":"direct","settings":{"domainStrategy":"UseIPv4"}}: stop("direct 出口不是脚本管理结构")
@@ -2302,14 +2305,33 @@ for c in runtime:
     email=c.get("email")
     if not isinstance(email,str) or email in runtime_by_email: stop("VLESS client email 缺失或重复")
     runtime_by_email[email]=c
-meta_by_outbound={}
+state_meta_by_outbound={}
 for c in state_clients:
     tag=c.get("outbound")
-    if not isinstance(tag,str) or tag in meta_by_outbound: stop("state clients 出口缺失或重复")
-    meta_by_outbound[tag]=c
-if set(meta_by_outbound)!={"direct",*proxy_tags}: stop("state clients 与受管出口不一致")
-if set(runtime_by_email)!={str(x.get("email","")) for x in state_clients}: stop("live VLESS clients 与 state clients 不一致")
-if version==3:
+    if not isinstance(tag,str) or tag in state_meta_by_outbound: stop("state clients 出口缺失或重复")
+    state_meta_by_outbound[tag]=c
+if adopt_live:
+    route_email_by_outbound={}
+    for rule in routing["rules"]:
+        users=rule.get("user"); tag=rule.get("outboundTag")
+        if users is None: continue
+        if not isinstance(users,list) or len(users)!=1 or not isinstance(tag,str) or tag in route_email_by_outbound:
+            stop("外部修改后的 user 路由无法唯一映射到出口")
+        route_email_by_outbound[tag]=str(users[0])
+    if set(route_email_by_outbound)!={"direct",*proxy_tags}: stop("外部修改后的 client 与出口路由不完整")
+    if set(route_email_by_outbound.values())!=set(runtime_by_email): stop("外部修改后的 client 与路由用户不一致")
+    old_records={str(x.get("tag","")):x for x in state_proxies}
+    meta_by_outbound={}
+    for tag,email in route_email_by_outbound.items():
+        old=state_meta_by_outbound.get(tag,{})
+        record=old_records.get(tag,{})
+        default_name="native" if tag=="direct" else tag
+        meta_by_outbound[tag]={"name":str(old.get("name") or record.get("name") or default_name),"uuid":str(runtime_by_email[email]["id"]),"email":email,"outbound":tag,"resolution":old.get("resolution")}
+else:
+    meta_by_outbound=state_meta_by_outbound
+    if set(meta_by_outbound)!={"direct",*proxy_tags}: stop("state clients 与受管出口不一致")
+    if set(runtime_by_email)!={str(x.get("email","")) for x in state_clients}: stop("live VLESS clients 与 state clients 不一致")
+if version==3 and not adopt_live:
     for tag,meta in meta_by_outbound.items():
         email=str(meta.get("email","")); live=runtime_by_email.get(email)
         if live is None or str(meta.get("uuid",""))!=str(live["id"]): stop(f"v3 state client {tag} 与 live UUID 不一致")
@@ -2336,7 +2358,16 @@ def parse_proxy(outbound):
     stop(f"出口协议 {protocol!r} 不受更新器管理")
 
 model_proxies=[]
-for record in state_proxies:
+if adopt_live:
+    old_records={str(x.get("tag","")):x for x in state_proxies}
+    records_to_load=[]
+    for tag in proxy_tags:
+        record=dict(old_records.get(tag,{}))
+        record.setdefault("tag",tag); record.setdefault("name",meta_by_outbound[tag]["name"]); record.setdefault("id",str(uuid.uuid4())); record.setdefault("resolutionCheck",None)
+        records_to_load.append(record)
+else:
+    records_to_load=state_proxies
+for record in records_to_load:
     tag=str(record["tag"]); meta=meta_by_outbound[tag]; email=str(meta.get("email","")); live=runtime_by_email.get(email)
     if live is None: stop(f"出口 {tag} 找不到对应 live client")
     proxy,strategy=parse_proxy(by_tag[tag])
@@ -2348,15 +2379,16 @@ for record in state_proxies:
     if proxy["scheme"]=="socks5" and (not isinstance(resolution,dict) or resolution.get("targetStrategy")!=strategy):
         resolution={"result":"imported-live-config","mode":"xray-ipv4" if strategy=="UseIPv4" else "remote-domain","targetStrategy":strategy,"checkedAt":None,"summary":"从现有 Xray 配置迁移，未重新检测","attempts":[]}
     elif proxy["scheme"]!="socks5": resolution=None
-    if version==3:
+    if version==3 and not adopt_live:
         if record.get("email")!=email or record.get("uuid")!=live["id"] or record.get("name")!=meta.get("name"): stop(f"v3 状态中 {tag} 的稳定身份与 live config 不一致")
         stable_id=record.get("id")
+    elif adopt_live: stable_id=record.get("id") or str(uuid.uuid4())
     else: stable_id=f"legacy-{tag}"
     if not isinstance(stable_id,str) or not stable_id: stop(f"出口 {tag} 缺少稳定 ID")
     model_proxies.append({"id":stable_id,"name":str(record.get("name","")),"tag":tag,"email":email,"uuid":str(live["id"]),"proxy":proxy,"resolutionCheck":resolution,"needsProbe":False})
 native_meta=meta_by_outbound["direct"]; native_email=str(native_meta.get("email","")); native_live=runtime_by_email.get(native_email)
 if native_live is None: stop("找不到 native live client")
-if version==3:
+if version==3 and not adopt_live:
     native_state=state.get("native")
     expected_native={"name":str(native_meta.get("name","native")),"uuid":str(native_live["id"]),"email":native_email,"outbound":"direct"}
     if native_state!=expected_native: stop("v3 state.native 与 state.clients/live config 不一致")
@@ -2372,7 +2404,7 @@ for inbound in inbounds:
         if set(inbound)!={"tag","listen","port","protocol","settings"} or set(s)!={"network","method","password"} or s.get("network")!="tcp,udp": stop("Shadowsocks 入站不是脚本管理结构")
         optional["shadowsocks"]={"listen":str(inbound.get("listen")),"port":int(inbound.get("port")),"method":str(s.get("method")),"password":str(s.get("password"))}
     else: stop("发现非脚本管理的额外入站")
-expected=[{"type":"field","user":[str(c["email"])],"outboundTag":str(c["outbound"])} for c in state_clients]
+expected=[{"type":"field","user":[str(c["email"])],"outboundTag":str(c["outbound"])} for c in meta_by_outbound.values()]
 if "socks5" in optional: expected.append({"type":"field","inboundTag":["socks-in"],"outboundTag":"direct"})
 if "shadowsocks" in optional: expected.append({"type":"field","inboundTag":["shadowsocks-in"],"outboundTag":"direct"})
 norm=lambda x:json.dumps(x,ensure_ascii=False,sort_keys=True)
@@ -2381,11 +2413,12 @@ needs_dns=any((x.get("resolutionCheck") or {}).get("targetStrategy")=="UseIPv4" 
 expected_dns={"servers":["https+local://1.1.1.1/dns-query"],"queryStrategy":"UseIPv4"}
 if needs_dns and config.get("dns")!=expected_dns: stop("UseIPv4 出口需要的共享 DNS 已漂移")
 if not needs_dns and "dns" in config: stop("发现非脚本管理 DNS 配置")
-sr=state.get("reality",{}); live_reality={"port":int(reality_inbound["port"]),"dest":str(rs["dest"]),"serverNames":[str(x) for x in rs["serverNames"]],"privateKey":str(rs["privateKey"]),"publicKey":str(sr.get("publicKey","")),"shortId":str(rs["shortIds"][0])}
+sr=state.get("reality",{}); live_reality={"port":int(reality_inbound["port"]),"dest":str(rs["dest"]),"serverNames":[str(x) for x in rs["serverNames"]],"privateKey":str(rs["privateKey"]),"publicKey":str(public_key_override if adopt_live else sr.get("publicKey","")),"shortId":str(rs["shortIds"][0])}
 if not live_reality["publicKey"]: stop("state.json 缺少 Reality publicKey")
-for field in ("port","dest","serverNames","shortId"):
-    if sr.get(field)!=live_reality[field]: stop(f"Reality {field} 在 state 与 live config 间不一致")
-if version==3 and sr.get("privateKey")!=live_reality["privateKey"]: stop("Reality privateKey 在 v3 state 与 live config 间不一致")
+if not adopt_live:
+    for field in ("port","dest","serverNames","shortId"):
+        if sr.get(field)!=live_reality[field]: stop(f"Reality {field} 在 state 与 live config 间不一致")
+    if version==3 and sr.get("privateKey")!=live_reality["privateKey"]: stop("Reality privateKey 在 v3 state 与 live config 间不一致")
 names=[str(x.get("name","")) for x in model_proxies]
 if not all(names) or len(set(names))!=len(names): stop("ISP 名称为空或重复")
 model={"version":3,"managedBy":"vps-manager","nodeName":str(state.get("nodeName","")),"publicAddress":str(state.get("publicAddress","")),"reality":live_reality,"native":{"name":str(native_meta.get("name","native")),"uuid":str(native_live["id"]),"email":native_email,"outbound":"direct"},"proxies":model_proxies,"optionalInbounds":optional}
@@ -2830,8 +2863,41 @@ apply_xray_candidate() {
   warn "若关闭或修改了旧入站端口，已有 UFW 放行规则不会自动删除。"
 }
 
+derive_reality_public_key_from_config() {
+  local config_source="$1" private_key output public_key
+  private_key="$(python3 - "${config_source}" <<'PY'
+import json,sys
+config=json.load(open(sys.argv[1]))
+items=[x for x in config.get("inbounds",[]) if x.get("protocol")=="vless" and x.get("streamSettings",{}).get("security")=="reality"]
+if len(items)!=1: raise SystemExit(1)
+print(items[0]["streamSettings"]["realitySettings"]["privateKey"])
+PY
+)" || return 1
+  [[ -n "${private_key}" ]] || return 1
+  output="$("${XRAY_BIN}" x25519 -i "${private_key}" 2>&1)" || return 1
+  public_key="$(printf '%s\n' "${output}" | sed -n -e 's/^Password (PublicKey):[[:space:]]*//p' -e 's/^Public key:[[:space:]]*//p' | head -n 1)"
+  [[ -n "${public_key}" ]] || return 1
+  printf '%s' "${public_key}"
+}
+
+latest_matching_xray_bundle() {
+  python3 - "${BACKUP_ROOT}" <<'PY'
+import hashlib,json,sys
+from pathlib import Path
+root=Path(sys.argv[1])
+for bundle in sorted(root.glob("xray-bundle-*"),reverse=True):
+    config,state=bundle/"config",bundle/"state"
+    if not config.is_file() or not state.is_file(): continue
+    try:
+        text=config.read_text(); metadata=json.loads(state.read_text())
+    except Exception: continue
+    if metadata.get("configSha256")==hashlib.sha256(text.encode()).hexdigest():
+        print(bundle); break
+PY
+}
+
 xray_update_workflow() {
-  local choice source_config source_state update_dir
+  local choice source_config source_state update_dir recovery_choice bundle="" public_key=""
   require_root; check_supported_os; command -v python3 >/dev/null 2>&1 || die "需要 python3。"; command -v curl >/dev/null 2>&1 || die "需要 curl。"
   if [[ "${DEMO_MODE}" == 1 ]]; then
     [[ -r "${DEMO_CONFIG_FILE}" && -r "${DEMO_STATE_FILE}" ]] || die "预览模式下请先在当前会话生成一次 Xray 配置。"
@@ -2847,8 +2913,53 @@ xray_update_workflow() {
   fi
   XRAY_PENDING_MODEL="${update_dir}/pending-model.json"; XRAY_CANDIDATE_CONFIG="${update_dir}/candidate-config.json"; XRAY_CANDIDATE_STATE="${update_dir}/candidate-state.json"; XRAY_CANDIDATE_INFO="${update_dir}/candidate-info.txt"; XRAY_CANDIDATE_YAML="${update_dir}/candidate-proxies.yaml"; XRAY_CANDIDATE_READY=0; XRAY_UPDATE_DIRTY=0
   if ! load_xray_model_from_paths "${source_config}" "${source_state}" "${XRAY_PENDING_MODEL}"; then
-    warn "现有配置未通过受管结构检查，已拒绝进入更新模式。"
-    return 0
+    if [[ "${DEMO_MODE}" == 1 ]]; then
+      warn "预览配置未通过受管结构检查，无法进入更新模式。"
+      return 0
+    fi
+    printf '\n检测到 config.json 与 VPS Manager 状态不一致。\n'
+    printf '  1) 找回最近一份指纹匹配的旧受管配置\n'
+    printf '  2) 保留当前 config.json，严格校验后以它为新基线\n'
+    printf '  0) 取消，不修改任何文件\n'
+    read -r -p "请选择 [0]: " recovery_choice
+    case "${recovery_choice:-0}" in
+      1)
+        bundle="$(latest_matching_xray_bundle)"
+        if [[ -z "${bundle}" || ! -d "${bundle}" ]]; then
+          warn "没有找到 config/state 指纹匹配的完整旧备份，无法自动恢复。"
+          return 0
+        fi
+        printf '将恢复：%s\n' "${bundle}"
+        prompt_yes_no "确认恢复旧 config/state/info/yaml 并重启 Xray" 0 || return 0
+        rollback_xray_bundle "${bundle}" || return 1
+        load_xray_model_from_paths "${XRAY_CONFIG}" "${STATE_FILE}" "${XRAY_PENDING_MODEL}" || {
+          warn "旧备份已恢复，但仍未通过受管结构检查。"
+          return 1
+        }
+        ;;
+      2)
+        validate_xray_config "${XRAY_CONFIG}" || {
+          warn "当前 config.json 未通过 Xray 校验，不能接管。"
+          return 0
+        }
+        public_key="$(derive_reality_public_key_from_config "${XRAY_CONFIG}")" || {
+          warn "无法从当前 Reality privateKey 派生公钥，不能接管。"
+          return 0
+        }
+        bundle="$(backup_xray_bundle)" || {
+          warn "接管前统一备份失败，当前配置没有变化。"
+          return 1
+        }
+        if ! load_xray_model_from_paths "${XRAY_CONFIG}" "${STATE_FILE}" "${XRAY_PENDING_MODEL}" adopt-live "${public_key}"; then
+          warn "当前 config.json 不符合可安全接管的脚本结构；已保留原文件，备份位于 ${bundle}。"
+          return 0
+        fi
+        warn "已将当前 live config 载入为更新基线；应用候选配置后才会刷新 state/info/yaml。"
+        printf '接管前备份：%s\n' "${bundle}"
+        ;;
+      0) return 0;;
+      *) warn "未知选项，未修改任何文件。"; return 0;;
+    esac
   fi
   while true; do
     printf '\n当前待更新配置：\n'; show_pending_xray_summary
