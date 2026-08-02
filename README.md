@@ -385,9 +385,9 @@ Cloudflare Access Service Token 的读取顺序：
 建议根分区：4 GiB 或更大
 ```
 
-不满足新版空间条件时，Debian 12 amd64 机器如果仍有至少 400 MiB 可用空间，可以选择安装 Cloudflare 官方 `2026.1.150.0` 轻量稳定版。该版本是新版 Linux GUI 引入前的官方版本，下载约 53 MiB、安装后约 152 MiB，仍支持 `mdm.xml`、Zero Trust Team 和 Service Token。
+Debian 11、Debian 12 和 Ubuntu 24.04 amd64 默认安装各自发行版对应的 Cloudflare 官方 `2026.1.150.0` 轻量稳定版；如果已经安装其他版本，脚本会在确认后降级。该版本是新版 Linux GUI 引入前的官方版本，下载约 53 MiB、安装后约 152 MiB，仍支持 `mdm.xml`、Zero Trust Team 和 Service Token。安装前至少需要 400 MiB 可用空间。
 
-脚本会校验官方安装包的 SHA-256，并在安装后执行 `apt-mark hold cloudflare-warp`，防止系统升级时重新拉入带 WebKit/GTK 的大型新版。锁定期间不会获得新版功能和修复；磁盘扩容后应手动解除锁定并升级：
+脚本会校验官方安装包的 SHA-256；降级前备份现有 `mdm.xml`，安装时使用 `--allow-downgrades`，完成后执行 `apt-mark hold cloudflare-warp`，防止系统升级时重新拉入带 WebKit/GTK 的大型新版。锁定期间不会获得新版功能和安全修复；如需恢复新版，应手动解除锁定并升级：
 
 ```bash
 apt-mark unhold cloudflare-warp

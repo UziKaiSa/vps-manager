@@ -18,6 +18,10 @@ KOMARI_WARP_LEGACY_MIN_FREE_MIB=400
 KOMARI_WARP_LEGACY_VERSION="2026.1.150.0"
 KOMARI_WARP_LEGACY_URL="https://downloads.cloudflareclient.com/v1/download/bookworm-intel/version/2026.1.150.0"
 KOMARI_WARP_LEGACY_SHA256="049ad669140ac0f428a980ebd8b4bca7949307076d7cf51f6e5668c239d6ad87"
+KOMARI_WARP_LEGACY_NOBLE_URL="https://downloads.cloudflareclient.com/v1/download/noble-intel/version/2026.1.150.0"
+KOMARI_WARP_LEGACY_NOBLE_SHA256="2e388e4746e2cb1918227f84da38786de3dded883feaa3ad4fb5be10a70bc30a"
+KOMARI_WARP_LEGACY_BULLSEYE_URL="https://downloads.cloudflareclient.com/v1/download/bullseye-intel/version/2026.1.150.0"
+KOMARI_WARP_LEGACY_BULLSEYE_SHA256="fcad2595a371f051b81f548b65f6cab93681690c45bda97bc4e729a8b14f4528"
 ALPINE_WARP_ROOT="/opt/cloudflare-warp"
 ALPINE_WARP_MIN_FREE_MIB=300
 
@@ -3478,20 +3482,47 @@ komari_check_warp_disk() {
     printf 'Cloudflare WARP 当前会强制安装 WebKit/GTK 等大型依赖。\n'
     printf '脚本要求：根分区至少 %s MiB、可用空间至少 %s MiB；建议扩容到 4 GiB 以上。\n' \
       "${KOMARI_WARP_MIN_ROOT_MIB}" "${KOMARI_WARP_MIN_FREE_MIB}"
-    printf '如果是 Debian 12 amd64 且至少还有 400 MiB 可用空间，脚本可以改装 Cloudflare 官方旧版轻量客户端并锁定版本。\n'
+    printf '如果是 Debian 11/12 或 Ubuntu 24.04 amd64 且至少还有 400 MiB 可用空间，脚本可以改装对应发行版的 Cloudflare 官方旧版轻量客户端并锁定版本。\n'
     return 1
   fi
 }
 
 komari_install_warp_legacy() {
-  local codename arch root_free_kib root_free_mib package_file installed_version
+  local os_id codename arch root_free_kib root_free_mib package_file installed_version backup=""
+  local package_url package_sha256
   # shellcheck disable=SC1091
   . /etc/os-release
+  os_id="${ID:-}"
   codename="${VERSION_CODENAME:-}"
   arch="$(dpkg --print-architecture)"
-  if [[ "${codename}" != "bookworm" || "${arch}" != "amd64" ]]; then
-    warn "官方轻量旧版自动安装目前只支持 Debian 12 amd64；当前为 ${codename:-unknown} ${arch}."
+  if [[ "${arch}" != "amd64" ]] \
+    || ! { [[ "${os_id}" == "debian" && "${codename}" =~ ^(bullseye|bookworm)$ ]] \
+      || [[ "${os_id}" == "ubuntu" && "${codename}" == "noble" ]]; }; then
+    warn "官方轻量旧版自动安装目前只支持 Debian 11/12 或 Ubuntu 24.04 amd64；当前为 ${os_id:-unknown} ${codename:-unknown} ${arch}."
     return 1
+  fi
+
+  case "${codename}" in
+    bullseye)
+      package_url="${KOMARI_WARP_LEGACY_BULLSEYE_URL}"
+      package_sha256="${KOMARI_WARP_LEGACY_BULLSEYE_SHA256}"
+      ;;
+    bookworm)
+      package_url="${KOMARI_WARP_LEGACY_URL}"
+      package_sha256="${KOMARI_WARP_LEGACY_SHA256}"
+      ;;
+    noble)
+      package_url="${KOMARI_WARP_LEGACY_NOBLE_URL}"
+      package_sha256="${KOMARI_WARP_LEGACY_NOBLE_SHA256}"
+      ;;
+  esac
+
+  installed_version="$(dpkg-query -W -f='${Version}' cloudflare-warp 2>/dev/null || true)"
+  if [[ "${installed_version}" == "${KOMARI_WARP_LEGACY_VERSION}" ]] \
+    && command -v warp-cli >/dev/null 2>&1; then
+    apt-mark hold cloudflare-warp >/dev/null
+    log "Cloudflare WARP ${installed_version} 已安装并锁定"
+    return 0
   fi
 
   root_free_kib="$(df -Pk / | awk 'NR == 2 {print $4}')"
@@ -3507,7 +3538,17 @@ komari_install_warp_legacy() {
   printf '  Cloudflare 官方 WARP: %s（新 Linux GUI 引入前）\n' "${KOMARI_WARP_LEGACY_VERSION}"
   printf '  下载约 53 MiB，安装后约 152 MiB；安装完成后会锁定版本。\n'
   printf '  锁定期间不会获得新版功能和修复；扩容后可解除锁定并升级。\n'
-  prompt_yes_no "是否安装并锁定这个官方轻量版本" 1 || return 1
+  if [[ -n "${installed_version}" ]]; then
+    printf '  当前已安装版本：%s；继续后会降级并保留现有 MDM 配置。\n' "${installed_version}"
+    prompt_yes_no "是否降级并锁定这个官方轻量版本" 1 || return 1
+    if [[ -f /var/lib/cloudflare-warp/mdm.xml ]]; then
+      backup="$(backup_file /var/lib/cloudflare-warp/mdm.xml warp-mdm-before-downgrade)"
+      log "WARP MDM 配置已备份到 ${backup}"
+    fi
+    apt-mark unhold cloudflare-warp >/dev/null 2>&1 || true
+  else
+    prompt_yes_no "是否安装并锁定这个官方轻量版本" 1 || return 1
+  fi
 
   export DEBIAN_FRONTEND=noninteractive
   apt_update_safe
@@ -3515,9 +3556,9 @@ komari_install_warp_legacy() {
   ensure_work_dir
   package_file="${WORK_DIR}/cloudflare-warp_${KOMARI_WARP_LEGACY_VERSION}_amd64.deb"
   curl -fL --retry 2 --connect-timeout 10 --max-time 180 \
-    -o "${package_file}" "${KOMARI_WARP_LEGACY_URL}"
-  printf '%s  %s\n' "${KOMARI_WARP_LEGACY_SHA256}" "${package_file}" | sha256sum -c -
-  apt-get install -y "${package_file}"
+    -o "${package_file}" "${package_url}"
+  printf '%s  %s\n' "${package_sha256}" "${package_file}" | sha256sum -c -
+  apt-get install -y --allow-downgrades "${package_file}"
 
   installed_version="$(dpkg-query -W -f='${Version}' cloudflare-warp 2>/dev/null || true)"
   [[ "${installed_version}" == "${KOMARI_WARP_LEGACY_VERSION}" ]] \
@@ -3525,27 +3566,34 @@ komari_install_warp_legacy() {
   command -v warp-cli >/dev/null 2>&1 \
     || { warn "WARP 已安装但找不到 warp-cli。"; return 1; }
   apt-mark hold cloudflare-warp >/dev/null
+  service_restart warp-svc
   log "已安装并锁定 Cloudflare WARP ${installed_version}"
 }
 
 komari_install_warp_client() {
-  local codename
+  local os_id codename arch
   if is_alpine; then
     komari_install_warp_alpine
     return $?
   fi
-  if [[ "$(dpkg-query -W -f='${db:Status-Status}' cloudflare-warp 2>/dev/null || true)" == "installed" ]] \
-    && command -v warp-cli >/dev/null 2>&1; then
-    log "Cloudflare WARP 已安装，跳过重复安装"
-    return 0
+
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  os_id="${ID:-}"
+  codename="${VERSION_CODENAME:-}"
+  arch="$(dpkg --print-architecture)"
+  if [[ "${arch}" == "amd64" ]] \
+    && { [[ "${os_id}" == "debian" && "${codename}" =~ ^(bullseye|bookworm)$ ]] \
+      || [[ "${os_id}" == "ubuntu" && "${codename}" == "noble" ]]; }; then
+    komari_install_warp_legacy
+    return $?
   fi
 
   if ! komari_check_warp_disk; then
     komari_install_warp_legacy
     return $?
   fi
-  # shellcheck disable=SC1091
-  . /etc/os-release; codename="${VERSION_CODENAME:-}"; [[ -n "${codename}" ]] || codename="$(lsb_release -cs)"
+  [[ -n "${codename}" ]] || codename="$(lsb_release -cs)"
   export DEBIAN_FRONTEND=noninteractive
   apt_update_safe; apt-get install -y curl gpg lsb-release ca-certificates nftables
   install -d -m 0755 /usr/share/keyrings
