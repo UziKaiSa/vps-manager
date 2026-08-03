@@ -24,6 +24,10 @@ KOMARI_WARP_LEGACY_BULLSEYE_URL="https://downloads.cloudflareclient.com/v1/downl
 KOMARI_WARP_LEGACY_BULLSEYE_SHA256="fcad2595a371f051b81f548b65f6cab93681690c45bda97bc4e729a8b14f4528"
 ALPINE_WARP_ROOT="/opt/cloudflare-warp"
 ALPINE_WARP_MIN_FREE_MIB=300
+ALPINE_WARP_GUARD="/usr/local/sbin/vps-manager-warp-guard"
+ALPINE_WARP_LOG_MAX_BYTES=8388608
+ALPINE_WARP_LOG_TAIL_BYTES=2097152
+ALPINE_WARP_RSS_MAX_KIB=163840
 
 OS_ID=""
 INIT_SYSTEM=""
@@ -3727,6 +3731,80 @@ extract_deb_to() {
 }
 
 
+install_alpine_warp_guard() {
+  local log_file="/var/log/cloudflare-warp/warp-svc.log"
+  local archive_file="/var/log/cloudflare-warp/warp-svc.log.1.gz"
+  local log_size tail_tmp
+  if [[ -f "${log_file}" ]]; then
+    log_size="$(wc -c < "${log_file}" 2>/dev/null || echo 0)"
+    if (( log_size > ALPINE_WARP_LOG_MAX_BYTES )); then
+      tail_tmp="$(mktemp /run/warp-svc-bootstrap.XXXXXX)"
+      tail -c "${ALPINE_WARP_LOG_TAIL_BYTES}" "${log_file}" > "${tail_tmp}" 2>/dev/null \
+        || cp "${log_file}" "${tail_tmp}"
+      : > "${log_file}"
+      gzip -c "${tail_tmp}" > "${archive_file}"
+      chmod 600 "${archive_file}"
+      rm -f -- "${tail_tmp}"
+    fi
+  fi
+  install -d -m 755 /usr/local/sbin /var/log/cloudflare-warp
+  cat > "${ALPINE_WARP_GUARD}" <<EOF
+#!/bin/sh
+set -eu
+
+LOG_FILE="/var/log/cloudflare-warp/warp-svc.log"
+ARCHIVE_FILE="/var/log/cloudflare-warp/warp-svc.log.1.gz"
+LOCK_DIR="/run/vps-manager-warp-guard.lock"
+MAX_LOG_BYTES=${ALPINE_WARP_LOG_MAX_BYTES}
+TAIL_BYTES=${ALPINE_WARP_LOG_TAIL_BYTES}
+MAX_RSS_KIB=${ALPINE_WARP_RSS_MAX_KIB}
+
+mkdir "\${LOCK_DIR}" 2>/dev/null || exit 0
+cleanup() { rm -rf "\${LOCK_DIR}" "\${TAIL_TMP:-}" "\${ARCHIVE_TMP:-}"; }
+trap cleanup EXIT INT TERM
+
+if [ -f "\${LOG_FILE}" ]; then
+  size="\$(wc -c < "\${LOG_FILE}" 2>/dev/null || echo 0)"
+  if [ "\${size}" -gt "\${MAX_LOG_BYTES}" ]; then
+    TAIL_TMP="\$(mktemp /run/warp-svc-tail.XXXXXX)"
+    ARCHIVE_TMP="\${ARCHIVE_FILE}.tmp.\$\$"
+    tail -c "\${TAIL_BYTES}" "\${LOG_FILE}" > "\${TAIL_TMP}" 2>/dev/null || cp "\${LOG_FILE}" "\${TAIL_TMP}"
+    : > "\${LOG_FILE}"
+    gzip -c "\${TAIL_TMP}" > "\${ARCHIVE_TMP}"
+    chmod 600 "\${ARCHIVE_TMP}"
+    mv -f "\${ARCHIVE_TMP}" "\${ARCHIVE_FILE}"
+    logger -t vps-manager-warp-guard "rotated warp-svc.log at \${size} bytes"
+  fi
+fi
+
+warp_pid=''
+for cmdline in /proc/[0-9]*/cmdline; do
+  [ -r "\${cmdline}" ] || continue
+  if tr '\\000' ' ' < "\${cmdline}" 2>/dev/null | grep -q '${ALPINE_WARP_ROOT}/client/bin/warp-svc'; then
+    warp_pid="\${cmdline#/proc/}"
+    warp_pid="\${warp_pid%/cmdline}"
+    break
+  fi
+done
+
+if [ -n "\${warp_pid}" ] && [ -r "/proc/\${warp_pid}/status" ]; then
+  rss="\$(awk '/^VmRSS:/{print \$2; exit}' "/proc/\${warp_pid}/status")"
+  rss="\${rss:-0}"
+  if [ "\${rss}" -gt "\${MAX_RSS_KIB}" ]; then
+    logger -t vps-manager-warp-guard "restarting warp-svc at VmRSS=\${rss} KiB"
+    rc-service warp-svc restart >/dev/null
+  fi
+fi
+EOF
+  chmod 700 "${ALPINE_WARP_GUARD}"
+  touch /etc/crontabs/root
+  grep -Fqx "*/5 * * * * ${ALPINE_WARP_GUARD}" /etc/crontabs/root \
+    || printf '*/5 * * * * %s\n' "${ALPINE_WARP_GUARD}" >> /etc/crontabs/root
+  service_enable_start crond >/dev/null 2>&1 || true
+  "${ALPINE_WARP_GUARD}"
+}
+
+
 komari_install_warp_alpine() {
   local free_kib free_mib stage package_file entry hash path url
   local mirror="https://deb.debian.org/debian"
@@ -3735,6 +3813,7 @@ komari_install_warp_alpine() {
     log "Alpine WARP ${KOMARI_WARP_LEGACY_VERSION} 已安装，跳过重复安装"
     service_enable_start dbus >/dev/null 2>&1 || true
     service_enable_start warp-svc
+    install_alpine_warp_guard
     return 0
   fi
   free_kib="$(df -Pk / | awk 'NR == 2 {print $4}')"
@@ -3808,6 +3887,7 @@ depend() { need net dbus; after firewall; }
 EOF
   chmod 755 /etc/init.d/warp-svc
   service_enable_start warp-svc
+  install_alpine_warp_guard
   warp-cli --version
   log "Alpine WARP 兼容运行时安装完成并已锁定版本"
 }

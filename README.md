@@ -42,6 +42,8 @@ Xray 使用 XTLS 官方发布的 Linux amd64 静态压缩包，并由 OpenRC 管
 
 [Cloudflare 官方支持列表](https://developers.cloudflare.com/cloudflare-one/team-and-resources/devices/cloudflare-one-client/download/)目前没有 Alpine。为了让小硬盘 Alpine 机器仍可使用 Zero Trust Team、MDM 和 Service Token，脚本会安装并锁定 Cloudflare WARP `2026.1.150.0`，将官方 Debian 程序及其经过 SHA-256 校验的 glibc 依赖隔离在 `/opt/cloudflare-warp`。它不会替换 Alpine 的 musl，但属于兼容方案而不是 Cloudflare 官方支持的 Alpine 安装方式。
 
+Alpine 安装流程还会部署一个每 5 分钟执行的资源保护器：`warp-svc.log` 超过 8 MiB 时保留末尾 2 MiB 并压缩归档，`warp-svc` 的 RSS 超过 160 MiB 时自动重启服务。日志轮转不影响隧道；内存保护触发时会有一次短暂的 WARP 重连。
+
 ## 快速开始
 
 ### 方法一：使用 curl
