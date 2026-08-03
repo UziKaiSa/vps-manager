@@ -44,6 +44,8 @@ Xray 使用 XTLS 官方发布的 Linux amd64 静态压缩包，并由 OpenRC 管
 
 Alpine 安装流程还会部署一个每 5 分钟执行的资源保护器：`warp-svc.log` 超过 8 MiB 时保留末尾 2 MiB 并压缩归档，`warp-svc` 的 RSS 超过 160 MiB 时自动重启服务。日志轮转不影响隧道；内存保护触发时会有一次短暂的 WARP 重连。
 
+Debian/Ubuntu 安装流程会部署同一内存阈值的 systemd timer，每 5 分钟检查一次 `warp-svc` RSS，超过 160 MiB 时自动重启服务。官方客户端自己的文件日志已按固定数量轮转，因此不会再叠加一套文件日志轮转。
+
 ## 快速开始
 
 ### 方法一：使用 curl

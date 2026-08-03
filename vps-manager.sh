@@ -24,10 +24,10 @@ KOMARI_WARP_LEGACY_BULLSEYE_URL="https://downloads.cloudflareclient.com/v1/downl
 KOMARI_WARP_LEGACY_BULLSEYE_SHA256="fcad2595a371f051b81f548b65f6cab93681690c45bda97bc4e729a8b14f4528"
 ALPINE_WARP_ROOT="/opt/cloudflare-warp"
 ALPINE_WARP_MIN_FREE_MIB=300
-ALPINE_WARP_GUARD="/usr/local/sbin/vps-manager-warp-guard"
+WARP_GUARD_PATH="/usr/local/sbin/vps-manager-warp-guard"
+WARP_RSS_MAX_KIB=163840
 ALPINE_WARP_LOG_MAX_BYTES=8388608
 ALPINE_WARP_LOG_TAIL_BYTES=2097152
-ALPINE_WARP_RSS_MAX_KIB=163840
 
 OS_ID=""
 INIT_SYSTEM=""
@@ -3646,6 +3646,7 @@ komari_install_warp_legacy() {
   if [[ "${installed_version}" == "${KOMARI_WARP_LEGACY_VERSION}" ]] \
     && command -v warp-cli >/dev/null 2>&1; then
     apt-mark hold cloudflare-warp >/dev/null
+    install_systemd_warp_guard
     log "Cloudflare WARP ${installed_version} 已安装并锁定"
     return 0
   fi
@@ -3692,6 +3693,7 @@ komari_install_warp_legacy() {
     || { warn "WARP 已安装但找不到 warp-cli。"; return 1; }
   apt-mark hold cloudflare-warp >/dev/null
   service_restart warp-svc
+  install_systemd_warp_guard
   log "已安装并锁定 Cloudflare WARP ${installed_version}"
 }
 
@@ -3731,6 +3733,65 @@ extract_deb_to() {
 }
 
 
+install_systemd_warp_guard() {
+  install -d -m 755 /usr/local/sbin
+  cat > "${WARP_GUARD_PATH}" <<EOF
+#!/bin/sh
+set -eu
+
+LOCK_DIR="/run/vps-manager-warp-guard.lock"
+MAX_RSS_KIB=${WARP_RSS_MAX_KIB}
+mkdir "\${LOCK_DIR}" 2>/dev/null || exit 0
+trap 'rmdir "\${LOCK_DIR}" 2>/dev/null || true' EXIT INT TERM
+
+warp_pid=''
+for cmdline in /proc/[0-9]*/cmdline; do
+  [ -r "\${cmdline}" ] || continue
+  if tr '\\000' ' ' < "\${cmdline}" 2>/dev/null | grep -q '/bin/warp-svc'; then
+    warp_pid="\${cmdline#/proc/}"
+    warp_pid="\${warp_pid%/cmdline}"
+    break
+  fi
+done
+
+if [ -n "\${warp_pid}" ] && [ -r "/proc/\${warp_pid}/status" ]; then
+  rss="\$(awk '/^VmRSS:/{print \$2; exit}' "/proc/\${warp_pid}/status")"
+  rss="\${rss:-0}"
+  if [ "\${rss}" -gt "\${MAX_RSS_KIB}" ]; then
+    logger -t vps-manager-warp-guard "restarting warp-svc at VmRSS=\${rss} KiB"
+    systemctl restart warp-svc
+  fi
+fi
+EOF
+  chmod 700 "${WARP_GUARD_PATH}"
+  cat > /etc/systemd/system/vps-manager-warp-guard.service <<EOF
+[Unit]
+Description=VPS Manager WARP memory guard
+After=warp-svc.service
+
+[Service]
+Type=oneshot
+ExecStart=${WARP_GUARD_PATH}
+EOF
+  cat > /etc/systemd/system/vps-manager-warp-guard.timer <<'EOF'
+[Unit]
+Description=Check WARP memory usage every five minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+RandomizedDelaySec=30s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now vps-manager-warp-guard.timer
+  "${WARP_GUARD_PATH}"
+}
+
+
 install_alpine_warp_guard() {
   local log_file="/var/log/cloudflare-warp/warp-svc.log"
   local archive_file="/var/log/cloudflare-warp/warp-svc.log.1.gz"
@@ -3748,7 +3809,7 @@ install_alpine_warp_guard() {
     fi
   fi
   install -d -m 755 /usr/local/sbin /var/log/cloudflare-warp
-  cat > "${ALPINE_WARP_GUARD}" <<EOF
+  cat > "${WARP_GUARD_PATH}" <<EOF
 #!/bin/sh
 set -eu
 
@@ -3757,7 +3818,7 @@ ARCHIVE_FILE="/var/log/cloudflare-warp/warp-svc.log.1.gz"
 LOCK_DIR="/run/vps-manager-warp-guard.lock"
 MAX_LOG_BYTES=${ALPINE_WARP_LOG_MAX_BYTES}
 TAIL_BYTES=${ALPINE_WARP_LOG_TAIL_BYTES}
-MAX_RSS_KIB=${ALPINE_WARP_RSS_MAX_KIB}
+MAX_RSS_KIB=${WARP_RSS_MAX_KIB}
 
 mkdir "\${LOCK_DIR}" 2>/dev/null || exit 0
 cleanup() { rm -rf "\${LOCK_DIR}" "\${TAIL_TMP:-}" "\${ARCHIVE_TMP:-}"; }
@@ -3796,12 +3857,12 @@ if [ -n "\${warp_pid}" ] && [ -r "/proc/\${warp_pid}/status" ]; then
   fi
 fi
 EOF
-  chmod 700 "${ALPINE_WARP_GUARD}"
+  chmod 700 "${WARP_GUARD_PATH}"
   touch /etc/crontabs/root
-  grep -Fqx "*/5 * * * * ${ALPINE_WARP_GUARD}" /etc/crontabs/root \
-    || printf '*/5 * * * * %s\n' "${ALPINE_WARP_GUARD}" >> /etc/crontabs/root
+  grep -Fqx "*/5 * * * * ${WARP_GUARD_PATH}" /etc/crontabs/root \
+    || printf '*/5 * * * * %s\n' "${WARP_GUARD_PATH}" >> /etc/crontabs/root
   service_enable_start crond >/dev/null 2>&1 || true
-  "${ALPINE_WARP_GUARD}"
+  "${WARP_GUARD_PATH}"
 }
 
 
