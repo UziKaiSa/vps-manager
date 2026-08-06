@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.9.2-test"
+SCRIPT_VERSION="0.9.3-test"
 SCRIPT_NAME="VPS Manager"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh"
 
@@ -1039,7 +1039,7 @@ install_base_tools() {
 
 
 install_or_upgrade_xray() {
-  local installer archive stage
+  local installer archive stage alpine_arch archive_name checksum_file expected_sha256
 
   require_root
   check_supported_os
@@ -1054,15 +1054,29 @@ install_or_upgrade_xray() {
   if is_alpine; then
     log "安装 Alpine Xray 依赖"
     apk add --no-cache bash ca-certificates curl unzip python3 py3-yaml openssl shadow su-exec
+    alpine_arch="$(apk --print-arch)"
+    case "${alpine_arch}" in
+      x86_64) archive_name="Xray-linux-64.zip" ;;
+      aarch64) archive_name="Xray-linux-arm64-v8a.zip" ;;
+      *) die "Alpine Xray 自动安装仅支持 x86_64 和 aarch64；当前为 ${alpine_arch}." ;;
+    esac
     ensure_work_dir
     archive="${WORK_DIR}/xray.zip"
+    checksum_file="${WORK_DIR}/xray.zip.dgst"
     stage="${WORK_DIR}/xray"
     mkdir -p "${stage}"
     curl -fL --retry 3 --connect-timeout 10 -o "${archive}" \
-      https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+      "https://github.com/XTLS/Xray-core/releases/latest/download/${archive_name}"
+    curl -fL --retry 3 --connect-timeout 10 -o "${checksum_file}" \
+      "https://github.com/XTLS/Xray-core/releases/latest/download/${archive_name}.dgst"
+    expected_sha256="$(awk -F'= ' '/^SHA2-256= / {print $2; exit}' "${checksum_file}")"
+    [[ "${expected_sha256}" =~ ^[0-9a-f]{64}$ ]] || die "无法读取 Xray 官方 SHA-256。"
+    printf '%s  %s\n' "${expected_sha256}" "${archive}" | sha256sum -c -
     unzip -tq "${archive}" >/dev/null || die "Xray 官方压缩包校验失败。"
     unzip -q "${archive}" -d "${stage}"
     [[ -x "${stage}/xray" ]] || die "Xray 压缩包中缺少可执行文件。"
+    "${stage}/xray" version >/dev/null \
+      || die "Xray 候选文件无法在当前 ${alpine_arch} 系统执行，未替换现有文件。"
     getent group xray >/dev/null 2>&1 || addgroup -S xray
     id xray >/dev/null 2>&1 || adduser -S -D -H -h /var/empty -s /sbin/nologin -G xray xray
     install -d -m 755 /usr/local/bin /usr/local/share/xray /usr/local/etc/xray
@@ -1081,7 +1095,7 @@ respawn_max=0
 depend() { need net; after firewall; }
 EOF
     chmod 755 /etc/init.d/xray
-    log "Alpine Xray 已安装"
+    log "Alpine Xray ${alpine_arch} 已安装"
     "${XRAY_BIN}" version | head -n 3
     return 0
   fi
