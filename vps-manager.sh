@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.9.1-test"
+SCRIPT_VERSION="0.9.2-test"
 SCRIPT_NAME="VPS Manager"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh"
 
@@ -18,6 +18,8 @@ KOMARI_WARP_LEGACY_MIN_FREE_MIB=400
 KOMARI_WARP_LEGACY_VERSION="2026.1.150.0"
 KOMARI_WARP_LEGACY_URL="https://downloads.cloudflareclient.com/v1/download/bookworm-intel/version/2026.1.150.0"
 KOMARI_WARP_LEGACY_SHA256="049ad669140ac0f428a980ebd8b4bca7949307076d7cf51f6e5668c239d6ad87"
+KOMARI_WARP_LEGACY_ARM64_URL="https://downloads.cloudflareclient.com/v1/download/bookworm-arm/version/2026.1.150.0"
+KOMARI_WARP_LEGACY_ARM64_SHA256="4a1854dd5dae9cbbb88113297898aecd857e2b16d066238b7207212fc6435222"
 KOMARI_WARP_LEGACY_NOBLE_URL="https://downloads.cloudflareclient.com/v1/download/noble-intel/version/2026.1.150.0"
 KOMARI_WARP_LEGACY_NOBLE_SHA256="2e388e4746e2cb1918227f84da38786de3dded883feaa3ad4fb5be10a70bc30a"
 KOMARI_WARP_LEGACY_BULLSEYE_URL="https://downloads.cloudflareclient.com/v1/download/bullseye-intel/version/2026.1.150.0"
@@ -3866,16 +3868,87 @@ EOF
 }
 
 
+komari_alpine_runtime_manifest() {
+  case "$1" in
+    amd64)
+      cat <<'EOF'
+1896a2aacf4ad681ff5eacc24a5b0ca4d5d9c9b9c9e4b6de5197bc1e116ea619|pool/main/g/gcc-12/gcc-12-base_12.2.0-14+deb12u1_amd64.deb
+ba4f88f73dbc3ae9055f3c20f4523bfdbaf1ad13ff95e258924f77d20b4fbedf|pool/main/g/glibc/libc6_2.36-9+deb12u14_amd64.deb
+8d684c673e7483802a5c447834b0df6fce006eb3a7109e1be412f5ad425bb24f|pool/main/libc/libcap2/libcap2_2.66-4+deb12u3+b1_amd64.deb
+18ee0ce5fab9f7b671e87da1e9fa18660e36e04a3402f24bdb8635e0ba1d35f6|pool/main/d/dbus/libdbus-1-3_1.14.10-1~deb12u1_amd64.deb
+3016e62cb4b7cd8038822870601f5ed131befe942774d0f745622cc77d8a88f7|pool/main/g/gcc-12/libgcc-s1_12.2.0-14+deb12u1_amd64.deb
+e7a56552139c693904a6f9712234c05fe918353273a7cbdb5e62f423ad71bb97|pool/main/libg/libgcrypt20/libgcrypt20_1.10.1-3+deb12u1_amd64.deb
+89944ee11d7370ce6ef46fc52f094c4a6512eff8943ec4c6ebefeae6360ceada|pool/main/libg/libgpg-error/libgpg-error0_1.46-1_amd64.deb
+64cde86cef1deaf828bd60297839b59710b5cd8dc50efd4f12643caaee9389d3|pool/main/l/lz4/liblz4-1_1.9.4-1_amd64.deb
+f96d8876b53ec89d76a992bc199679b818cf518225a768954d9451fb556a4eb7|pool/main/x/xz-utils/liblzma5_5.4.1-1+deb12u1_amd64.deb
+6cca09767e94e4b5d2888ef31ad797bd3e7cec27fbbe98b49b10d4884746ce77|pool/main/n/nspr/libnspr4_4.35-1_amd64.deb
+bb4339de2e76be9862225447c6c24b9d759baba5ee861d86dfb558ebf4474d14|pool/main/n/nss/libnss3_3.87.1-1+deb12u2_amd64.deb
+a8d78b40e9b4e422224aeebfe0e4dfc243f6acf3532490b0c05480d4283d41e2|pool/main/s/sqlite3/libsqlite3-0_3.40.1-2+deb12u2_amd64.deb
+013c07514a9e4933b2d5c098018695a6aa42d085dbc483ce2c094a954c8a1b0a|pool/main/s/systemd/libsystemd0_252.39-1~deb12u2_amd64.deb
+6315b5ac38b724a710fb96bf1042019398cb656718b1522279a5185ed39318fa|pool/main/libz/libzstd/libzstd1_1.5.4+dfsg2-5_amd64.deb
+EOF
+      ;;
+    arm64)
+      cat <<'EOF'
+674cf6cba6d432bd200c45fe866c1652c7a53523cc2e7a613e05bc4abf7b5440|pool/main/g/gcc-12/gcc-12-base_12.2.0-14+deb12u1_arm64.deb
+01f4330719fd4f65580e16ea5a0527f372fca750e8f588d26deaf09f2d3b1cf4|pool/main/g/glibc/libc6_2.36-9+deb12u14_arm64.deb
+b3a21ae1cef9c2f3fa340007100fb0aa934ab6a4d8aed131660de9713db2bb6e|pool/main/libc/libcap2/libcap2_2.66-4+deb12u3+b1_arm64.deb
+2a423794f44ee756f70fda67c6e47b15afe3dd22cd69e51f5d14d2ec9538f806|pool/main/d/dbus/libdbus-1-3_1.14.10-1~deb12u1_arm64.deb
+576926b283613db80168ddf76380a3bd877602778cf0d226caa7bfbfa71eacf3|pool/main/g/gcc-12/libgcc-s1_12.2.0-14+deb12u1_arm64.deb
+140af58350c9b15bfa611000d9e0205528bbed2cba39271bf12bd36de2678f2e|pool/main/libg/libgcrypt20/libgcrypt20_1.10.1-3+deb12u1_arm64.deb
+aff6ce011ae9abf7090e906f0cf6bc2b447bbc4cc7e03ff117f9d73528857352|pool/main/libg/libgpg-error/libgpg-error0_1.46-1_arm64.deb
+f061216ce11aabba8f032dfd6c75c181e782fef7493033b9621a8c3b2953b87e|pool/main/l/lz4/liblz4-1_1.9.4-1_arm64.deb
+647ce9d81e41c30071ce6ac0d3324579216a33aaa1d28971d6952315f6a95a75|pool/main/x/xz-utils/liblzma5_5.4.1-1+deb12u1_arm64.deb
+3aa6bc5a1a3f83627f735b9712eed74ed2c345ae9148e9d876887a97982ae28d|pool/main/n/nspr/libnspr4_4.35-1_arm64.deb
+2e5af2fc3d1015674a674b48149a342f1922d74c82f16c0cdc2d6a6bee27f154|pool/main/n/nss/libnss3_3.87.1-1+deb12u2_arm64.deb
+a690f7f2aa6435bd1fd7cbbd2216acb9acbb8c48c9721f2c195766375439eb13|pool/main/s/sqlite3/libsqlite3-0_3.40.1-2+deb12u2_arm64.deb
+293ab474b90276dae9ebc03ed01e622e0c1f2578e83ed3aa926ae1eaf84dda9c|pool/main/s/systemd/libsystemd0_252.39-1~deb12u2_arm64.deb
+95e173c9538f96ede4fc275ec7863f395a97dd0ea62454be9bc914efa1b9be93|pool/main/libz/libzstd/libzstd1_1.5.4+dfsg2-5_arm64.deb
+EOF
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+
 komari_install_warp_alpine() {
-  local free_kib free_mib stage package_file entry hash path url
+  local free_kib free_mib stage package_file hash path url alpine_arch deb_arch lib_arch loader
+  local package_url package_sha256 installed_arch="" backup=""
   local mirror="https://deb.debian.org/debian"
+  alpine_arch="$(apk --print-arch)"
+  case "${alpine_arch}" in
+    x86_64)
+      deb_arch="amd64"
+      lib_arch="x86_64-linux-gnu"
+      loader="ld-linux-x86-64.so.2"
+      package_url="${KOMARI_WARP_LEGACY_URL}"
+      package_sha256="${KOMARI_WARP_LEGACY_SHA256}"
+      ;;
+    aarch64)
+      deb_arch="arm64"
+      lib_arch="aarch64-linux-gnu"
+      loader="ld-linux-aarch64.so.1"
+      package_url="${KOMARI_WARP_LEGACY_ARM64_URL}"
+      package_sha256="${KOMARI_WARP_LEGACY_ARM64_SHA256}"
+      ;;
+    *)
+      warn "Alpine WARP 兼容运行时仅支持 x86_64 和 aarch64；当前为 ${alpine_arch}."
+      return 1
+      ;;
+  esac
+  [[ ! -r "${ALPINE_WARP_ROOT}/ARCH" ]] || installed_arch="$(< "${ALPINE_WARP_ROOT}/ARCH")"
   if [[ -x "${ALPINE_WARP_ROOT}/client/bin/warp-cli" && -f "${ALPINE_WARP_ROOT}/VERSION" ]] \
-    && grep -qx "${KOMARI_WARP_LEGACY_VERSION}" "${ALPINE_WARP_ROOT}/VERSION"; then
-    log "Alpine WARP ${KOMARI_WARP_LEGACY_VERSION} 已安装，跳过重复安装"
+    && grep -qx "${KOMARI_WARP_LEGACY_VERSION}" "${ALPINE_WARP_ROOT}/VERSION" \
+    && [[ "${installed_arch}" == "${deb_arch}" ]] \
+    && warp-cli --version >/dev/null 2>&1; then
+    log "Alpine WARP ${KOMARI_WARP_LEGACY_VERSION} ${deb_arch} 已安装，跳过重复安装"
     service_enable_start dbus >/dev/null 2>&1 || true
     service_enable_start warp-svc
     install_alpine_warp_guard
     return 0
+  fi
+  if [[ -d "${ALPINE_WARP_ROOT}" ]]; then
+    warn "检测到不可用或架构不匹配的 Alpine WARP 安装（记录架构：${installed_arch:-未知}，当前：${deb_arch}），将重新安装。"
   fi
   free_kib="$(df -Pk / | awk 'NR == 2 {print $4}')"
   free_mib=$((free_kib / 1024))
@@ -3899,39 +3972,31 @@ komari_install_warp_alpine() {
     printf '%s  %s\n' "${hash}" "${package_file}" | sha256sum -c -
     extract_deb_to "${package_file}" "${stage}/runtime"
     rm -f -- "${package_file}"
-  done <<'EOF'
-1896a2aacf4ad681ff5eacc24a5b0ca4d5d9c9b9c9e4b6de5197bc1e116ea619|pool/main/g/gcc-12/gcc-12-base_12.2.0-14+deb12u1_amd64.deb
-ba4f88f73dbc3ae9055f3c20f4523bfdbaf1ad13ff95e258924f77d20b4fbedf|pool/main/g/glibc/libc6_2.36-9+deb12u14_amd64.deb
-8d684c673e7483802a5c447834b0df6fce006eb3a7109e1be412f5ad425bb24f|pool/main/libc/libcap2/libcap2_2.66-4+deb12u3+b1_amd64.deb
-18ee0ce5fab9f7b671e87da1e9fa18660e36e04a3402f24bdb8635e0ba1d35f6|pool/main/d/dbus/libdbus-1-3_1.14.10-1~deb12u1_amd64.deb
-3016e62cb4b7cd8038822870601f5ed131befe942774d0f745622cc77d8a88f7|pool/main/g/gcc-12/libgcc-s1_12.2.0-14+deb12u1_amd64.deb
-e7a56552139c693904a6f9712234c05fe918353273a7cbdb5e62f423ad71bb97|pool/main/libg/libgcrypt20/libgcrypt20_1.10.1-3+deb12u1_amd64.deb
-89944ee11d7370ce6ef46fc52f094c4a6512eff8943ec4c6ebefeae6360ceada|pool/main/libg/libgpg-error/libgpg-error0_1.46-1_amd64.deb
-64cde86cef1deaf828bd60297839b59710b5cd8dc50efd4f12643caaee9389d3|pool/main/l/lz4/liblz4-1_1.9.4-1_amd64.deb
-f96d8876b53ec89d76a992bc199679b818cf518225a768954d9451fb556a4eb7|pool/main/x/xz-utils/liblzma5_5.4.1-1+deb12u1_amd64.deb
-6cca09767e94e4b5d2888ef31ad797bd3e7cec27fbbe98b49b10d4884746ce77|pool/main/n/nspr/libnspr4_4.35-1_amd64.deb
-bb4339de2e76be9862225447c6c24b9d759baba5ee861d86dfb558ebf4474d14|pool/main/n/nss/libnss3_3.87.1-1+deb12u2_amd64.deb
-a8d78b40e9b4e422224aeebfe0e4dfc243f6acf3532490b0c05480d4283d41e2|pool/main/s/sqlite3/libsqlite3-0_3.40.1-2+deb12u2_amd64.deb
-013c07514a9e4933b2d5c098018695a6aa42d085dbc483ce2c094a954c8a1b0a|pool/main/s/systemd/libsystemd0_252.39-1~deb12u2_amd64.deb
-6315b5ac38b724a710fb96bf1042019398cb656718b1522279a5185ed39318fa|pool/main/libz/libzstd/libzstd1_1.5.4+dfsg2-5_amd64.deb
-EOF
+  done < <(komari_alpine_runtime_manifest "${deb_arch}")
   package_file="${WORK_DIR}/cloudflare-warp.deb"
-  curl -fL --retry 3 --connect-timeout 10 --max-time 240 -o "${package_file}" "${KOMARI_WARP_LEGACY_URL}"
-  printf '%s  %s\n' "${KOMARI_WARP_LEGACY_SHA256}" "${package_file}" | sha256sum -c -
+  curl -fL --retry 3 --connect-timeout 10 --max-time 240 -o "${package_file}" "${package_url}"
+  printf '%s  %s\n' "${package_sha256}" "${package_file}" | sha256sum -c -
   extract_deb_to "${package_file}" "${stage}/client"
   [[ -x "${stage}/client/bin/warp-cli" && -x "${stage}/client/bin/warp-svc" ]] \
     || { warn "WARP 包内缺少程序文件。"; return 1; }
   printf '%s\n' "${KOMARI_WARP_LEGACY_VERSION}" > "${stage}/VERSION"
-  rm -rf -- "${ALPINE_WARP_ROOT}"
+  printf '%s\n' "${deb_arch}" > "${stage}/ARCH"
+  service_is_active warp-svc && rc-service warp-svc stop || true
+  if [[ -d "${ALPINE_WARP_ROOT}" ]]; then
+    install -d -m 700 "${BACKUP_ROOT}"
+    backup="${BACKUP_ROOT}/cloudflare-warp-before-${deb_arch}-$(date '+%Y%m%d-%H%M%S')"
+    mv "${ALPINE_WARP_ROOT}" "${backup}"
+    log "原 Alpine WARP 运行时已备份到 ${backup}"
+  fi
   install -d -m 755 "$(dirname "${ALPINE_WARP_ROOT}")"
   mv "${stage}" "${ALPINE_WARP_ROOT}"
   cat > /usr/local/bin/warp-cli <<EOF
 #!/bin/sh
-exec ${ALPINE_WARP_ROOT}/runtime/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 --library-path ${ALPINE_WARP_ROOT}/runtime/lib/x86_64-linux-gnu:${ALPINE_WARP_ROOT}/runtime/usr/lib/x86_64-linux-gnu ${ALPINE_WARP_ROOT}/client/bin/warp-cli "\$@"
+exec ${ALPINE_WARP_ROOT}/runtime/lib/${lib_arch}/${loader} --library-path ${ALPINE_WARP_ROOT}/runtime/lib/${lib_arch}:${ALPINE_WARP_ROOT}/runtime/usr/lib/${lib_arch} ${ALPINE_WARP_ROOT}/client/bin/warp-cli "\$@"
 EOF
   cat > /usr/local/bin/warp-svc <<EOF
 #!/bin/sh
-exec ${ALPINE_WARP_ROOT}/runtime/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 --library-path ${ALPINE_WARP_ROOT}/runtime/lib/x86_64-linux-gnu:${ALPINE_WARP_ROOT}/runtime/usr/lib/x86_64-linux-gnu ${ALPINE_WARP_ROOT}/client/bin/warp-svc "\$@"
+exec ${ALPINE_WARP_ROOT}/runtime/lib/${lib_arch}/${loader} --library-path ${ALPINE_WARP_ROOT}/runtime/lib/${lib_arch}:${ALPINE_WARP_ROOT}/runtime/usr/lib/${lib_arch} ${ALPINE_WARP_ROOT}/client/bin/warp-svc "\$@"
 EOF
   chmod 755 /usr/local/bin/warp-cli /usr/local/bin/warp-svc
   install -d -m 755 /var/log/cloudflare-warp
@@ -3950,7 +4015,7 @@ EOF
   service_enable_start warp-svc
   install_alpine_warp_guard
   warp-cli --version
-  log "Alpine WARP 兼容运行时安装完成并已锁定版本"
+  log "Alpine WARP ${deb_arch} 兼容运行时安装完成并已锁定版本"
 }
 
 
