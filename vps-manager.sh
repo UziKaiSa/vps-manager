@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.9.4-test"
+SCRIPT_VERSION="0.9.5-test"
 SCRIPT_NAME="VPS Manager"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh"
 
@@ -3556,14 +3556,18 @@ komari_target_home() {
 }
 
 
-komari_local_agent_candidate() {
-  local home="$1" arch candidate=""
-  arch="$(uname -m)"
-  case "${arch}" in
-    x86_64|amd64) arch="amd64" ;;
-    aarch64|arm64) arch="arm64" ;;
+komari_agent_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64) printf 'amd64' ;;
+    aarch64|arm64) printf 'arm64' ;;
     *) return 1 ;;
   esac
+}
+
+
+komari_local_agent_candidate() {
+  local home="$1" arch candidate=""
+  arch="$(komari_agent_arch)" || return 1
   if [[ -n "${KOMARI_LOCAL_AGENT:-}" ]]; then
     candidate="${KOMARI_LOCAL_AGENT}"
   elif [[ -f "${home}/komari-agent-linux-${arch}" ]]; then
@@ -3573,6 +3577,38 @@ komari_local_agent_candidate() {
   fi
   [[ -n "${candidate}" && -f "${candidate}" && ! -L "${candidate}" && -s "${candidate}" ]] || return 1
   printf '%s' "${candidate}"
+}
+
+
+komari_host_is_ipv6_only() {
+  command -v ip >/dev/null 2>&1 || return 1
+  ip -6 route show default 2>/dev/null | awk 'NF { found=1 } END { exit !found }' || return 1
+  ip -4 -o addr show scope global 2>/dev/null \
+    | awk '$2 != "CloudflareWARP" { found=1 } END { exit !found }' && return 1
+  return 0
+}
+
+
+komari_show_ipv6_only_agent_notice() {
+  local home="$1" endpoint="$2" arch download_url upload_path menu_path
+  arch="$(komari_agent_arch)" || {
+    warn "当前 CPU 架构没有对应的 Komari Agent 自动提示，请手动查看官方 Release。"
+    return 0
+  }
+  download_url="https://github.com/komari-monitor/komari-agent/releases/latest/download/komari-agent-linux-${arch}"
+  upload_path="${home}/komari-agent-linux-${arch}"
+  if is_alpine; then
+    menu_path="主菜单 3) Komari + WARP 管理 -> 1) 配置/修复 WARP 私网，并安装/重装 Agent"
+  elif [[ "${endpoint}" == "${KOMARI_DEFAULT_PRIVATE_URL}" || "${endpoint}" == *'.internal'* ]]; then
+    menu_path="主菜单 5) 安装/管理 Komari Agent -> 1) 配置/修复 WARP 私网，并可继续安装 Agent"
+  else
+    menu_path="主菜单 5) 安装/管理 Komari Agent -> 2) 安装/重装普通公网 Agent"
+  fi
+  printf '\n[提示] 检测到当前服务器为 IPv6-only，无法保证直接访问 GitHub Releases。\n'
+  printf '请先在其他设备手动下载 Komari Agent：\n  %s\n' "${download_url}"
+  printf '然后将文件上传到当前服务器：\n  %s\n' "${upload_path}"
+  printf '上传完成后重新运行本脚本，并选择：\n  %s\n\n' "${menu_path}"
+  printf '脚本检测到该本地文件后会校验并优先使用，不会再次下载 GitHub Release。\n'
 }
 
 
@@ -3673,6 +3709,11 @@ komari_install_agent() {
   local disable_ssh=1 gpu=1 detect_ip=1
   local -a args=()
   home="$(komari_target_home)"
+  local_agent="$(komari_local_agent_candidate "${home}" || true)"
+  if [[ -z "${local_agent}" ]] && komari_host_is_ipv6_only; then
+    komari_show_ipv6_only_agent_notice "${home}" "${endpoint}"
+    return 0
+  fi
   endpoint="$(prompt_default "Komari 连接地址" "${endpoint}")"
   token="$(prompt_secret "Komari Client Token")"
   [[ -n "${token}" ]] || { warn "Komari Token 不能为空。"; return 1; }
@@ -3683,7 +3724,6 @@ komari_install_agent() {
   prompt_yes_no "是否禁用 Web SSH" 1 || disable_ssh=0
   prompt_yes_no "是否启用 GPU 监控" 1 || gpu=0
   prompt_yes_no "是否自动记录公网 IPv4" 1 || detect_ip=0
-  local_agent="$(komari_local_agent_candidate "${home}" || true)"
   printf '\nAgent 配置预览：\n  Endpoint: %s\n  安装目录: %s\n  重置日: %s\n  Token: <已隐藏>\n' "${endpoint}" "${install_dir}" "${day}"
   [[ -z "${local_agent}" ]] || printf '  本地 Agent: %s\n' "${local_agent}"
   if [[ "${DEMO_MODE}" == 1 ]]; then
