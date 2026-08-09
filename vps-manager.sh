@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.9.3-test"
+SCRIPT_VERSION="0.9.4-test"
 SCRIPT_NAME="VPS Manager"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh"
 
@@ -3556,8 +3556,120 @@ komari_target_home() {
 }
 
 
+komari_local_agent_candidate() {
+  local home="$1" arch candidate=""
+  arch="$(uname -m)"
+  case "${arch}" in
+    x86_64|amd64) arch="amd64" ;;
+    aarch64|arm64) arch="arm64" ;;
+    *) return 1 ;;
+  esac
+  if [[ -n "${KOMARI_LOCAL_AGENT:-}" ]]; then
+    candidate="${KOMARI_LOCAL_AGENT}"
+  elif [[ -f "${home}/komari-agent-linux-${arch}" ]]; then
+    candidate="${home}/komari-agent-linux-${arch}"
+  elif [[ "${home}" != /root && -f "/root/komari-agent-linux-${arch}" ]]; then
+    candidate="/root/komari-agent-linux-${arch}"
+  fi
+  [[ -n "${candidate}" && -f "${candidate}" && ! -L "${candidate}" && -s "${candidate}" ]] || return 1
+  printf '%s' "${candidate}"
+}
+
+
+komari_write_local_runner() {
+  local runner="$1" agent="$2" endpoint="$3" token="$4" day="$5"
+  local disable_ssh="$6" gpu="$7" public_ip="$8"
+  {
+    printf '#!/usr/bin/env bash\nexec '
+    printf '%q ' "${agent}" -e "${endpoint}" -t "${token}" --month-rotate "${day}"
+    [[ "${disable_ssh}" == 1 ]] && printf '%q ' --disable-web-ssh
+    [[ "${gpu}" == 1 ]] && printf '%q ' --gpu
+    [[ -n "${public_ip}" ]] && printf '%q ' --custom-ipv4 "${public_ip}"
+    printf '\n'
+  } > "${runner}"
+  chmod 700 "${runner}"
+}
+
+
+komari_install_local_agent() {
+  local source="$1" endpoint="$2" token="$3" install_dir="$4" day="$5"
+  local disable_ssh="$6" gpu="$7" public_ip="$8"
+  local agent="${install_dir}/agent" runner="${install_dir}/run-agent.sh"
+  local service_file backup_agent="" backup_runner="" backup_service="" require_warp=0
+  local warp_dependency="" warp_after="" warp_requires=""
+  [[ "${endpoint}" == "${KOMARI_DEFAULT_PRIVATE_URL}" || "${endpoint}" == *'.internal'* ]] && require_warp=1
+  if [[ "${require_warp}" == 1 ]]; then
+    warp_dependency=" warp-svc"
+    warp_after=" warp-svc.service"
+    warp_requires="Requires=warp-svc.service"
+  fi
+  ensure_work_dir
+  install -m 700 "${source}" "${WORK_DIR}/komari-agent"
+  "${WORK_DIR}/komari-agent" --help >/dev/null 2>&1 \
+    || { warn "本地 Komari Agent 无法正常执行 --help，已停止安装。"; return 1; }
+  log "本地 Komari Agent SHA-256: $(sha256sum "${WORK_DIR}/komari-agent" | awk '{print $1}')"
+  install -d -m 700 "${install_dir}"
+  [[ ! -e "${agent}" ]] || backup_agent="$(backup_file "${agent}" komari-agent-local)"
+  [[ ! -e "${runner}" ]] || backup_runner="$(backup_file "${runner}" komari-runner)"
+  if is_alpine; then service_file="/etc/init.d/komari-agent"; else service_file="/etc/systemd/system/komari-agent.service"; fi
+  [[ ! -e "${service_file}" ]] || backup_service="$(backup_file "${service_file}" komari-service)"
+  if service_is_active komari-agent; then
+    if is_alpine; then rc-service komari-agent stop; else systemctl stop komari-agent.service; fi
+  fi
+  install -m 700 "${WORK_DIR}/komari-agent" "${agent}"
+  komari_write_local_runner "${runner}" "${agent}" "${endpoint}" "${token}" "${day}" \
+    "${disable_ssh}" "${gpu}" "${public_ip}"
+  if is_alpine; then
+    cat > "${service_file}" <<EOF
+#!/sbin/openrc-run
+name="Komari Agent Service"
+description="Komari monitoring agent"
+command="${runner}"
+command_user="root"
+directory="${install_dir}"
+pidfile="/run/komari-agent.pid"
+retry="SIGTERM/30"
+supervisor=supervise-daemon
+
+depend() {
+    need net${warp_dependency}
+    after network${warp_dependency}
+}
+EOF
+    chmod 700 "${service_file}"
+  else
+    cat > "${service_file}" <<EOF
+[Unit]
+Description=Komari Agent Service
+Wants=network-online.target
+After=network-online.target${warp_after}
+${warp_requires}
+
+[Service]
+Type=simple
+ExecStart="${runner}"
+WorkingDirectory="${install_dir}"
+Restart=always
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    chmod 600 "${service_file}"
+    systemctl daemon-reload
+  fi
+  if ! service_enable_start komari-agent || ! service_is_active komari-agent; then
+    warn "本地 Agent 已写入但服务启动失败。备份位置: ${backup_agent:-无旧 Agent} ${backup_runner:-无旧启动器} ${backup_service:-无旧服务}"
+    return 1
+  fi
+  log "已使用本地文件安装 Komari Agent: ${source}"
+  service_status_text komari-agent | sed -n '1,60p' || true
+}
+
+
 komari_install_agent() {
-  local endpoint="$1" token home install_dir day installer checksum public_ip
+  local endpoint="$1" token home install_dir day installer checksum public_ip local_agent=""
   local disable_ssh=1 gpu=1 detect_ip=1
   local -a args=()
   home="$(komari_target_home)"
@@ -3571,9 +3683,25 @@ komari_install_agent() {
   prompt_yes_no "是否禁用 Web SSH" 1 || disable_ssh=0
   prompt_yes_no "是否启用 GPU 监控" 1 || gpu=0
   prompt_yes_no "是否自动记录公网 IPv4" 1 || detect_ip=0
+  local_agent="$(komari_local_agent_candidate "${home}" || true)"
   printf '\nAgent 配置预览：\n  Endpoint: %s\n  安装目录: %s\n  重置日: %s\n  Token: <已隐藏>\n' "${endpoint}" "${install_dir}" "${day}"
-  if [[ "${DEMO_MODE}" == 1 ]]; then printf '[演示] 将校验并调用 Komari 官方安装器：%s\n' "${KOMARI_INSTALL_URL}"; return 0; fi
+  [[ -z "${local_agent}" ]] || printf '  本地 Agent: %s\n' "${local_agent}"
+  if [[ "${DEMO_MODE}" == 1 ]]; then
+    if [[ -n "${local_agent}" ]]; then printf '[演示] 将校验并优先使用本地 Komari Agent：%s\n' "${local_agent}"
+    else printf '[演示] 将校验并调用 Komari 官方安装器：%s\n' "${KOMARI_INSTALL_URL}"
+    fi
+    return 0
+  fi
   prompt_yes_no "确认安装或重装 Komari Agent" 0 || return 0
+  if [[ -n "${local_agent}" ]] && prompt_yes_no "是否优先使用检测到的本地 Agent（跳过 GitHub Release 下载）" 1; then
+    if [[ "${detect_ip}" == 1 ]]; then
+      public_ip="$(curl -4 -fsS --max-time 10 https://api.ipify.org 2>/dev/null || true)"
+      [[ -n "${public_ip}" ]] || warn "公网 IPv4 探测失败。"
+    fi
+    komari_install_local_agent "${local_agent}" "${endpoint}" "${token}" "${install_dir}" "${day}" \
+      "${disable_ssh}" "${gpu}" "${public_ip:-}"
+    return $?
+  fi
   ensure_work_dir; installer="${WORK_DIR}/install-komari-agent.sh"
   curl -fL --retry 3 --connect-timeout 10 -o "${installer}" "${KOMARI_INSTALL_URL}"
   chmod 700 "${installer}"; bash -n "${installer}"

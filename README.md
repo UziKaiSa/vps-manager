@@ -2,7 +2,7 @@
 
 `VPS Manager` 是一个面向 Debian/Ubuntu VPS 的中文交互式管理脚本，并为小硬盘 Alpine/OpenRC NAT VPS 提供受限模式，用于完成服务器初始化、Xray 配置，以及 Komari Agent/WARP 私网接入。
 
-当前版本：`0.9.1-test`
+当前版本：`0.9.4-test`
 
 > 目前是测试版。首次在正式服务器上使用前，建议先运行预览模式，并保留一个已经登录的 SSH 终端。
 
@@ -430,7 +430,17 @@ sudo chmod 600 /root/warp-token.env
 - 是否启用 GPU 监控
 - 是否记录公网 IPv4
 
-安装 Agent 本体时仍会下载并校验 Komari 官方安装器，而不是使用本仓库旧的包装脚本。
+安装 Agent 时会先检测环境变量 `KOMARI_LOCAL_AGENT` 指向的文件，或者目标用户家目录下与当前架构匹配的 `komari-agent-linux-amd64` / `komari-agent-linux-arm64`。检测到非空的普通文件后，脚本会显示路径并默认询问是否优先使用；确认后会计算 SHA-256、执行 `--help` 校验、安装到 Agent 目录，并跳过 GitHub Release 下载。
+
+本地安装路径会生成权限为 `700` 的启动包装器保存 Agent 参数，避免 Client Token 出现在 systemd/OpenRC service 文件中。私网 Endpoint 会让 `komari-agent` 显式依赖 `warp-svc`，保证重启时先建立私网；如果 WARP没有正确安装，Agent服务也不会伪装成成功启动。已有 Agent、启动包装器和服务文件会先保存到 `/var/backups/vps-manager/`。
+
+纯 IPv6机器可以先在其他能够访问 GitHub Releases 的电脑下载官方二进制，再通过可信的文件传输工具上传。例如 amd64 root 用户默认放置在：
+
+```text
+/root/komari-agent-linux-amd64
+```
+
+找不到本地文件或用户拒绝使用时，脚本仍会下载并校验 Komari 官方安装器，保持原有安装路径。
 
 ## 6. 状态检查
 
@@ -523,7 +533,7 @@ python3 apply-kaisa-komari-theme.py --db ./data/komari.db --no-backup
 
 ### Komari 选项是否完全不再访问 GitHub？
 
-不是。主脚本不再下载本仓库旧的 Komari/WARP 包装脚本，但安装 Komari Agent 本体仍会从 [Komari 官方仓库](https://github.com/komari-monitor/komari-agent)获取官方安装器。
+不一定。检测到并确认使用本地 Agent 时，不会访问 GitHub Release；找不到本地文件或拒绝使用时，仍会从 [Komari 官方仓库](https://github.com/komari-monitor/komari-agent)获取官方安装器。
 
 ## 安全提醒
 
