@@ -1664,6 +1664,9 @@ if pending_model:
     private_key = str(reality["privateKey"])
     public_key = str(reality["publicKey"])
     short_id = str(reality["shortId"])
+    guard = reality.get("guard", {"enabled": True})
+    guard_enabled = bool(guard.get("enabled", True))
+    guard_port = int(guard.get("port", 39000))
 else:
     node_name = env("CFG_NODE_NAME")
     public_address = env("CFG_PUBLIC_ADDRESS")
@@ -1679,6 +1682,8 @@ else:
     private_key = env("CFG_PRIVATE_KEY")
     public_key = env("CFG_PUBLIC_KEY")
     short_id = env("CFG_SHORT_ID")
+    guard_enabled = True
+    guard_port = 39000
 
 if not server_names:
     raise SystemExit("Reality serverNames 不能为空")
@@ -1739,6 +1744,27 @@ outbounds = [
         "settings": {"domainStrategy": "UseIPv4"},
     }
 ]
+
+managed_ports = {reality_port}
+if pending_model:
+    managed_ports.update(
+        int(item["port"])
+        for item in pending_model.get("optionalInbounds", {}).values()
+    )
+else:
+    if env("CFG_ENABLE_SOCKS") == "1":
+        managed_ports.add(int(env("CFG_SOCKS_PORT")))
+    if env("CFG_ENABLE_SS") == "1":
+        managed_ports.add(int(env("CFG_SS_PORT")))
+if guard_enabled:
+    if not 39000 <= guard_port <= 59999 or guard_port in managed_ports:
+        guard_port = next(
+            (port for port in range(39000, 60000) if port not in managed_ports),
+            0,
+        )
+    if not guard_port:
+        raise SystemExit("没有可用的 Reality 防偷本地端口")
+    outbounds.append({"protocol": "blackhole", "tag": "reality-guard-block"})
 
 native_identity = pending_model.get("native", {}) if pending_model else {}
 local_email = str(native_identity.get("email", "local@vps-manager.local"))
@@ -1814,6 +1840,9 @@ for index, entry in enumerate(proxy_entries, 1):
         }
     )
 
+reality_runtime_target = (
+    f"127.0.0.1:{guard_port}" if guard_enabled else reality_dest
+)
 inbounds = [
     {
         "port": reality_port,
@@ -1827,7 +1856,7 @@ inbounds = [
             "security": "reality",
             "realitySettings": {
                 "show": False,
-                "dest": reality_dest,
+                "dest": reality_runtime_target,
                 "xver": 0,
                 "serverNames": server_names,
                 "privateKey": private_key,
@@ -1836,6 +1865,40 @@ inbounds = [
         },
     }
 ]
+
+if guard_enabled:
+    target_host, target_port = parse_host_port(reality_dest)
+    inbounds.append(
+        {
+            "tag": "reality-guard-in",
+            "listen": "127.0.0.1",
+            "port": guard_port,
+            "protocol": "dokodemo-door",
+            "settings": {
+                "address": target_host,
+                "port": target_port,
+                "network": "tcp",
+            },
+            "sniffing": {
+                "enabled": True,
+                "destOverride": ["tls"],
+                "routeOnly": True,
+            },
+        }
+    )
+    routing_rules[0:0] = [
+        {
+            "type": "field",
+            "inboundTag": ["reality-guard-in"],
+            "domain": [f"full:{name}" for name in server_names],
+            "outboundTag": "direct",
+        },
+        {
+            "type": "field",
+            "inboundTag": ["reality-guard-in"],
+            "outboundTag": "reality-guard-block",
+        },
+    ]
 
 optional_inbounds = {}
 pending_optional = pending_model.get("optionalInbounds", {}) if pending_model else {}
@@ -1952,6 +2015,7 @@ state = {
         "privateKey": private_key,
         "publicKey": public_key,
         "shortId": short_id,
+        "guard": {"enabled": guard_enabled, "port": guard_port},
     },
     "native": {
         "name": local_name,
@@ -1981,6 +2045,8 @@ lines = [
     f"自动检测地址: {public_address}:{reality_port}",
     f"Reality dest: {reality_dest}",
     f"Reality serverNames: {', '.join(server_names)}",
+    f"Reality 防偷: {'开启' if guard_enabled else '关闭'}"
+    + (f"（127.0.0.1:{guard_port}，full: 精确匹配）" if guard_enabled else ""),
     f"YAML servername: {server_name}",
     f"Reality PrivateKey: {private_key}",
     f"Reality PublicKey/Password: {public_key}",
@@ -2327,8 +2393,24 @@ if len(reality_list)!=1: stop("必须且只能存在一个受管 VLESS-Reality �
 reality_inbound=reality_list[0]
 if set(reality_inbound)!={"port","protocol","settings","streamSettings"}: stop("VLESS-Reality 入站包含非脚本管理字段")
 settings=reality_inbound.get("settings",{}); stream=reality_inbound.get("streamSettings",{}); rs=stream.get("realitySettings",{})
-if set(settings)!={"clients","decryption"} or settings.get("decryption")!="none" or stream.get("network")!="tcp" or set(stream)!={"network","security","realitySettings"} or set(rs)!={"show","dest","xver","serverNames","privateKey","shortIds"} or rs.get("show") is not False or rs.get("xver")!=0: stop("VLESS-Reality 内容不是脚本生成结构")
+target_fields=set(rs)&{"target","dest"}
+if len(target_fields)!=1: stop("Reality 必须且只能包含 target 或 dest")
+target_field=next(iter(target_fields))
+if set(settings)!={"clients","decryption"} or settings.get("decryption")!="none" or stream.get("network")!="tcp" or set(stream)!={"network","security","realitySettings"} or set(rs)!={"show",target_field,"xver","serverNames","privateKey","shortIds"} or rs.get("show") is not False or rs.get("xver")!=0: stop("VLESS-Reality 内容不是脚本生成结构")
 if len(rs.get("shortIds",[]))!=1: stop("更新器只管理一个 Reality Short ID")
+guard_inbounds=[x for x in inbounds if x.get("tag")=="reality-guard-in"]
+if len(guard_inbounds)>1: stop("Reality 防偷辅助入站重复")
+guard_inbound=guard_inbounds[0] if guard_inbounds else None
+guard_enabled=guard_inbound is not None
+guard_port=None
+original_target=str(rs[target_field])
+if guard_enabled:
+    guard_port=int(guard_inbound.get("port",0)); gs=guard_inbound.get("settings",{})
+    expected_guard={"tag":"reality-guard-in","listen":"127.0.0.1","port":guard_port,"protocol":"dokodemo-door","settings":gs,"sniffing":{"enabled":True,"destOverride":["tls"],"routeOnly":True}}
+    if guard_inbound!=expected_guard or set(gs)!={"address","port","network"} or gs.get("network")!="tcp" or not 39000<=guard_port<=59999: stop("Reality 防偷辅助入站不是脚本管理结构")
+    if original_target!=f"127.0.0.1:{guard_port}": stop("Reality target 未指向防偷辅助入站")
+    host=str(gs.get("address","")); port=int(gs.get("port",0))
+    original_target=f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
 state_clients=state.get("clients"); state_proxies=state.get("proxies")
 if not isinstance(state_clients,list) or not isinstance(state_proxies,list): stop("state.json 缺少 clients/proxies")
 by_tag={}
@@ -2336,10 +2418,12 @@ for x in outbounds:
     tag=x.get("tag")
     if not isinstance(tag,str) or not tag or tag in by_tag: stop("出口 tag 缺失或重复")
     by_tag[tag]=x
-proxy_tags=sorted(set(by_tag)-{"direct"}) if adopt_live else [str(x.get("tag","")) for x in state_proxies]
+managed_special={"direct","reality-guard-block"} if guard_enabled else {"direct"}
+proxy_tags=sorted(set(by_tag)-managed_special) if adopt_live else [str(x.get("tag","")) for x in state_proxies]
 if not all(proxy_tags) or len(set(proxy_tags))!=len(proxy_tags): stop("state.json 的 ISP tag 无效")
-if set(by_tag)!={"direct",*proxy_tags}: stop("发现 state.json 未登记出口，或受管出口缺失")
+if set(by_tag)!={*managed_special,*proxy_tags}: stop("发现 state.json 未登记出口，或受管出口缺失")
 if by_tag["direct"]!={"protocol":"freedom","tag":"direct","settings":{"domainStrategy":"UseIPv4"}}: stop("direct 出口不是脚本管理结构")
+if guard_enabled and by_tag["reality-guard-block"]!={"protocol":"blackhole","tag":"reality-guard-block"}: stop("Reality 防偷 block 出口不是脚本管理结构")
 runtime=settings.get("clients")
 if not isinstance(runtime,list): stop("VLESS clients 格式错误")
 runtime_by_email={}
@@ -2439,7 +2523,7 @@ if version==3 and not adopt_live:
     if native_state!=expected_native: stop("v3 state.native 与 state.clients/live config 不一致")
 optional={}
 for inbound in inbounds:
-    if inbound is reality_inbound: continue
+    if inbound is reality_inbound or inbound is guard_inbound: continue
     tag=inbound.get("tag"); s=inbound.get("settings",{})
     if tag=="socks-in" and inbound.get("protocol")=="socks":
         users=s.get("users")
@@ -2450,6 +2534,11 @@ for inbound in inbounds:
         optional["shadowsocks"]={"listen":str(inbound.get("listen")),"port":int(inbound.get("port")),"method":str(s.get("method")),"password":str(s.get("password"))}
     else: stop("发现非脚本管理的额外入站")
 expected=[{"type":"field","user":[str(c["email"])],"outboundTag":str(c["outbound"])} for c in meta_by_outbound.values()]
+if guard_enabled:
+    expected[0:0]=[
+        {"type":"field","inboundTag":["reality-guard-in"],"domain":[f"full:{x}" for x in rs["serverNames"]],"outboundTag":"direct"},
+        {"type":"field","inboundTag":["reality-guard-in"],"outboundTag":"reality-guard-block"},
+    ]
 if "socks5" in optional: expected.append({"type":"field","inboundTag":["socks-in"],"outboundTag":"direct"})
 if "shadowsocks" in optional: expected.append({"type":"field","inboundTag":["shadowsocks-in"],"outboundTag":"direct"})
 norm=lambda x:json.dumps(x,ensure_ascii=False,sort_keys=True)
@@ -2458,11 +2547,13 @@ needs_dns=any((x.get("resolutionCheck") or {}).get("targetStrategy")=="UseIPv4" 
 expected_dns={"servers":["https+local://1.1.1.1/dns-query"],"queryStrategy":"UseIPv4"}
 if needs_dns and config.get("dns")!=expected_dns: stop("UseIPv4 出口需要的共享 DNS 已漂移")
 if not needs_dns and "dns" in config: stop("发现非脚本管理 DNS 配置")
-sr=state.get("reality",{}); live_reality={"port":int(reality_inbound["port"]),"dest":str(rs["dest"]),"serverNames":[str(x) for x in rs["serverNames"]],"privateKey":str(rs["privateKey"]),"publicKey":str(public_key_override if adopt_live else sr.get("publicKey","")),"shortId":str(rs["shortIds"][0])}
+sr=state.get("reality",{}); live_reality={"port":int(reality_inbound["port"]),"dest":original_target,"serverNames":[str(x) for x in rs["serverNames"]],"privateKey":str(rs["privateKey"]),"publicKey":str(public_key_override if adopt_live else sr.get("publicKey","")),"shortId":str(rs["shortIds"][0]),"guard":{"enabled":guard_enabled,"port":guard_port or int(sr.get("guard",{}).get("port",39000))}}
 if not live_reality["publicKey"]: stop("state.json 缺少 Reality publicKey")
 if not adopt_live:
     for field in ("port","dest","serverNames","shortId"):
         if sr.get(field)!=live_reality[field]: stop(f"Reality {field} 在 state 与 live config 间不一致")
+    state_guard=sr.get("guard",{"enabled":False,"port":39000})
+    if bool(state_guard.get("enabled",False))!=guard_enabled or (guard_enabled and int(state_guard.get("port",0))!=guard_port): stop("Reality 防偷状态在 state 与 live config 间不一致")
     if version==3 and sr.get("privateKey")!=live_reality["privateKey"]: stop("Reality privateKey 在 v3 state 与 live config 间不一致")
 names=[str(x.get("name","")) for x in model_proxies]
 if not all(names) or len(set(names))!=len(names): stop("ISP 名称为空或重复")
@@ -2539,6 +2630,9 @@ elif action=="rotate-uuid":
     else: model["proxies"][int(args[0])]["uuid"]=str(uuid.uuid4())
 elif action=="reality-key": model["reality"].update({"privateKey":args[0],"publicKey":args[1]})
 elif action=="short-id": model["reality"]["shortId"]=args[0]
+elif action=="reality-guard":
+    guard=model["reality"].setdefault("guard",{"enabled":True,"port":39000})
+    guard["enabled"]=args[0]=="1"
 else: raise SystemExit("未知模型操作")
 tmp=path.with_name(path.name+".new"); tmp.write_text(json.dumps(model,ensure_ascii=False,indent=2)+"\n"); os.chmod(tmp,0o600); os.replace(tmp,path)
 PY
@@ -2567,6 +2661,12 @@ if not re.fullmatch(r"[0-9a-fA-F]+",r["shortId"]) or len(r["shortId"])%2: raise 
 try: ports=[int(r.get("port"))]
 except Exception: raise SystemExit("Reality 端口无效")
 if not 1<=ports[0]<=65535: raise SystemExit("Reality 端口超出范围")
+guard=r.get("guard",{"enabled":True,"port":39000})
+if not isinstance(guard,dict) or not isinstance(guard.get("enabled"),bool): raise SystemExit("Reality 防偷状态无效")
+try: guard_port=int(guard.get("port",39000))
+except Exception: raise SystemExit("Reality 防偷端口无效")
+if not 39000<=guard_port<=59999: raise SystemExit("Reality 防偷端口必须在 39000-59999")
+if guard.get("enabled"): ports.append(guard_port)
 ids={k:[] for k in ("tag","email","uuid","id")}; names=[]
 for item in model.get("proxies",[]):
     names.append(item.get("name"))
@@ -2587,7 +2687,7 @@ for kind,item in model.get("optionalInbounds",{}).items():
     if not item.get("listen") or not item.get("password"): raise SystemExit(f"{kind} 监听地址或密码为空")
     if kind=="socks5" and not item.get("username"): raise SystemExit("SOCKS5 用户名为空")
     if kind=="shadowsocks" and not item.get("method"): raise SystemExit("Shadowsocks 加密方式为空")
-if len(ports)!=len(set(ports)): raise SystemExit("Reality、SOCKS5 和 Shadowsocks 端口不能重复")
+if len(ports)!=len(set(ports)): raise SystemExit("Reality、防偷辅助入站、SOCKS5 和 Shadowsocks 端口不能重复")
 PY
 }
 
@@ -2597,6 +2697,8 @@ import json,sys
 m=json.load(open(sys.argv[1])); r=m["reality"]; o=m["optionalInbounds"]
 print(f"节点：{m['nodeName']}  客户端地址：{m['publicAddress']}")
 print(f"Reality：{r['port']} -> {r['dest']}  serverNames={','.join(r['serverNames'])}")
+g=r.get('guard',{'enabled':True,'port':39000})
+print("Reality 防偷："+(f"开启（127.0.0.1:{g['port']}，full: 精确匹配）" if g.get('enabled') else "关闭"))
 print(f"ISP 出口：{len(m['proxies'])} 个")
 print("SOCKS5 入站："+(f"{o['socks5']['listen']}:{o['socks5']['port']}" if "socks5" in o else "关闭"))
 print("Shadowsocks 入站："+(f"{o['shadowsocks']['listen']}:{o['shadowsocks']['port']}" if "shadowsocks" in o else "关闭"))
@@ -2628,9 +2730,11 @@ update_node_info_menu() {
 }
 
 update_reality_menu() {
-  local choice current value normalized_value key_pair private_key public_key
+  local choice current value normalized_value key_pair private_key public_key guard_label
   while true; do
-    printf '\nReality 更新：\n  1) 端口：%s\n  2) target：%s\n  3) serverNames\n  4) 轮换密钥对\n  5) 轮换 Short ID\n  0) 返回\n' "$(pending_model_query reality.port)" "$(pending_model_query reality.dest)"
+    current="$(pending_model_query reality.guard.enabled 2>/dev/null || printf 1)"
+    [[ "${current}" == 1 ]] && guard_label="开启" || guard_label="关闭"
+    printf '\nReality 更新：\n  1) 端口：%s\n  2) target：%s\n  3) serverNames\n  4) 轮换密钥对\n  5) 轮换 Short ID\n  6) 切换 Reality 防偷（当前：%s）\n  0) 返回\n' "$(pending_model_query reality.port)" "$(pending_model_query reality.dest)" "${guard_label}"
     read -r -p "请选择 [0]: " choice
     case "${choice:-0}" in
       1) current="$(pending_model_query reality.port)"; while true; do value="$(prompt_default "新 Reality 端口" "${current}")"; validate_port "${value}" && break; warn "端口必须在 1-65535 之间。"; done; [[ "${value}" == "${current}" ]] || pending_model_mutate set reality.port "${value}";;
@@ -2642,6 +2746,7 @@ PY
 )"; value="$(prompt_default "新 serverNames（逗号分隔）" "${current}")"; [[ "${value}" == "${current}" ]] || pending_model_mutate set reality.serverNames "${value}";;
       4) prompt_yes_no "轮换密钥会要求所有客户端更新，确认继续" "0" || continue; [[ "${DEMO_MODE}" == 1 ]] && { warn "预览模式不生成真实 Reality 密钥。"; continue; }; key_pair="$(generate_reality_keys)"; private_key="${key_pair%%$'\t'*}"; public_key="${key_pair#*$'\t'}"; pending_model_mutate reality-key "${private_key}" "${public_key}";;
       5) prompt_yes_no "轮换 Short ID 会要求所有客户端更新，确认继续" "0" || continue; pending_model_mutate short-id "$(openssl rand -hex 8)";;
+      6) current="$(pending_model_query reality.guard.enabled 2>/dev/null || printf 1)"; [[ "${current}" == 1 ]] && pending_model_mutate reality-guard 0 || pending_model_mutate reality-guard 1;;
       0) return 0;; *) warn "未知选项。";;
     esac
   done

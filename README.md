@@ -200,6 +200,8 @@ SSH 公钥写入和 SSH 加固已经移到一级菜单的“SSH 密钥与加固�
 - 客户端连接地址填写 VPS 公网 IP 或已经解析到该 VPS 的域名
 - Reality target 填写裸域名或裸 IP 时会自动补全 `:443`；已经填写合法端口则保持不变
 - Reality `serverNames` 支持多个域名，用英文逗号分隔
+- 默认开启 Reality 防偷：未鉴权 fallback 先进入仅监听 `127.0.0.1` 的 TLS SNI 检查入站，仅 `full:` 精确命中 `serverNames` 时才访问原 target；可在 Reality 更新菜单中关闭或重新开启
+- 防偷辅助端口稳定保存在状态中，默认从 `39000-59999` 选择且避开其他受管入站；更新器兼容 Xray 的 `target` 和旧版 `dest`
 - UUID、Reality 密钥和 Short ID 会自动生成
 - 配置写入前会显示完整 JSON 供审核
 
