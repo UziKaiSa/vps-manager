@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.9.5-test"
+SCRIPT_VERSION="0.9.6-test"
 SCRIPT_NAME="VPS Manager"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh"
 
@@ -20,6 +20,8 @@ KOMARI_WARP_LEGACY_URL="https://downloads.cloudflareclient.com/v1/download/bookw
 KOMARI_WARP_LEGACY_SHA256="049ad669140ac0f428a980ebd8b4bca7949307076d7cf51f6e5668c239d6ad87"
 KOMARI_WARP_LEGACY_ARM64_URL="https://downloads.cloudflareclient.com/v1/download/bookworm-arm/version/2026.1.150.0"
 KOMARI_WARP_LEGACY_ARM64_SHA256="4a1854dd5dae9cbbb88113297898aecd857e2b16d066238b7207212fc6435222"
+KOMARI_WARP_LEGACY_JAMMY_URL="https://downloads.cloudflareclient.com/v1/download/jammy-intel/version/2026.1.150.0"
+KOMARI_WARP_LEGACY_JAMMY_SHA256="4d54b54880c7c0eebbed8165ce876b43693884ef636b1517136645445a8681a"
 KOMARI_WARP_LEGACY_NOBLE_URL="https://downloads.cloudflareclient.com/v1/download/noble-intel/version/2026.1.150.0"
 KOMARI_WARP_LEGACY_NOBLE_SHA256="2e388e4746e2cb1918227f84da38786de3dded883feaa3ad4fb5be10a70bc30a"
 KOMARI_WARP_LEGACY_BULLSEYE_URL="https://downloads.cloudflareclient.com/v1/download/bullseye-intel/version/2026.1.150.0"
@@ -3911,7 +3913,7 @@ komari_check_warp_disk() {
     printf 'Cloudflare WARP 当前会强制安装 WebKit/GTK 等大型依赖。\n'
     printf '脚本要求：根分区至少 %s MiB、可用空间至少 %s MiB；建议扩容到 4 GiB 以上。\n' \
       "${KOMARI_WARP_MIN_ROOT_MIB}" "${KOMARI_WARP_MIN_FREE_MIB}"
-    printf '如果是 Debian 11/12 或 Ubuntu 24.04 amd64 且至少还有 400 MiB 可用空间，脚本可以改装对应发行版的 Cloudflare 官方旧版轻量客户端并锁定版本。\n'
+    printf '如果是 Debian 11/12 或 Ubuntu 22.04/24.04/26.04 amd64 且至少还有 400 MiB 可用空间，脚本可以改装对应发行版的 Cloudflare 官方旧版轻量客户端并锁定版本。\n'
     return 1
   fi
 }
@@ -3927,8 +3929,8 @@ komari_install_warp_legacy() {
   arch="$(dpkg --print-architecture)"
   if [[ "${arch}" != "amd64" ]] \
     || ! { [[ "${os_id}" == "debian" && "${codename}" =~ ^(bullseye|bookworm)$ ]] \
-      || [[ "${os_id}" == "ubuntu" && "${os_version}" =~ ^(24|26)\.04$ ]]; }; then
-    warn "官方轻量旧版自动安装目前只支持 Debian 11/12 或 Ubuntu 24.04/26.04 amd64；当前为 ${os_id:-unknown} ${os_version:-unknown} ${codename:-unknown} ${arch}."
+      || [[ "${os_id}" == "ubuntu" && "${os_version}" =~ ^(22|24|26)\.04$ ]]; }; then
+    warn "官方轻量旧版自动安装目前只支持 Debian 11/12 或 Ubuntu 22.04/24.04/26.04 amd64；当前为 ${os_id:-unknown} ${os_version:-unknown} ${codename:-unknown} ${arch}."
     return 1
   fi
 
@@ -3940,6 +3942,10 @@ komari_install_warp_legacy() {
     bookworm)
       package_url="${KOMARI_WARP_LEGACY_URL}"
       package_sha256="${KOMARI_WARP_LEGACY_SHA256}"
+      ;;
+    jammy)
+      package_url="${KOMARI_WARP_LEGACY_JAMMY_URL}"
+      package_sha256="${KOMARI_WARP_LEGACY_JAMMY_SHA256}"
       ;;
     noble|resolute)
       package_url="${KOMARI_WARP_LEGACY_NOBLE_URL}"
@@ -4017,7 +4023,7 @@ komari_install_warp_client() {
   arch="$(dpkg --print-architecture)"
   if [[ "${arch}" == "amd64" ]] \
     && { [[ "${os_id}" == "debian" && "${codename}" =~ ^(bullseye|bookworm)$ ]] \
-      || [[ "${os_id}" == "ubuntu" && "${os_version}" =~ ^(24|26)\.04$ ]]; }; then
+      || [[ "${os_id}" == "ubuntu" && "${os_version}" =~ ^(22|24|26)\.04$ ]]; }; then
     komari_install_warp_legacy
     return $?
   fi
