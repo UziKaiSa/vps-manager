@@ -294,6 +294,8 @@ ss://BASE64(加密方式:密码)@IP或域名:端口
 
 “添加公钥”只校验并写入 `~/.ssh/authorized_keys`，会避免重复添加相同密钥；它不会修改 SSH 端口，也不会关闭密码登录。已有文件在变更前会保存到 `/var/backups/vps-manager/`。
 
+菜单 3 和菜单 4 完成后都会检查 SSH 的重启持久性：写入 `/etc/tmpfiles.d/vps-manager-sshd.conf`，确保每次启动都创建临时目录 `/run/sshd`；随后执行 `sshd -t`，确认 `ssh.service`/`sshd.service` 已启用且正在运行，并显示生效监听端口。由 `ssh.socket` 切换到高位端口服务模式时，脚本会同时启用对应 service，避免当前会话正常但重启后 SSH 断链。
+
 脚本只会显示客户端生成密钥的命令、读取你粘贴的公钥，不会在 VPS 上生成、保存或显示客户端私钥。
 
 ### SSH 加固注意事项

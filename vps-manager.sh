@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.9.6-test"
+SCRIPT_VERSION="0.9.7-test"
 SCRIPT_NAME="VPS Manager"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh"
 
@@ -39,6 +39,7 @@ INIT_SYSTEM=""
 SSHD_MAIN_CONFIG="/etc/ssh/sshd_config"
 SSHD_DROPIN_DIR="/etc/ssh/sshd_config.d"
 SSHD_MANAGED_CONFIG="${SSHD_DROPIN_DIR}/00-vps-manager-hardening.conf"
+SSHD_TMPFILES_CONFIG="/etc/tmpfiles.d/vps-manager-sshd.conf"
 SSH_SOCKET_TRANSITIONED=0
 SSH_SOCKET_WAS_ENABLED=0
 SSH_SOCKET_WAS_ACTIVE=0
@@ -576,6 +577,38 @@ ssh_service_name() {
 }
 
 
+ensure_ssh_service_persistent() {
+  local ssh_service="$1"
+  local effective_ports
+
+  install -d -o root -g root -m 0755 /etc/tmpfiles.d \
+    || { warn "无法创建 systemd-tmpfiles 配置目录。"; return 1; }
+  printf 'd /run/sshd 0755 root root -\n' > "${SSHD_TMPFILES_CONFIG}" \
+    || { warn "无法写入 SSH 运行目录持久化规则。"; return 1; }
+  chmod 0644 "${SSHD_TMPFILES_CONFIG}" \
+    || { warn "无法设置 SSH tmpfiles 规则权限。"; return 1; }
+  systemd-tmpfiles --create "${SSHD_TMPFILES_CONFIG}" \
+    || { warn "无法通过 systemd-tmpfiles 创建 /run/sshd。"; return 1; }
+  [[ -d /run/sshd ]] \
+    || { warn "SSH 运行目录 /run/sshd 仍不存在。"; return 1; }
+  /usr/sbin/sshd -t \
+    || { warn "SSH 配置语法检查失败，未启动服务。"; return 1; }
+  systemctl enable "${ssh_service}" >/dev/null \
+    || { warn "无法设置 ${ssh_service} 开机启动。"; return 1; }
+  systemctl start "${ssh_service}" \
+    || { warn "无法启动 ${ssh_service}。"; return 1; }
+  systemctl is-enabled --quiet "${ssh_service}" \
+    || { warn "${ssh_service} 未保持开机启用状态。"; return 1; }
+  systemctl is-active --quiet "${ssh_service}" \
+    || { warn "${ssh_service} 当前未运行。"; return 1; }
+  effective_ports="$(/usr/sbin/sshd -T 2>/dev/null | awk '$1 == "port" {print $2}' | paste -sd, -)"
+  [[ -n "${effective_ports}" ]] \
+    || { warn "无法读取 SSH 生效端口。"; return 1; }
+  printf 'SSH 重启持久性检查通过：%s 已启用并运行；监听端口配置：%s\n' \
+    "${ssh_service}" "${effective_ports}"
+}
+
+
 
 switch_ssh_socket_to_service() {
   local ssh_service="$1"
@@ -597,7 +630,7 @@ switch_ssh_socket_to_service() {
     && systemctl stop "${ssh_service}" \
     && systemctl stop ssh.socket \
     && systemctl daemon-reload \
-    && systemctl start "${ssh_service}"
+    && ensure_ssh_service_persistent "${ssh_service}"
 }
 
 
@@ -996,6 +1029,14 @@ EOF
       "${admin_user}" "${admin_group}" "${ssh_service}" "${port_config_backup_dir}"
     die "SSH reload 失败，已恢复。"
   fi
+  fi
+
+  if ! ensure_ssh_service_persistent "${ssh_service}"; then
+    rollback_ssh_hardening \
+      "${config_existed}" "${config_before}" \
+      "${authorized_existed}" "${authorized_before}" "${authorized_keys}" \
+      "${admin_user}" "${admin_group}" "${ssh_service}" "${port_config_backup_dir}"
+    die "SSH 当前可用但重启持久性检查失败，已恢复原配置。"
   fi
 
   if ! wait_for_port_listening "${ssh_port}" 10; then
@@ -3177,9 +3218,10 @@ show_connection_info() {
 
 add_ssh_public_key() {
   local admin_user admin_home admin_group authorized_keys public_key key_file key_type key_blob
-  local fingerprint candidate staged="" backup_dir=""
+  local fingerprint candidate staged="" backup_dir="" ssh_service
 
   require_root
+  check_supported_os
   admin_user="$(default_ssh_admin_user)"
   id "${admin_user}" >/dev/null 2>&1 \
     || { warn "无法识别当前管理用户：${admin_user}"; return 1; }
@@ -3226,6 +3268,9 @@ add_ssh_public_key() {
   if [[ -f "${authorized_keys}" ]] \
     && awk -v blob="${key_blob}" '$2 == blob { found=1 } END { exit !found }' "${authorized_keys}"; then
     printf '该公钥已存在，无需重复写入。\n'
+    ssh_service="$(ssh_service_name)" \
+      || { warn "未找到 SSH systemd 服务。"; return 1; }
+    ensure_ssh_service_persistent "${ssh_service}"
     return 0
   fi
   prompt_yes_no "确认把该公钥添加到 ${admin_user} 的 authorized_keys" "0" \
@@ -3259,6 +3304,10 @@ add_ssh_public_key() {
 
   log "公钥已添加到 ${authorized_keys}"
   [[ -n "${backup_dir}" ]] && printf '原文件备份：%s\n' "${backup_dir}"
+  ssh_service="$(ssh_service_name)" \
+    || { warn "公钥已写入，但未找到 SSH systemd 服务。"; return 1; }
+  ensure_ssh_service_persistent "${ssh_service}" \
+    || { warn "公钥已写入，但 SSH 重启持久性检查失败；请保持当前会话并立即检查。"; return 1; }
 }
 
 generate_local_ssh_key() {
