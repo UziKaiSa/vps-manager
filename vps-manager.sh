@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.9.8-test"
+SCRIPT_VERSION="0.9.9-test"
 SCRIPT_NAME="VPS Manager"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh"
 
@@ -32,6 +32,8 @@ WARP_GUARD_PATH="/usr/local/sbin/vps-manager-warp-guard"
 WARP_RSS_MAX_KIB=163840
 ALPINE_WARP_LOG_MAX_BYTES=8388608
 ALPINE_WARP_LOG_TAIL_BYTES=2097152
+APT_LOCK_WAIT_SECONDS=600
+APT_LOCK_REPORT_SECONDS=15
 
 OS_ID=""
 INIT_SYSTEM=""
@@ -326,6 +328,7 @@ repair_debian_bullseye_apt_sources() {
 
 apt_update_safe() {
   local update_log
+  wait_for_apt_locks "${APT_LOCK_WAIT_SECONDS}" || return 1
   update_log="$(mktemp /tmp/vps-manager-apt-update.XXXXXX.log)"
 
   if apt-get update 2>&1 | tee "${update_log}"; then
@@ -351,6 +354,50 @@ apt_update_safe() {
   rm -f -- "${update_log}"
   apt-get clean
   apt-get update
+}
+
+
+apt_lock_holders() {
+  local lock pid
+  local -a locks=(
+    /var/lib/dpkg/lock-frontend
+    /var/lib/dpkg/lock
+    /var/lib/apt/lists/lock
+    /var/cache/apt/archives/lock
+  )
+  for lock in "${locks[@]}"; do
+    [[ -e "${lock}" ]] || continue
+    while IFS= read -r pid; do
+      [[ "${pid}" =~ ^[0-9]+$ && "${pid}" != "$$" ]] || continue
+      printf '%s\n' "${pid}"
+    done < <(fuser "${lock}" 2>/dev/null | tr ' ' '\n')
+  done | sort -nu
+}
+
+
+wait_for_apt_locks() {
+  local timeout="${1:-${APT_LOCK_WAIT_SECONDS}}"
+  local elapsed=0
+  local holders details
+  command -v fuser >/dev/null 2>&1 \
+    || { warn "缺少 fuser，无法安全识别 APT/dpkg 锁持有者。"; return 1; }
+  while true; do
+    holders="$(apt_lock_holders)"
+    [[ -n "${holders}" ]] || return 0
+    details="$(ps -o pid=,stat=,etime=,comm= -p "$(printf '%s\n' "${holders}" | paste -sd, -)" 2>/dev/null \
+      | sed 's/^[[:space:]]*//' | paste -sd';' -)"
+    if (( elapsed >= timeout )); then
+      warn "等待 APT/dpkg 锁超时（${timeout} 秒）。持有进程：${details:-${holders//$'\n'/,}}"
+      warn "未删除锁文件、未终止系统更新；请稍后重新运行。"
+      return 1
+    fi
+    if (( elapsed % APT_LOCK_REPORT_SECONDS == 0 )); then
+      printf 'APT/dpkg 正由系统更新占用，安全等待中（%s/%s 秒）：%s\n' \
+        "${elapsed}" "${timeout}" "${details:-${holders//$'\n'/,}}"
+    fi
+    sleep 5
+    elapsed=$((elapsed + 5))
+  done
 }
 
 
@@ -3738,7 +3785,7 @@ komari_agent_arch() {
 
 
 komari_local_agent_candidate() {
-  local home="$1" arch candidate=""
+  local home="$1" arch candidate="" versioned=""
   arch="$(komari_agent_arch)" || return 1
   if [[ -n "${KOMARI_LOCAL_AGENT:-}" ]]; then
     candidate="${KOMARI_LOCAL_AGENT}"
@@ -3746,6 +3793,14 @@ komari_local_agent_candidate() {
     candidate="${home}/komari-agent-linux-${arch}"
   elif [[ "${home}" != /root && -f "/root/komari-agent-linux-${arch}" ]]; then
     candidate="/root/komari-agent-linux-${arch}"
+  else
+    versioned="$(find "${home}" -maxdepth 1 -type f -name "komari-agent-linux-${arch}-v*" -print 2>/dev/null \
+      | sort -V | tail -n 1)"
+    if [[ -z "${versioned}" && "${home}" != /root ]]; then
+      versioned="$(find /root -maxdepth 1 -type f -name "komari-agent-linux-${arch}-v*" -print 2>/dev/null \
+        | sort -V | tail -n 1)"
+    fi
+    candidate="${versioned}"
   fi
   [[ -n "${candidate}" && -f "${candidate}" && ! -L "${candidate}" && -s "${candidate}" ]] || return 1
   printf '%s' "${candidate}"
@@ -3915,8 +3970,23 @@ komari_install_agent() {
     return $?
   fi
   ensure_work_dir; installer="${WORK_DIR}/install-komari-agent.sh"
-  curl -fL --retry 3 --connect-timeout 10 -o "${installer}" "${KOMARI_INSTALL_URL}"
-  chmod 700 "${installer}"; bash -n "${installer}"
+  if ! curl -fL --retry 3 --connect-timeout 10 -o "${installer}" "${KOMARI_INSTALL_URL}"; then
+    warn "Komari 官方安装器下载失败。"
+    local_agent="$(komari_local_agent_candidate "${home}" || true)"
+    if [[ -n "${local_agent}" ]] && prompt_yes_no "是否使用本机兜底 Agent：$(basename "${local_agent}")" 1; then
+      if [[ "${detect_ip}" == 1 ]]; then
+        public_ip="$(curl -4 -fsS --max-time 10 https://api.ipify.org 2>/dev/null || true)"
+        [[ -n "${public_ip}" ]] || warn "公网 IPv4 探测失败。"
+      fi
+      komari_install_local_agent "${local_agent}" "${endpoint}" "${token}" "${install_dir}" "${day}" \
+        "${disable_ssh}" "${gpu}" "${public_ip:-}"
+      return $?
+    fi
+    warn "未使用本地兜底 Agent，本次安装已停止。"
+    return 1
+  fi
+  chmod 700 "${installer}"
+  bash -n "${installer}" || { warn "Komari 官方安装器语法校验失败。"; return 1; }
   checksum="$(sha256sum "${installer}" | awk '{print $1}')"; log "Komari 官方安装器 SHA-256: ${checksum}"
   args=(-e "${endpoint}" -t "${token}" --install-dir "${install_dir}" --month-rotate "${day}")
   [[ "${disable_ssh}" == 1 ]] && args+=(--disable-web-ssh)
@@ -3925,7 +3995,17 @@ komari_install_agent() {
     public_ip="$(curl -4 -fsS --max-time 10 https://api.ipify.org 2>/dev/null || true)"
     [[ -n "${public_ip}" ]] && args+=(--custom-ipv4 "${public_ip}") || warn "公网 IPv4 探测失败。"
   fi
-  bash "${installer}" "${args[@]}"
+  if ! bash "${installer}" "${args[@]}"; then
+    warn "Komari 官方安装流程失败，通常是 GitHub Release 文件链路不可用。"
+    local_agent="$(komari_local_agent_candidate "${home}" || true)"
+    if [[ -n "${local_agent}" ]] && prompt_yes_no "是否改用本机兜底 Agent：$(basename "${local_agent}")" 1; then
+      komari_install_local_agent "${local_agent}" "${endpoint}" "${token}" "${install_dir}" "${day}" \
+        "${disable_ssh}" "${gpu}" "${public_ip:-}"
+      return $?
+    fi
+    warn "未使用本地兜底 Agent，本次安装已停止。"
+    return 1
+  fi
   service_status_text komari-agent | sed -n '1,60p' || true
 }
 
@@ -4037,14 +4117,22 @@ komari_install_warp_legacy() {
   fi
 
   export DEBIAN_FRONTEND=noninteractive
-  apt_update_safe
-  apt-get install -y curl ca-certificates gnupg2 iproute2 nftables libcap2-bin
+  apt_update_safe || { warn "APT 索引更新失败，已停止 WARP 安装。"; return 1; }
+  wait_for_apt_locks "${APT_LOCK_WAIT_SECONDS}" \
+    || { warn "APT/dpkg 仍被占用，已停止 WARP 安装。"; return 1; }
+  apt-get -o DPkg::Lock::Timeout="${APT_LOCK_WAIT_SECONDS}" install -y \
+    curl ca-certificates gnupg2 iproute2 nftables libcap2-bin \
+    || { warn "WARP 依赖安装失败，已停止。"; return 1; }
   ensure_work_dir
   package_file="${WORK_DIR}/cloudflare-warp_${KOMARI_WARP_LEGACY_VERSION}_amd64.deb"
   curl -fL --retry 2 --connect-timeout 10 --max-time 180 \
     -o "${package_file}" "${package_url}"
   printf '%s  %s\n' "${package_sha256}" "${package_file}" | sha256sum -c -
-  apt-get install -y --allow-downgrades "${package_file}"
+  wait_for_apt_locks "${APT_LOCK_WAIT_SECONDS}" \
+    || { warn "APT/dpkg 仍被占用，已停止 WARP 安装。"; return 1; }
+  apt-get -o DPkg::Lock::Timeout="${APT_LOCK_WAIT_SECONDS}" install -y \
+    --allow-downgrades "${package_file}" \
+    || { warn "WARP 安装包写入失败，已停止。"; return 1; }
 
   installed_version="$(dpkg-query -W -f='${Version}' cloudflare-warp 2>/dev/null || true)"
   [[ "${installed_version}" == "${KOMARI_WARP_LEGACY_VERSION}" ]] \

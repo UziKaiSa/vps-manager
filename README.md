@@ -399,6 +399,8 @@ Debian 11、Debian 12、Ubuntu 22.04、Ubuntu 24.04 和 Ubuntu 26.04 amd64 默�
 
 脚本会校验官方安装包的 SHA-256；降级前备份现有 `mdm.xml`，安装时使用 `--allow-downgrades`，完成后执行 `apt-mark hold cloudflare-warp`，防止系统升级时重新拉入带 WebKit/GTK 的大型新版。锁定期间不会获得新版功能和安全修复；如需恢复新版，应手动解除锁定并升级：
 
+如果 Ubuntu/Debian 的 `unattended-upgrade`、`apt-daily` 或其他合法软件包事务正在持有 APT/dpkg 锁，脚本会保留锁和系统更新进程，最多等待 10 分钟并定期显示持有者。等待超时或 APT 更新失败时，本次 WARP 安装会立即停止，不会继续下载后再次撞锁，也不会建议删除锁文件。
+
 ```bash
 apt-mark unhold cloudflare-warp
 apt update
@@ -434,7 +436,7 @@ sudo chmod 600 /root/warp-token.env
 - 是否启用 GPU 监控
 - 是否记录公网 IPv4
 
-安装 Agent 时会先检测环境变量 `KOMARI_LOCAL_AGENT` 指向的文件，或者目标用户家目录下与当前架构匹配的 `komari-agent-linux-amd64` / `komari-agent-linux-arm64`。检测到非空的普通文件后，脚本会显示路径并默认询问是否优先使用；确认后会计算 SHA-256、执行 `--help` 校验、安装到 Agent 目录，并跳过 GitHub Release 下载。
+安装 Agent 时会先检测环境变量 `KOMARI_LOCAL_AGENT` 指向的文件，或者目标用户家目录下与当前架构匹配的 `komari-agent-linux-amd64` / `komari-agent-linux-arm64`，也支持带版本号的文件名（例如 `komari-agent-linux-amd64-v1.2.60`，存在多个版本时选择版本号最高的文件）。检测到非空的普通文件后，脚本会显示路径并默认询问是否优先使用；确认后会计算 SHA-256、执行 `--help` 校验、安装到 Agent 目录，并跳过 GitHub Release 下载。如果用户先尝试官方安装，而 GitHub Release 下载链路随后失败，脚本会再次检测本地文件并询问是否改用该兜底版本。
 
 本地安装路径会生成权限为 `700` 的启动包装器保存 Agent 参数，避免 Client Token 出现在 systemd/OpenRC service 文件中。私网 Endpoint 会让 `komari-agent` 显式依赖 `warp-svc`，保证重启时先建立私网；如果 WARP没有正确安装，Agent服务也不会伪装成成功启动。已有 Agent、启动包装器和服务文件会先保存到 `/var/backups/vps-manager/`。
 
