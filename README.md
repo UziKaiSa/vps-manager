@@ -420,7 +420,7 @@ sudo chmod 600 /root/warp-token.env
 
 脚本会安装 Cloudflare 官方 WARP 客户端、写入 MDM、连接 WARP、检查 Komari 私网地址，然后询问是否继续安装 Agent。
 
-如果缺少 `nf_tables` 内核支持，脚本会询问是否安装新内核，但不会自动重启服务器。
+脚本以 `nft list ruleset` 的实际结果判断 nftables 能力，不会因为 LXC 容器内无法执行 `modprobe` 而误判。容器共享宿主机内核：如果 nftables 不可用，脚本会提示联系服务商开放 nftables/NET_ADMIN 和 `/dev/net/tun`，不会在容器内反复安装无效的 `linux-image`。只有非容器系统在加载 `nf_tables` 后仍不可用时，才会询问是否安装新内核，并且不会自动重启服务器。
 
 ### 普通公网模式
 

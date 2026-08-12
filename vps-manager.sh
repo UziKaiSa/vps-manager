@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.9.7-test"
+SCRIPT_VERSION="0.9.8-test"
 SCRIPT_NAME="VPS Manager"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh"
 
@@ -4378,14 +4378,32 @@ EOF
 
 
 komari_check_kernel() {
-  if is_alpine; then
-    if nft list ruleset >/dev/null 2>&1; then log "Alpine nftables 接口可用"; return 0; fi
-    warn "当前容器没有可用的 nftables 内核接口，WARP 可能无法连接；这需要服务商在宿主机开放。"
+  local virtualization=""
+
+  if nft list ruleset >/dev/null 2>&1; then
+    log "nftables 接口可用"
+    return 0
+  fi
+
+  virtualization="$(systemd-detect-virt --container 2>/dev/null || true)"
+  if is_alpine || [[ -n "${virtualization}" && "${virtualization}" != "none" ]]; then
+    warn "当前 ${virtualization:-Alpine} 容器没有可用的 nftables 接口；容器共享宿主机内核，安装 linux-image 或重启容器不会修复。"
+    warn "请联系服务商在宿主机开放 nftables/NET_ADMIN 权限和 /dev/net/tun。"
     return 1
   fi
-  if modprobe nf_tables >/dev/null 2>&1 && nft list ruleset >/dev/null 2>&1; then log "nftables 内核支持正常"; return 0; fi
+
+  if modprobe nf_tables >/dev/null 2>&1 \
+    && nft list ruleset >/dev/null 2>&1; then
+    log "已加载 nf_tables，nftables 接口可用"
+    return 0
+  fi
   warn "当前内核缺少 nftables 支持，WARP 可能无法连接。"
-  if prompt_yes_no "安装 linux-image-amd64 新内核（之后需手动重启）" 0; then apt_update_safe; apt-get install -y --no-install-recommends linux-image-amd64; warn "请重启后重新执行 WARP 配置。"; return 1; fi
+  if prompt_yes_no "安装 linux-image-amd64 新内核（之后需手动重启）" 0; then
+    apt_update_safe
+    apt-get install -y --no-install-recommends linux-image-amd64
+    warn "请重启后重新执行 WARP 配置。"
+  fi
+  return 1
 }
 
 
