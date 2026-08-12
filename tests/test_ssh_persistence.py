@@ -18,6 +18,22 @@ require(
     "managed sshd tmpfiles rule is missing",
 )
 require(
+    'SSHD_MANAGED_CONFIG="${SSHD_DROPIN_DIR}/00-00-vps-manager-hardening.conf"',
+    "managed SSH drop-in must sort before provider 00-* overrides",
+)
+require(
+    'SSHD_LEGACY_MANAGED_CONFIG="${SSHD_DROPIN_DIR}/00-vps-manager-hardening.conf"',
+    "legacy managed SSH drop-in path must remain identifiable for migration",
+)
+require(
+    'rm -f -- "${SSHD_LEGACY_MANAGED_CONFIG}"',
+    "legacy managed SSH drop-in must be removed after effective validation",
+)
+require(
+    "passwordauthentication=${effective_password:-未知}",
+    "SSH effective-config failure must report the mismatched authentication values",
+)
+require(
     "printf 'd /run/sshd 0755 root root -\\n' > \"${SSHD_TMPFILES_CONFIG}\"",
     "/run/sshd is not persisted through systemd-tmpfiles",
 )

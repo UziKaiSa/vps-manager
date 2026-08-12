@@ -43,7 +43,8 @@ INIT_SYSTEM=""
 
 SSHD_MAIN_CONFIG="/etc/ssh/sshd_config"
 SSHD_DROPIN_DIR="/etc/ssh/sshd_config.d"
-SSHD_MANAGED_CONFIG="${SSHD_DROPIN_DIR}/00-vps-manager-hardening.conf"
+SSHD_MANAGED_CONFIG="${SSHD_DROPIN_DIR}/00-00-vps-manager-hardening.conf"
+SSHD_LEGACY_MANAGED_CONFIG="${SSHD_DROPIN_DIR}/00-vps-manager-hardening.conf"
 SSHD_TMPFILES_CONFIG="/etc/tmpfiles.d/vps-manager-sshd.conf"
 SSH_SOCKET_TRANSITIONED=0
 SSH_SOCKET_WAS_ENABLED=0
@@ -1059,8 +1060,14 @@ EOF
       "${config_existed}" "${config_before}" \
       "${authorized_existed}" "${authorized_before}" "${authorized_keys}" \
       "${admin_user}" "${admin_group}" "${ssh_service}" "${port_config_backup_dir}"
-    die "SSH 生效配置与预期不一致，已恢复。有效端口：${effective_ports:-未知}"
+    die "SSH 生效配置与预期不一致，已恢复。实际值：port=${effective_ports:-未知}, passwordauthentication=${effective_password:-未知}, kbdinteractiveauthentication=${effective_kbd:-未知}, pubkeyauthentication=${effective_pubkey:-未知}, authenticationmethods=${effective_methods:-未知}"
   fi
+
+  # The old managed file sorts after some provider 00-* overrides.  Keep it
+  # through validation so rollback can restore it, then remove it only after
+  # the new first-loaded configuration has been proven effective.
+  [[ "${SSHD_LEGACY_MANAGED_CONFIG}" == "${SSHD_MANAGED_CONFIG}" ]] \
+    || rm -f -- "${SSHD_LEGACY_MANAGED_CONFIG}"
 
   if ! switch_ssh_socket_to_service "${ssh_service}"; then
     rollback_ssh_hardening \
