@@ -436,7 +436,9 @@ sudo chmod 600 /root/warp-token.env
 - 是否启用 GPU 监控
 - 是否记录公网 IPv4
 
-安装 Agent 时会先检测环境变量 `KOMARI_LOCAL_AGENT` 指向的文件，或者目标用户家目录下与当前架构匹配的 `komari-agent-linux-amd64` / `komari-agent-linux-arm64`，也支持带版本号的文件名（例如 `komari-agent-linux-amd64-v1.2.60`，存在多个版本时选择版本号最高的文件）。检测到非空的普通文件后，脚本会显示路径并默认询问是否优先使用；确认后会计算 SHA-256、执行 `--help` 校验、安装到 Agent 目录，并跳过 GitHub Release 下载。如果用户先尝试官方安装，而 GitHub Release 下载链路随后失败，脚本会再次检测本地文件并询问是否改用该兜底版本。
+安装 Agent 时会先检测环境变量 `KOMARI_LOCAL_AGENT` 指向的文件，或者目标用户家目录下与当前架构匹配的 `komari-agent-linux-amd64` / `komari-agent-linux-arm64`，也支持带版本号的文件名（例如 `komari-agent-linux-amd64-v1.2.60`，存在多个版本时选择版本号最高的文件）。检测到非空的普通文件后，脚本会显示路径并默认询问是否优先使用；确认后会计算 SHA-256、执行 `--help` 校验、安装到 Agent 目录，并跳过 GitHub Release 下载。
+
+仓库的 `assets/` 目录同时保存经过 SHA-256 固定校验的 amd64 兜底 Agent。若 Komari 官方安装器或其 GitHub Release 下载链路失败，且目标机上没有手动上传的 Agent，脚本会询问是否从 VPS Manager 仓库下载固定版本；确认后只有哈希完全匹配才会执行。
 
 本地安装路径会生成权限为 `700` 的启动包装器保存 Agent 参数，避免 Client Token 出现在 systemd/OpenRC service 文件中。私网 Endpoint 会让 `komari-agent` 显式依赖 `warp-svc`，保证重启时先建立私网；如果 WARP没有正确安装，Agent服务也不会伪装成成功启动。已有 Agent、启动包装器和服务文件会先保存到 `/var/backups/vps-manager/`。
 

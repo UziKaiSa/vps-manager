@@ -9,6 +9,9 @@ XRAY_BIN="/usr/local/bin/xray"
 XRAY_CONFIG="/usr/local/etc/xray/config.json"
 XRAY_INSTALL_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
 KOMARI_INSTALL_URL="https://raw.githubusercontent.com/komari-monitor/komari-agent/refs/heads/main/install.sh"
+KOMARI_FALLBACK_VERSION="1.2.60"
+KOMARI_FALLBACK_AMD64_SHA256="113af112a914b918f315fa6cd3a98e8c0f932900f776c4c412b2a79477180859"
+KOMARI_FALLBACK_BASE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/assets"
 KOMARI_DEFAULT_TEAM="your-team-name"
 KOMARI_DEFAULT_PRIVATE_URL="http://komari.example.internal:8080"
 KOMARI_TOKEN_ENV_FILE="/root/warp-token.env"
@@ -3931,6 +3934,53 @@ EOF
 }
 
 
+komari_download_repo_fallback() {
+  local arch filename url checksum target
+  KOMARI_REPO_FALLBACK_PATH=""
+  arch="$(komari_agent_arch)" || { warn "当前架构没有仓库兜底 Agent。"; return 1; }
+  case "${arch}" in
+    amd64) checksum="${KOMARI_FALLBACK_AMD64_SHA256}" ;;
+    *) warn "仓库暂未提供 ${arch} 架构的兜底 Agent。"; return 1 ;;
+  esac
+  filename="komari-agent-linux-${arch}-v${KOMARI_FALLBACK_VERSION}"
+  url="${KOMARI_FALLBACK_BASE_URL}/${filename}"
+  prompt_yes_no "是否从 VPS Manager 仓库下载并使用兜底 Agent ${KOMARI_FALLBACK_VERSION}" 1 || return 1
+  ensure_work_dir
+  target="${WORK_DIR}/${filename}"
+  if ! curl -fL --retry 3 --connect-timeout 10 --max-time 180 -o "${target}" "${url}"; then
+    warn "VPS Manager 仓库兜底 Agent 下载失败：${url}"
+    rm -f "${target}"
+    return 1
+  fi
+  if ! printf '%s  %s\n' "${checksum}" "${target}" | sha256sum -c -; then
+    warn "仓库兜底 Agent SHA-256 校验失败，已拒绝执行。"
+    rm -f "${target}"
+    return 1
+  fi
+  chmod 700 "${target}"
+  KOMARI_REPO_FALLBACK_PATH="${target}"
+}
+
+
+komari_install_fallback_after_failure() {
+  local home="$1" endpoint="$2" token="$3" install_dir="$4" day="$5"
+  local disable_ssh="$6" gpu="$7" detect_ip="$8" public_ip="${9:-}" local_agent=""
+  local_agent="$(komari_local_agent_candidate "${home}" || true)"
+  if [[ -n "${local_agent}" ]]; then
+    prompt_yes_no "是否改用本机兜底 Agent：$(basename "${local_agent}")" 1 || return 1
+  else
+    komari_download_repo_fallback || return 1
+    local_agent="${KOMARI_REPO_FALLBACK_PATH}"
+  fi
+  if [[ "${detect_ip}" == 1 && -z "${public_ip}" ]]; then
+    public_ip="$(curl -4 -fsS --max-time 10 https://api.ipify.org 2>/dev/null || true)"
+    [[ -n "${public_ip}" ]] || warn "公网 IPv4 探测失败。"
+  fi
+  komari_install_local_agent "${local_agent}" "${endpoint}" "${token}" "${install_dir}" "${day}" \
+    "${disable_ssh}" "${gpu}" "${public_ip}"
+}
+
+
 komari_install_agent() {
   local endpoint="$1" token home install_dir day installer checksum public_ip local_agent=""
   local disable_ssh=1 gpu=1 detect_ip=1
@@ -3972,18 +4022,9 @@ komari_install_agent() {
   ensure_work_dir; installer="${WORK_DIR}/install-komari-agent.sh"
   if ! curl -fL --retry 3 --connect-timeout 10 -o "${installer}" "${KOMARI_INSTALL_URL}"; then
     warn "Komari 官方安装器下载失败。"
-    local_agent="$(komari_local_agent_candidate "${home}" || true)"
-    if [[ -n "${local_agent}" ]] && prompt_yes_no "是否使用本机兜底 Agent：$(basename "${local_agent}")" 1; then
-      if [[ "${detect_ip}" == 1 ]]; then
-        public_ip="$(curl -4 -fsS --max-time 10 https://api.ipify.org 2>/dev/null || true)"
-        [[ -n "${public_ip}" ]] || warn "公网 IPv4 探测失败。"
-      fi
-      komari_install_local_agent "${local_agent}" "${endpoint}" "${token}" "${install_dir}" "${day}" \
-        "${disable_ssh}" "${gpu}" "${public_ip:-}"
-      return $?
-    fi
-    warn "未使用本地兜底 Agent，本次安装已停止。"
-    return 1
+    komari_install_fallback_after_failure "${home}" "${endpoint}" "${token}" "${install_dir}" "${day}" \
+      "${disable_ssh}" "${gpu}" "${detect_ip}" "${public_ip:-}"
+    return $?
   fi
   chmod 700 "${installer}"
   bash -n "${installer}" || { warn "Komari 官方安装器语法校验失败。"; return 1; }
@@ -3997,14 +4038,9 @@ komari_install_agent() {
   fi
   if ! bash "${installer}" "${args[@]}"; then
     warn "Komari 官方安装流程失败，通常是 GitHub Release 文件链路不可用。"
-    local_agent="$(komari_local_agent_candidate "${home}" || true)"
-    if [[ -n "${local_agent}" ]] && prompt_yes_no "是否改用本机兜底 Agent：$(basename "${local_agent}")" 1; then
-      komari_install_local_agent "${local_agent}" "${endpoint}" "${token}" "${install_dir}" "${day}" \
-        "${disable_ssh}" "${gpu}" "${public_ip:-}"
-      return $?
-    fi
-    warn "未使用本地兜底 Agent，本次安装已停止。"
-    return 1
+    komari_install_fallback_after_failure "${home}" "${endpoint}" "${token}" "${install_dir}" "${day}" \
+      "${disable_ssh}" "${gpu}" "${detect_ip}" "${public_ip:-}"
+    return $?
   fi
   service_status_text komari-agent | sed -n '1,60p' || true
 }
