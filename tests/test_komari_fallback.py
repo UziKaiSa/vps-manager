@@ -25,3 +25,9 @@ def test_repo_fallback_is_versioned_and_hash_pinned():
     assert 'KOMARI_FALLBACK_AMD64_SHA256="113af112a914b918' in TEXT
     assert 'KOMARI_FALLBACK_BASE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/assets"' in TEXT
     assert "sha256sum -c -" in TEXT
+
+
+def test_systemd_working_directory_is_unquoted_and_verified():
+    assert "WorkingDirectory=${install_dir}" in TEXT
+    assert 'WorkingDirectory="${install_dir}"' not in TEXT
+    assert 'systemd-analyze verify "${service_file}"' in TEXT

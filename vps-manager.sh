@@ -3914,7 +3914,7 @@ ${warp_requires}
 [Service]
 Type=simple
 ExecStart="${runner}"
-WorkingDirectory="${install_dir}"
+WorkingDirectory=${install_dir}
 Restart=always
 RestartSec=5
 User=root
@@ -3924,6 +3924,12 @@ WantedBy=multi-user.target
 EOF
     chmod 600 "${service_file}"
     systemctl daemon-reload
+    if command -v systemd-analyze >/dev/null 2>&1 \
+      && ! systemd-analyze verify "${service_file}" >/dev/null 2>&1; then
+      warn "Komari systemd 服务文件校验失败，已停止启动。"
+      systemd-analyze verify "${service_file}" 2>&1 | sed -n '1,40p' || true
+      return 1
+    fi
   fi
   if ! service_enable_start komari-agent || ! service_is_active komari-agent; then
     warn "本地 Agent 已写入但服务启动失败。备份位置: ${backup_agent:-无旧 Agent} ${backup_runner:-无旧启动器} ${backup_service:-无旧服务}"
