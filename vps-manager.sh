@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.9.10-test"
+SCRIPT_VERSION="0.9.11-test"
 SCRIPT_NAME="VPS Manager"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh"
 
@@ -37,6 +37,9 @@ WARP_GUARD_PATH="/usr/local/sbin/vps-manager-warp-guard"
 WARP_RSS_MAX_KIB=163840
 ALPINE_WARP_LOG_MAX_BYTES=8388608
 ALPINE_WARP_LOG_TAIL_BYTES=2097152
+ALPINE_WARP_ULTRA_LOG_MAX_BYTES=524288
+ALPINE_WARP_ULTRA_LOG_TAIL_BYTES=131072
+ALPINE_WARP_ULTRA_RSS_MAX_KIB=98304
 APT_LOCK_WAIT_SECONDS=600
 APT_LOCK_REPORT_SECONDS=15
 
@@ -4361,12 +4364,19 @@ EOF
 install_alpine_warp_guard() {
   local log_file="/var/log/cloudflare-warp/warp-svc.log"
   local archive_file="/var/log/cloudflare-warp/warp-svc.log.1.gz"
-  local log_size tail_tmp
+  local log_size tail_tmp max_log_bytes="${ALPINE_WARP_LOG_MAX_BYTES}"
+  local tail_bytes="${ALPINE_WARP_LOG_TAIL_BYTES}" max_rss_kib="${WARP_RSS_MAX_KIB}"
+  if [[ -r "${ALPINE_WARP_ROOT}/PROFILE" ]] \
+    && grep -qx 'ultra-low-disk' "${ALPINE_WARP_ROOT}/PROFILE"; then
+    max_log_bytes="${ALPINE_WARP_ULTRA_LOG_MAX_BYTES}"
+    tail_bytes="${ALPINE_WARP_ULTRA_LOG_TAIL_BYTES}"
+    max_rss_kib="${ALPINE_WARP_ULTRA_RSS_MAX_KIB}"
+  fi
   if [[ -f "${log_file}" ]]; then
     log_size="$(wc -c < "${log_file}" 2>/dev/null || echo 0)"
-    if (( log_size > ALPINE_WARP_LOG_MAX_BYTES )); then
+    if (( log_size > max_log_bytes )); then
       tail_tmp="$(mktemp /run/warp-svc-bootstrap.XXXXXX)"
-      tail -c "${ALPINE_WARP_LOG_TAIL_BYTES}" "${log_file}" > "${tail_tmp}" 2>/dev/null \
+      tail -c "${tail_bytes}" "${log_file}" > "${tail_tmp}" 2>/dev/null \
         || cp "${log_file}" "${tail_tmp}"
       : > "${log_file}"
       gzip -c "${tail_tmp}" > "${archive_file}"
@@ -4382,9 +4392,9 @@ set -eu
 LOG_FILE="/var/log/cloudflare-warp/warp-svc.log"
 ARCHIVE_FILE="/var/log/cloudflare-warp/warp-svc.log.1.gz"
 LOCK_DIR="/run/vps-manager-warp-guard.lock"
-MAX_LOG_BYTES=${ALPINE_WARP_LOG_MAX_BYTES}
-TAIL_BYTES=${ALPINE_WARP_LOG_TAIL_BYTES}
-MAX_RSS_KIB=${WARP_RSS_MAX_KIB}
+MAX_LOG_BYTES=${max_log_bytes}
+TAIL_BYTES=${tail_bytes}
+MAX_RSS_KIB=${max_rss_kib}
 
 mkdir "\${LOCK_DIR}" 2>/dev/null || exit 0
 cleanup() { rm -rf "\${LOCK_DIR}" "\${TAIL_TMP:-}" "\${ARCHIVE_TMP:-}"; }
@@ -4582,8 +4592,6 @@ komari_install_warp_alpine() {
     apk del binutils xz >/dev/null 2>&1 || true
     gzip -9 "${stage}/client/bin/warp-cli"
     printf '%s\n' 'ultra-low-disk' > "${stage}/PROFILE"
-    ALPINE_WARP_LOG_MAX_BYTES=1048576
-    ALPINE_WARP_LOG_TAIL_BYTES=262144
   fi
   service_is_active warp-svc && rc-service warp-svc stop || true
   if [[ -d "${ALPINE_WARP_ROOT}" ]]; then
