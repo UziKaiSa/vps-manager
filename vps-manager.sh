@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.9.9-test"
+SCRIPT_VERSION="0.9.10-test"
 SCRIPT_NAME="VPS Manager"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh"
 
@@ -31,6 +31,8 @@ KOMARI_WARP_LEGACY_BULLSEYE_URL="https://downloads.cloudflareclient.com/v1/downl
 KOMARI_WARP_LEGACY_BULLSEYE_SHA256="fcad2595a371f051b81f548b65f6cab93681690c45bda97bc4e729a8b14f4528"
 ALPINE_WARP_ROOT="/opt/cloudflare-warp"
 ALPINE_WARP_MIN_FREE_MIB=300
+ALPINE_WARP_ULTRA_MIN_FREE_MIB=105
+ALPINE_WARP_ULTRA_TMPFS_MIB=60
 WARP_GUARD_PATH="/usr/local/sbin/vps-manager-warp-guard"
 WARP_RSS_MAX_KIB=163840
 ALPINE_WARP_LOG_MAX_BYTES=8388608
@@ -58,6 +60,8 @@ BACKUP_ROOT="/var/backups/vps-manager"
 
 DEMO_MODE=0
 WORK_DIR=""
+ALPINE_WARP_TMP_DIR=""
+ALPINE_WARP_STAGE_DIR=""
 DEMO_CONFIG_FILE=""
 DEMO_INFO_FILE=""
 DEMO_YAML_FILE=""
@@ -92,8 +96,21 @@ declare -a CFG_PROXY_LINKS=()
 
 
 cleanup() {
-  if [[ -n "${WORK_DIR}" && "${WORK_DIR}" == /tmp/vps-manager.* && -d "${WORK_DIR}" ]]; then
+  if [[ -n "${WORK_DIR}" \
+    && ( "${WORK_DIR}" == /tmp/vps-manager.* || "${WORK_DIR}" == /run/vps-manager.* ) \
+    && -d "${WORK_DIR}" ]]; then
     rm -rf -- "${WORK_DIR}"
+  fi
+  if [[ -n "${ALPINE_WARP_TMP_DIR}" \
+    && ( "${ALPINE_WARP_TMP_DIR}" == /run/vps-manager-warp.* \
+      || "${ALPINE_WARP_TMP_DIR}" == /dev/shm/vps-manager-warp.* ) \
+    && -d "${ALPINE_WARP_TMP_DIR}" ]]; then
+    rm -rf -- "${ALPINE_WARP_TMP_DIR}"
+  fi
+  if [[ -n "${ALPINE_WARP_STAGE_DIR}" \
+    && "${ALPINE_WARP_STAGE_DIR}" == /opt/.cloudflare-warp-stage.* \
+    && -d "${ALPINE_WARP_STAGE_DIR}" ]]; then
+    rm -rf -- "${ALPINE_WARP_STAGE_DIR}"
   fi
 }
 
@@ -239,7 +256,14 @@ service_status_text() {
 
 ensure_work_dir() {
   cleanup
-  WORK_DIR="$(mktemp -d /tmp/vps-manager.XXXXXX)"
+  if [[ -r "${ALPINE_WARP_ROOT}/PROFILE" ]] \
+    && grep -qx 'ultra-low-disk' "${ALPINE_WARP_ROOT}/PROFILE" \
+    && [[ -d /run && -w /run ]] \
+    && (( $(df -Pk /run | awk 'NR == 2 {print $4}') >= 32 * 1024 )); then
+    WORK_DIR="$(mktemp -d /run/vps-manager.XXXXXX)"
+  else
+    WORK_DIR="$(mktemp -d /tmp/vps-manager.XXXXXX)"
+  fi
   chmod 700 "${WORK_DIR}"
 }
 
@@ -4230,6 +4254,51 @@ extract_deb_to() {
 }
 
 
+extract_deb_members_to() {
+  local package="$1" destination="$2" data_archive compression
+  shift 2
+  data_archive="$(ar t "${package}" | awk '/^data\.tar\./{print; exit}')"
+  [[ -n "${data_archive}" ]] || return 1
+  case "${data_archive}" in
+    *.gz) compression="z" ;;
+    *.xz) compression="J" ;;
+    *) warn "不支持的 deb 数据压缩格式：${data_archive}"; return 1 ;;
+  esac
+  ar p "${package}" "${data_archive}" | tar -x"${compression}"f - -C "${destination}" "$@"
+}
+
+
+prune_alpine_warp_runtime() {
+  local runtime="$1" path name
+  while IFS= read -r -d '' path; do
+    name="${path##*/}"
+    case "${name}" in
+      ld-linux-x86-64.so.2|ld-linux-aarch64.so.1|libc.so.6|libcap.so.2*|libdbus-1.so.3*|\
+      libgcc_s.so.1|libgcrypt.so.20*|libgpg-error.so.0*|liblz4.so.1*|liblzma.so.5*|\
+      libm.so.6|libnspr4.so|libnss3.so|libnssutil3.so|libplc4.so|libplds4.so|libsmime3.so|\
+      libsystemd.so.0*|libzstd.so.1*) ;;
+      *) rm -f -- "${path}" ;;
+    esac
+  done < <(find "${runtime}" \( -type f -o -type l \) -print0)
+  find "${runtime}" -depth -type d -empty -delete
+}
+
+
+alpine_warp_tmpfs_dir() {
+  local candidate available_kib
+  for candidate in /dev/shm /run; do
+    [[ -d "${candidate}" && -w "${candidate}" ]] || continue
+    available_kib="$(df -Pk "${candidate}" | awk 'NR == 2 {print $4}')"
+    [[ "${available_kib}" =~ ^[0-9]+$ ]] || continue
+    if (( available_kib >= ALPINE_WARP_ULTRA_TMPFS_MIB * 1024 )); then
+      mktemp -d "${candidate}/vps-manager-warp.XXXXXX"
+      return 0
+    fi
+  done
+  return 1
+}
+
+
 install_systemd_warp_guard() {
   install -d -m 755 /usr/local/sbin
   cat > "${WARP_GUARD_PATH}" <<EOF
@@ -4408,7 +4477,7 @@ EOF
 
 komari_install_warp_alpine() {
   local free_kib free_mib stage package_file hash path url alpine_arch deb_arch lib_arch loader
-  local package_url package_sha256 installed_arch="" backup=""
+  local package_url package_sha256 installed_arch="" backup="" ultra_low_disk=0 package_dir=""
   local mirror="https://deb.debian.org/debian"
   alpine_arch="$(apk --print-arch)"
   case "${alpine_arch}" in
@@ -4432,7 +4501,9 @@ komari_install_warp_alpine() {
       ;;
   esac
   [[ ! -r "${ALPINE_WARP_ROOT}/ARCH" ]] || installed_arch="$(< "${ALPINE_WARP_ROOT}/ARCH")"
-  if [[ -x "${ALPINE_WARP_ROOT}/client/bin/warp-cli" && -f "${ALPINE_WARP_ROOT}/VERSION" ]] \
+  if [[ -f "${ALPINE_WARP_ROOT}/VERSION" ]] \
+    && { [[ -x "${ALPINE_WARP_ROOT}/client/bin/warp-cli" ]] \
+      || [[ -r "${ALPINE_WARP_ROOT}/client/bin/warp-cli.gz" ]]; } \
     && grep -qx "${KOMARI_WARP_LEGACY_VERSION}" "${ALPINE_WARP_ROOT}/VERSION" \
     && [[ "${installed_arch}" == "${deb_arch}" ]] \
     && warp-cli --version >/dev/null 2>&1; then
@@ -4448,8 +4519,18 @@ komari_install_warp_alpine() {
   free_kib="$(df -Pk / | awk 'NR == 2 {print $4}')"
   free_mib=$((free_kib / 1024))
   if (( free_mib < ALPINE_WARP_MIN_FREE_MIB )); then
-    warn "Alpine 隔离版 WARP 至少需要 ${ALPINE_WARP_MIN_FREE_MIB} MiB 可用空间；当前 ${free_mib} MiB。"
-    return 1
+    if [[ "${deb_arch}" != "amd64" ]]; then
+      warn "极限精简模式目前只完成了 amd64 ELF 依赖审计；${deb_arch} 仍需 ${ALPINE_WARP_MIN_FREE_MIB} MiB 可用空间。"
+      return 1
+    fi
+    if (( free_mib < ALPINE_WARP_ULTRA_MIN_FREE_MIB )); then
+      warn "Alpine 极限精简 WARP 至少需要 ${ALPINE_WARP_ULTRA_MIN_FREE_MIB} MiB 可用空间；当前 ${free_mib} MiB。"
+      return 1
+    fi
+    ultra_low_disk=1
+    warn "检测到小磁盘，将启用实验性极限精简模式。"
+    printf '该模式只保留 warp-svc、压缩后的 warp-cli 和递归 ELF 运行库，\n'
+    printf '安装包暂存在 tmpfs，不把下载包和解包副本同时写入根磁盘。\n'
   fi
   printf '\nAlpine 没有 Cloudflare 官方 WARP 包。脚本将安装固定版本 %s，\n' "${KOMARI_WARP_LEGACY_VERSION}"
   printf '并把官方 Debian 程序及其 glibc 依赖隔离在 %s，不替换 Alpine musl。\n' "${ALPINE_WARP_ROOT}"
@@ -4457,25 +4538,53 @@ komari_install_warp_alpine() {
   apk add --no-cache bash ca-certificates curl dbus iproute2 nftables libcap nss-tools libpcap binutils xz
   service_enable_start dbus
   ensure_work_dir
-  stage="${WORK_DIR}/cloudflare-warp"
+  if (( ultra_low_disk == 1 )); then
+    package_dir="$(alpine_warp_tmpfs_dir)" \
+      || { warn "tmpfs 至少需要 ${ALPINE_WARP_ULTRA_TMPFS_MIB} MiB 可用空间，无法安全暂存官方包。"; return 1; }
+    stage="/opt/.cloudflare-warp-stage.$$"
+    ALPINE_WARP_TMP_DIR="${package_dir}"
+    ALPINE_WARP_STAGE_DIR="${stage}"
+  else
+    package_dir="${WORK_DIR}"
+    stage="${WORK_DIR}/cloudflare-warp"
+  fi
+  rm -rf -- "${stage}"
   mkdir -p "${stage}/runtime" "${stage}/client"
   while IFS='|' read -r hash path; do
     [[ -n "${hash}" ]] || continue
-    package_file="${WORK_DIR}/runtime.deb"
+    package_file="${package_dir}/runtime.deb"
     url="${mirror}/${path}"
     curl -fL --retry 3 --connect-timeout 10 --max-time 300 -o "${package_file}" "${url}"
     printf '%s  %s\n' "${hash}" "${package_file}" | sha256sum -c -
     extract_deb_to "${package_file}" "${stage}/runtime"
     rm -f -- "${package_file}"
   done < <(komari_alpine_runtime_manifest "${deb_arch}")
-  package_file="${WORK_DIR}/cloudflare-warp.deb"
+  if (( ultra_low_disk == 1 )); then
+    prune_alpine_warp_runtime "${stage}/runtime"
+    free_kib="$(df -Pk / | awk 'NR == 2 {print $4}')"
+    (( free_kib >= 90 * 1024 )) \
+      || { warn "依赖安装后根分区不足 90 MiB，停止并清理候选运行时。"; rm -rf -- "${stage}" "${package_dir}"; return 1; }
+  fi
+  package_file="${package_dir}/cloudflare-warp.deb"
   curl -fL --retry 3 --connect-timeout 10 --max-time 240 -o "${package_file}" "${package_url}"
   printf '%s  %s\n' "${package_sha256}" "${package_file}" | sha256sum -c -
-  extract_deb_to "${package_file}" "${stage}/client"
+  if (( ultra_low_disk == 1 )); then
+    extract_deb_members_to "${package_file}" "${stage}/client" ./bin/warp-cli ./bin/warp-svc
+  else
+    extract_deb_to "${package_file}" "${stage}/client"
+  fi
+  rm -f -- "${package_file}"
   [[ -x "${stage}/client/bin/warp-cli" && -x "${stage}/client/bin/warp-svc" ]] \
     || { warn "WARP 包内缺少程序文件。"; return 1; }
   printf '%s\n' "${KOMARI_WARP_LEGACY_VERSION}" > "${stage}/VERSION"
   printf '%s\n' "${deb_arch}" > "${stage}/ARCH"
+  if (( ultra_low_disk == 1 )); then
+    apk del binutils xz >/dev/null 2>&1 || true
+    gzip -9 "${stage}/client/bin/warp-cli"
+    printf '%s\n' 'ultra-low-disk' > "${stage}/PROFILE"
+    ALPINE_WARP_LOG_MAX_BYTES=1048576
+    ALPINE_WARP_LOG_TAIL_BYTES=262144
+  fi
   service_is_active warp-svc && rc-service warp-svc stop || true
   if [[ -d "${ALPINE_WARP_ROOT}" ]]; then
     install -d -m 700 "${BACKUP_ROOT}"
@@ -4485,10 +4594,26 @@ komari_install_warp_alpine() {
   fi
   install -d -m 755 "$(dirname "${ALPINE_WARP_ROOT}")"
   mv "${stage}" "${ALPINE_WARP_ROOT}"
-  cat > /usr/local/bin/warp-cli <<EOF
+  ALPINE_WARP_STAGE_DIR=""
+  if (( ultra_low_disk == 1 )); then
+    cat > /usr/local/bin/warp-cli <<EOF
+#!/bin/sh
+set -eu
+runtime_cli="/run/vps-manager-warp-cli"
+if [ ! -x "\${runtime_cli}" ] || [ "${ALPINE_WARP_ROOT}/client/bin/warp-cli.gz" -nt "\${runtime_cli}" ]; then
+  tmp="\${runtime_cli}.tmp.\$\$"
+  gzip -dc "${ALPINE_WARP_ROOT}/client/bin/warp-cli.gz" > "\${tmp}"
+  chmod 700 "\${tmp}"
+  mv -f "\${tmp}" "\${runtime_cli}"
+fi
+exec ${ALPINE_WARP_ROOT}/runtime/lib/${lib_arch}/${loader} --library-path ${ALPINE_WARP_ROOT}/runtime/lib/${lib_arch}:${ALPINE_WARP_ROOT}/runtime/usr/lib/${lib_arch} "\${runtime_cli}" "\$@"
+EOF
+  else
+    cat > /usr/local/bin/warp-cli <<EOF
 #!/bin/sh
 exec ${ALPINE_WARP_ROOT}/runtime/lib/${lib_arch}/${loader} --library-path ${ALPINE_WARP_ROOT}/runtime/lib/${lib_arch}:${ALPINE_WARP_ROOT}/runtime/usr/lib/${lib_arch} ${ALPINE_WARP_ROOT}/client/bin/warp-cli "\$@"
 EOF
+  fi
   cat > /usr/local/bin/warp-svc <<EOF
 #!/bin/sh
 exec ${ALPINE_WARP_ROOT}/runtime/lib/${lib_arch}/${loader} --library-path ${ALPINE_WARP_ROOT}/runtime/lib/${lib_arch}:${ALPINE_WARP_ROOT}/runtime/usr/lib/${lib_arch} ${ALPINE_WARP_ROOT}/client/bin/warp-svc "\$@"
@@ -4510,6 +4635,8 @@ EOF
   service_enable_start warp-svc
   install_alpine_warp_guard
   warp-cli --version
+  rm -rf -- "${package_dir}"
+  ALPINE_WARP_TMP_DIR=""
   log "Alpine WARP ${deb_arch} 兼容运行时安装完成并已锁定版本"
 }
 
