@@ -503,34 +503,6 @@ chmod +x vps-manager.sh
 
 涉及正式配置的操作会尽量先创建备份。仍建议在大规模部署前自行保存云厂商快照。
 
-## Komari 看板主题脚本
-
-仓库继续保留：
-
-```text
-apply-kaisa-komari-theme.py
-```
-
-使用方法：
-
-```bash
-python3 apply-kaisa-komari-theme.py --db ./data/komari.db
-```
-
-指定备份目录：
-
-```bash
-python3 apply-kaisa-komari-theme.py \
-  --db ./data/komari.db \
-  --backup-dir ./data/theme-backups
-```
-
-只有在明确不需要数据库备份时才使用：
-
-```bash
-python3 apply-kaisa-komari-theme.py --db ./data/komari.db --no-backup
-```
-
 ## 常见问题
 
 ### 为什么预览模式不能查看现有系统配置？
@@ -562,6 +534,5 @@ python3 apply-kaisa-komari-theme.py --db ./data/komari.db --no-backup
 ```text
 vps-manager.sh                 VPS 初始化与管理主脚本
 windows-ssh-key.ps1            Windows SSH 公钥和私钥生成脚本
-apply-kaisa-komari-theme.py    可选的 Komari 看板主题脚本
 README.md                      中文使用说明
 ```
