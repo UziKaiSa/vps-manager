@@ -12,8 +12,6 @@ KOMARI_INSTALL_URL="https://raw.githubusercontent.com/komari-monitor/komari-agen
 KOMARI_FALLBACK_VERSION="1.2.60"
 KOMARI_FALLBACK_AMD64_SHA256="113af112a914b918f315fa6cd3a98e8c0f932900f776c4c412b2a79477180859"
 KOMARI_FALLBACK_BASE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/assets"
-KOMARI_DEFAULT_TEAM="your-team-name"
-KOMARI_DEFAULT_PRIVATE_URL="http://komari.example.internal:8080"
 KOMARI_TOKEN_ENV_FILE="/root/warp-token.env"
 KOMARI_WARP_MIN_ROOT_MIB=3072
 KOMARI_WARP_MIN_FREE_MIB=1536
@@ -149,6 +147,21 @@ prompt_default() {
 
   read -r -p "${prompt} [${default_value}]: " value
   printf '%s' "${value:-${default_value}}"
+}
+
+
+prompt_required() {
+  local prompt="$1"
+  local value
+
+  while true; do
+    read -r -p "${prompt}: " value
+    if [[ -n "${value}" ]]; then
+      printf '%s' "${value}"
+      return 0
+    fi
+    warn "该值不能为空。"
+  done
 }
 
 
@@ -1346,14 +1359,14 @@ collect_xray_configuration() {
   done
 
   local raw_reality_target normalized_reality_target
-  raw_reality_target="$(prompt_default "Reality target（裸域名/IP 自动补全 :443）" "www.example.com:443")"
+  raw_reality_target="$(prompt_required "Reality target（裸域名/IP 自动补全 :443）")"
   normalized_reality_target="$(normalize_reality_target "${raw_reality_target}")" \
     || die "Reality target 格式不正确。"
   if [[ "${normalized_reality_target}" != "${raw_reality_target}" ]]; then
     printf '已自动补全 Reality target：%s\n' "${normalized_reality_target}"
   fi
   CFG_REALITY_DEST="${normalized_reality_target}"
-  CFG_SERVER_NAMES="$(prompt_default "Reality serverNames（逗号分隔）" "www.example.com,example.com")"
+  CFG_SERVER_NAMES="$(prompt_required "Reality serverNames（逗号分隔）")"
   [[ -n "${CFG_SERVER_NAMES}" ]] || die "Reality serverNames 不能为空。"
 
   if port_is_listening "${CFG_REALITY_PORT}"; then
@@ -3863,7 +3876,7 @@ komari_show_ipv6_only_agent_notice() {
   upload_path="${home}/komari-agent-linux-${arch}"
   if is_alpine; then
     menu_path="主菜单 3) Komari + WARP 管理 -> 1) 配置/修复 WARP 私网，并安装/重装 Agent"
-  elif [[ "${endpoint}" == "${KOMARI_DEFAULT_PRIVATE_URL}" || "${endpoint}" == *'.internal'* ]]; then
+  elif [[ "${endpoint}" == *'.internal'* ]]; then
     menu_path="主菜单 5) 安装/管理 Komari Agent -> 1) 配置/修复 WARP 私网，并可继续安装 Agent"
   else
     menu_path="主菜单 5) 安装/管理 Komari Agent -> 2) 安装/重装普通公网 Agent"
@@ -3897,7 +3910,7 @@ komari_install_local_agent() {
   local agent="${install_dir}/agent" runner="${install_dir}/run-agent.sh"
   local service_file backup_agent="" backup_runner="" backup_service="" require_warp=0
   local warp_dependency="" warp_after="" warp_requires=""
-  [[ "${endpoint}" == "${KOMARI_DEFAULT_PRIVATE_URL}" || "${endpoint}" == *'.internal'* ]] && require_warp=1
+  [[ "${endpoint}" == *'.internal'* ]] && require_warp=1
   if [[ "${require_warp}" == 1 ]]; then
     warp_dependency=" warp-svc"
     warp_after=" warp-svc.service"
@@ -4725,8 +4738,8 @@ komari_verify_warp() {
 install_komari_warp() {
   local team endpoint install_agent=1
   require_root; check_supported_os
-  team="$(prompt_default "Cloudflare Zero Trust Team 名称" "${KOMARI_DEFAULT_TEAM}")"
-  endpoint="$(prompt_default "Komari 私网连接地址" "${KOMARI_DEFAULT_PRIVATE_URL}")"
+  team="$(prompt_required "Cloudflare Zero Trust Team 名称")"
+  endpoint="$(prompt_required "Komari 私网连接地址")"
   prompt_yes_no "WARP 完成后是否继续安装/重装 Agent" 1 || install_agent=0
   printf '\n配置预览：\n  Team: %s\n  私网地址: %s\n  MDM: /var/lib/cloudflare-warp/mdm.xml\n  Service Token: 环境变量、%s 或安全输入\n' "${team}" "${endpoint}" "${KOMARI_TOKEN_ENV_FILE}"
   if [[ "${DEMO_MODE}" == 1 ]]; then printf '[演示] 使用主脚本内置流程，不下载 komari-warp-scripts 包装脚本。\n'; [[ "${install_agent}" == 1 ]] && komari_install_agent "${endpoint}"; return 0; fi

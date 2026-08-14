@@ -374,14 +374,16 @@ proxy-groups:
 
 原仓库中的 `install-komari-warp-agent.sh` 已经并入主脚本。此选项会直接调用内置函数，不再下载并执行本仓库的包装脚本。
 
-默认值：
+以下值不在公开脚本中提供默认值，运行时必须输入：
 
 ```text
-Cloudflare Zero Trust Team: your-team-name
-Komari 私网地址: http://komari.example.internal:8080
+Cloudflare Zero Trust Team
+Komari 私网地址
 WARP MDM: /var/lib/cloudflare-warp/mdm.xml
 service_mode: warp
 ```
+
+Reality target 和 `serverNames` 同样没有内置默认域名，首次配置时必须输入。
 
 Cloudflare Access Service Token 的读取顺序：
 
