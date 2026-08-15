@@ -4,6 +4,7 @@
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import uuid
@@ -30,6 +31,15 @@ require('reality.get("guard", {"enabled": True})', "managed updates must default
 require('elif action=="reality-guard":', "guard toggle mutation is missing")
 require('[[ "${current}" == 1 ]] && pending_model_mutate reality-guard 0', "enabled guard must toggle off")
 require('"guard": {"enabled": guard_enabled, "port": guard_port}', "guard state is not persisted")
+require('CFG_REALITY_GUARD_PORT="$(random_available_port 39000 59999 "${ports[@]}")"', "new guard port must be randomized")
+require('guard_port = int(env("CFG_REALITY_GUARD_PORT"))', "generator must consume the randomized guard port")
+
+fixed_port_patterns = (
+    r'prompt_default "(?:VLESS-Reality|SOCKS5|Shadowsocks)[^\"]*端口" "?\d',
+    r'prompt_default "端口" "?\d',
+)
+if any(re.search(pattern, text) for pattern in fixed_port_patterns):
+    raise AssertionError("fixed public port default returned")
 
 # Prevent the vulnerable Xray keyword-domain rule from returning unnoticed.
 if '"domain": server_names' in text:

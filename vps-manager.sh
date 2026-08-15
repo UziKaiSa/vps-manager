@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.9.11-test"
+SCRIPT_VERSION="0.9.12-test"
 SCRIPT_NAME="VPS Manager"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh"
 
@@ -80,6 +80,7 @@ XRAY_UPDATE_DIRTY=0
 CFG_NODE_NAME=""
 CFG_PUBLIC_ADDRESS=""
 CFG_REALITY_PORT=""
+CFG_REALITY_GUARD_PORT=""
 CFG_REALITY_DEST=""
 CFG_SERVER_NAMES=""
 CFG_ENABLE_SOCKS=0
@@ -644,16 +645,34 @@ default_ssh_admin_user() {
 }
 
 
-random_high_port() {
-  local candidate
+random_available_port() {
+  local minimum="${1:-20000}"
+  local maximum="${2:-60000}"
+  local candidate random_value excluded collision
+  shift 2 || true
 
   while true; do
-    candidate="$(shuf -i 20000-60000 -n 1)"
-    if ! port_is_listening "${candidate}"; then
+    if command -v shuf >/dev/null 2>&1; then
+      candidate="$(shuf -i "${minimum}-${maximum}" -n 1)"
+    else
+      random_value="$(od -An -N4 -tu4 /dev/urandom | tr -d '[:space:]')"
+      [[ "${random_value}" =~ ^[0-9]+$ ]] || continue
+      candidate=$((minimum + random_value % (maximum - minimum + 1)))
+    fi
+    collision=0
+    for excluded in "$@"; do
+      [[ -z "${excluded}" || "${candidate}" != "${excluded}" ]] || { collision=1; break; }
+    done
+    if [[ "${collision}" == 0 ]] && ! port_is_listening "${candidate}"; then
       printf '%s' "${candidate}"
       return 0
     fi
   done
+}
+
+
+random_high_port() {
+  random_available_port 20000 60000
 }
 
 
@@ -1307,7 +1326,7 @@ collect_proxy_outbounds() {
 
 
 collect_optional_inbounds() {
-  local default_password
+  local default_password default_port
 
   CFG_ENABLE_SOCKS=0
   CFG_ENABLE_SS=0
@@ -1315,10 +1334,11 @@ collect_optional_inbounds() {
   if prompt_yes_no "是否开启 SOCKS5 入站端口" "0"; then
     CFG_ENABLE_SOCKS=1
     CFG_SOCKS_LISTEN="$(prompt_default "SOCKS5 监听地址（127.0.0.1 仅本机）" "127.0.0.1")"
+    default_port="$(random_available_port 20000 60000 "${CFG_REALITY_PORT}")"
     while true; do
-      CFG_SOCKS_PORT="$(prompt_default "SOCKS5 端口" "21625")"
-      validate_port "${CFG_SOCKS_PORT}" && break
-      warn "端口必须在 1-65535 之间。"
+      CFG_SOCKS_PORT="$(prompt_default "SOCKS5 端口" "${default_port}")"
+      validate_port "${CFG_SOCKS_PORT}" && ! port_is_listening "${CFG_SOCKS_PORT}" && break
+      warn "端口必须在 1-65535 之间且不能已被占用。"
     done
     CFG_SOCKS_USER="$(prompt_default "SOCKS5 用户名" "xray-socks")"
     default_password="$(random_password)"
@@ -1331,10 +1351,11 @@ collect_optional_inbounds() {
   if prompt_yes_no "是否开启 Shadowsocks 入站端口" "0"; then
     CFG_ENABLE_SS=1
     CFG_SS_LISTEN="$(prompt_default "Shadowsocks 监听地址" "0.0.0.0")"
+    default_port="$(random_available_port 20000 60000 "${CFG_REALITY_PORT}" "${CFG_SOCKS_PORT}")"
     while true; do
-      CFG_SS_PORT="$(prompt_default "Shadowsocks 端口" "21626")"
-      validate_port "${CFG_SS_PORT}" && break
-      warn "端口必须在 1-65535 之间。"
+      CFG_SS_PORT="$(prompt_default "Shadowsocks 端口" "${default_port}")"
+      validate_port "${CFG_SS_PORT}" && ! port_is_listening "${CFG_SS_PORT}" && break
+      warn "端口必须在 1-65535 之间且不能已被占用。"
     done
     CFG_SS_METHOD="$(prompt_default "Shadowsocks 加密方式" "2022-blake3-aes-128-gcm")"
     default_password="$(shadowsocks_password_for_method "${CFG_SS_METHOD}")"
@@ -1345,15 +1366,16 @@ collect_optional_inbounds() {
 
 
 collect_xray_configuration() {
-  local default_name
+  local default_name default_port
 
   default_name="$(hostname)"
   CFG_NODE_NAME="$(prompt_default "节点名称（用于生成 AWS YAML）" "${default_name}")"
   CFG_PUBLIC_ADDRESS="$(detect_public_address)"
   printf '自动检测到节点地址：%s（仅用于生成 AWS YAML）\n' "${CFG_PUBLIC_ADDRESS}"
 
+  default_port="$(random_available_port 20000 60000)"
   while true; do
-    CFG_REALITY_PORT="$(prompt_default "VLESS-Reality 端口" "58403")"
+    CFG_REALITY_PORT="$(prompt_default "VLESS-Reality 端口" "${default_port}")"
     validate_port "${CFG_REALITY_PORT}" && break
     warn "端口必须在 1-65535 之间。"
   done
@@ -1383,6 +1405,7 @@ collect_xray_configuration() {
   if [[ "$(printf '%s\n' "${ports[@]}" | sort -u | wc -l)" -ne "${#ports[@]}" ]]; then
     die "VLESS、SOCKS5 和 Shadowsocks 端口不能重复。"
   fi
+  CFG_REALITY_GUARD_PORT="$(random_available_port 39000 59999 "${ports[@]}")"
 }
 
 
@@ -1418,6 +1441,7 @@ generate_xray_files_once() {
   CFG_NODE_NAME="${CFG_NODE_NAME}" \
   CFG_PUBLIC_ADDRESS="${CFG_PUBLIC_ADDRESS}" \
   CFG_REALITY_PORT="${CFG_REALITY_PORT}" \
+  CFG_REALITY_GUARD_PORT="${CFG_REALITY_GUARD_PORT}" \
   CFG_REALITY_DEST="${CFG_REALITY_DEST}" \
   CFG_SERVER_NAMES="${CFG_SERVER_NAMES}" \
   CFG_PRIVATE_KEY="${private_key}" \
@@ -1823,7 +1847,7 @@ else:
     public_key = env("CFG_PUBLIC_KEY")
     short_id = env("CFG_SHORT_ID")
     guard_enabled = True
-    guard_port = 39000
+    guard_port = int(env("CFG_REALITY_GUARD_PORT"))
 
 if not server_names:
     raise SystemExit("Reality serverNames 不能为空")
@@ -2919,11 +2943,11 @@ PY
 }
 
 manage_socks_inbound_menu() {
-  local choice current value listen port user password
+  local choice current value listen port user password default_port
   while true; do
     if ! current="$(pending_model_query optionalInbounds.socks5.port 2>/dev/null)"; then
       printf '\nSOCKS5 入站当前关闭。\n  1) 开启\n  0) 返回\n'; read -r -p "请选择 [0]: " choice
-      case "${choice:-0}" in 1) listen="$(prompt_default "监听地址" 127.0.0.1)"; while true; do port="$(prompt_default "端口" 21625)"; validate_port "${port}" && break; warn "端口无效。"; done; user="$(prompt_default "用户名" xray-socks)"; password="$(prompt_secret "密码（留空自动生成）")"; [[ -n "${password}" ]] || password="$(random_password)"; pending_model_mutate inbound-enable socks5 "${listen}" "${port}" "${user}" "${password}";; 0) return 0;; esac; continue
+      case "${choice:-0}" in 1) listen="$(prompt_default "监听地址" 127.0.0.1)"; default_port="$(random_available_port 20000 60000 "$(pending_model_query reality.port)")"; while true; do port="$(prompt_default "端口" "${default_port}")"; validate_port "${port}" && ! port_is_listening "${port}" && break; warn "端口无效或已被占用。"; done; user="$(prompt_default "用户名" xray-socks)"; password="$(prompt_secret "密码（留空自动生成）")"; [[ -n "${password}" ]] || password="$(random_password)"; pending_model_mutate inbound-enable socks5 "${listen}" "${port}" "${user}" "${password}";; 0) return 0;; esac; continue
     fi
     printf '\nSOCKS5 入站：\n  1) 监听地址\n  2) 端口\n  3) 用户名\n  4) 替换密码\n  5) 关闭\n  0) 返回\n'; read -r -p "请选择 [0]: " choice
     case "${choice:-0}" in
@@ -2937,11 +2961,11 @@ manage_socks_inbound_menu() {
 }
 
 manage_ss_inbound_menu() {
-  local choice current value listen port method password
+  local choice current value listen port method password default_port socks_port
   while true; do
     if ! current="$(pending_model_query optionalInbounds.shadowsocks.port 2>/dev/null)"; then
       printf '\nShadowsocks 入站当前关闭。\n  1) 开启\n  0) 返回\n'; read -r -p "请选择 [0]: " choice
-      case "${choice:-0}" in 1) listen="$(prompt_default "监听地址" 0.0.0.0)"; while true; do port="$(prompt_default "端口" 21626)"; validate_port "${port}" && break; warn "端口无效。"; done; method="$(prompt_default "加密方式" 2022-blake3-aes-128-gcm)"; password="$(prompt_secret "密码/PSK（留空自动生成）")"; [[ -n "${password}" ]] || password="$(shadowsocks_password_for_method "${method}")"; pending_model_mutate inbound-enable shadowsocks "${listen}" "${port}" "${method}" "${password}";; 0) return 0;; esac; continue
+      case "${choice:-0}" in 1) listen="$(prompt_default "监听地址" 0.0.0.0)"; socks_port="$(pending_model_query optionalInbounds.socks5.port 2>/dev/null || true)"; default_port="$(random_available_port 20000 60000 "$(pending_model_query reality.port)" "${socks_port}")"; while true; do port="$(prompt_default "端口" "${default_port}")"; validate_port "${port}" && ! port_is_listening "${port}" && break; warn "端口无效或已被占用。"; done; method="$(prompt_default "加密方式" 2022-blake3-aes-128-gcm)"; password="$(prompt_secret "密码/PSK（留空自动生成）")"; [[ -n "${password}" ]] || password="$(shadowsocks_password_for_method "${method}")"; pending_model_mutate inbound-enable shadowsocks "${listen}" "${port}" "${method}" "${password}";; 0) return 0;; esac; continue
     fi
     printf '\nShadowsocks 入站：\n  1) 监听地址\n  2) 端口\n  3) 加密方式\n  4) 替换密码\n  5) 关闭\n  0) 返回\n'; read -r -p "请选择 [0]: " choice
     case "${choice:-0}" in

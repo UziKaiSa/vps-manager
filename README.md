@@ -2,7 +2,7 @@
 
 `VPS Manager` 是一个面向 Debian/Ubuntu VPS 的中文交互式管理脚本，并为小硬盘 Alpine/OpenRC NAT VPS 提供受限模式，用于完成服务器初始化、Xray 配置，以及 Komari Agent/WARP 私网接入。
 
-当前版本：`0.9.5-test`
+当前版本：`0.9.12-test`
 
 > 目前是测试版。首次在正式服务器上使用前，建议先运行预览模式，并保留一个已经登录的 SSH 终端。
 
@@ -202,6 +202,7 @@ SSH 公钥写入和 SSH 加固已经移到一级菜单的“SSH 密钥与加固�
 - 客户端连接地址填写 VPS 公网 IP 或已经解析到该 VPS 的域名
 - Reality target 填写裸域名或裸 IP 时会自动补全 `:443`；已经填写合法端口则保持不变
 - Reality `serverNames` 支持多个域名，用英文逗号分隔
+- Reality、SOCKS5、Shadowsocks 和 SSH 的首次建议端口均在运行时随机生成，并避开当前监听端口及同一份受管配置中的其他端口；更新已有配置时继续显示并沿用当前端口
 - 默认开启 Reality 防偷：未鉴权 fallback 先进入仅监听 `127.0.0.1` 的 TLS SNI 检查入站，仅 `full:` 精确命中 `serverNames` 时才访问原 target；可在 Reality 更新菜单中关闭或重新开启
 - 防偷辅助端口稳定保存在状态中，默认从 `39000-59999` 选择且避开其他受管入站；更新器兼容 Xray 的 `target` 和旧版 `dest`
 - UUID、Reality 密钥和 Short ID 会自动生成
