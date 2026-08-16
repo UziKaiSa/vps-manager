@@ -40,6 +40,11 @@ ALPINE_WARP_ULTRA_LOG_TAIL_BYTES=131072
 ALPINE_WARP_ULTRA_RSS_MAX_KIB=98304
 APT_LOCK_WAIT_SECONDS=600
 APT_LOCK_REPORT_SECONDS=15
+FIREWALL_CONFIG="/etc/vps-manager/firewall.nft"
+FIREWALL_SYSTEMD_UNIT="/etc/systemd/system/vps-manager-firewall.service"
+FIREWALL_OPENRC_SERVICE="/etc/init.d/vps-manager-firewall"
+FIREWALL_TABLE="vps_manager_firewall"
+FIREWALL_ROLLBACK_SECONDS=300
 
 OS_ID=""
 INIT_SYSTEM=""
@@ -4969,6 +4974,297 @@ xray_setup_workflow() {
 }
 
 
+detect_ssh_ports() {
+  local sshd_output="" port=""
+  local -a ports=()
+
+  if command -v sshd >/dev/null 2>&1; then
+    sshd_output="$(sshd -T 2>/dev/null || true)"
+  elif [[ -x /usr/sbin/sshd ]]; then
+    sshd_output="$(/usr/sbin/sshd -T 2>/dev/null || true)"
+  fi
+  while read -r _key port _rest; do
+    validate_port "${port:-}" && ports+=("${port}")
+  done < <(printf '%s\n' "${sshd_output}" | awk '$1 == "port" { print }')
+
+  if [[ ${#ports[@]} -eq 0 ]] && command -v ss >/dev/null 2>&1; then
+    while read -r port; do
+      validate_port "${port:-}" && ports+=("${port}")
+    done < <(ss -H -lntp 2>/dev/null | awk '/users:\(\("sshd"|users:\(\("sshd-session"/ { local_addr=$4; sub(/^.*:/, "", local_addr); print local_addr }' | sort -nu)
+  fi
+
+  [[ ${#ports[@]} -gt 0 ]] || return 1
+  printf '%s\n' "${ports[@]}" | sort -nu
+}
+
+
+list_public_listeners() {
+  local proto local_addr address port process
+
+  command -v ss >/dev/null 2>&1 || die "缺少 ss，无法安全识别监听端口。"
+  ss -H -lntup 2>/dev/null | while read -r proto _state _recvq _sendq local_addr _peer process; do
+    case "${proto}" in tcp|udp) ;; *) continue ;; esac
+    port="${local_addr##*:}"
+    address="${local_addr%:*}"
+    address="${address#[}"
+    address="${address%]}"
+    address="${address%%%*}"
+    validate_port "${port:-}" || continue
+    case "${address}" in 127.*|::1) continue ;; esac
+    printf '%s|%s|%s|%s\n' "${proto}" "${port}" "${local_addr}" "${process:-unknown}"
+  done | sort -t '|' -k1,1 -k2,2n -u
+}
+
+
+normalize_port_list() {
+  local input="${1//,/ }" port
+  local -a ports=()
+  for port in ${input}; do
+    validate_port "${port}" || return 1
+    ports+=("${port}")
+  done
+  [[ ${#ports[@]} -gt 0 ]] || return 0
+  printf '%s\n' "${ports[@]}" | sort -nu | tr '\n' ' ' | sed 's/ $//'
+}
+
+
+firewall_configured_ports() {
+  local protocol="$1"
+  [[ -f "${FIREWALL_CONFIG}" ]] || return 0
+  awk -v protocol="${protocol}" '$1 == protocol && $2 == "dport" { print }' "${FIREWALL_CONFIG}" \
+    | tr -cs '0-9' ' ' | sed 's/^ *//; s/ *$//' \
+    | tr ' ' '\n' | sed '/^$/d' | sort -nu | tr '\n' ' ' | sed 's/ $//'
+}
+
+
+firewall_write_rules() {
+  local tcp_ports="$1" udp_ports="$2" candidate="$3"
+  local tcp_set="" udp_set=""
+  [[ -n "${tcp_ports}" ]] && tcp_set="    tcp dport { ${tcp_ports// /, } } accept"
+  [[ -n "${udp_ports}" ]] && udp_set="    udp dport { ${udp_ports// /, } } accept"
+  mkdir -p "${STATE_DIR}" "${BACKUP_ROOT}"
+  cat > "${candidate}" <<EOF
+table inet ${FIREWALL_TABLE} {
+  chain input {
+    type filter hook input priority 10; policy drop;
+    iifname "lo" accept
+    iifname "CloudflareWARP" accept
+    ct state established,related accept
+    ct state invalid drop
+    meta l4proto { icmp, ipv6-icmp } accept
+${tcp_set}
+${udp_set}
+  }
+}
+EOF
+}
+
+
+firewall_install_persistence() {
+  if is_alpine; then
+    cat > "${FIREWALL_OPENRC_SERVICE}" <<EOF
+#!/sbin/openrc-run
+description="VPS Manager firewall"
+depend() { need net; after firewall; }
+start() {
+  ebegin "Loading VPS Manager firewall"
+  nft delete table inet ${FIREWALL_TABLE} >/dev/null 2>&1 || true
+  nft -f ${FIREWALL_CONFIG}
+  eend \$?
+}
+stop() {
+  ebegin "Removing VPS Manager firewall"
+  nft delete table inet ${FIREWALL_TABLE} >/dev/null 2>&1
+  eend \$?
+}
+EOF
+    chmod 700 "${FIREWALL_OPENRC_SERVICE}"
+    rc-update add vps-manager-firewall default >/dev/null
+    rc-service vps-manager-firewall restart >/dev/null
+  else
+    cat > "${FIREWALL_SYSTEMD_UNIT}" <<EOF
+[Unit]
+Description=VPS Manager firewall
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=-/usr/sbin/nft delete table inet ${FIREWALL_TABLE}
+ExecStart=/usr/sbin/nft -f ${FIREWALL_CONFIG}
+ExecReload=-/usr/sbin/nft delete table inet ${FIREWALL_TABLE}
+ExecReload=/usr/sbin/nft -f ${FIREWALL_CONFIG}
+ExecStop=/usr/sbin/nft delete table inet ${FIREWALL_TABLE}
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable vps-manager-firewall.service >/dev/null
+    systemctl restart vps-manager-firewall.service
+  fi
+}
+
+
+firewall_apply_with_rollback() {
+  local candidate="$1" backup="" marker rollback_script timestamp validation_candidate
+  timestamp="$(date '+%Y%m%d-%H%M%S')"
+  marker="/run/vps-manager-firewall-confirm-${timestamp}"
+  rollback_script="/run/vps-manager-firewall-rollback-${timestamp}.sh"
+  validation_candidate="$(mktemp /tmp/vps-manager-firewall-check.XXXXXX)"
+  sed "s/table inet ${FIREWALL_TABLE}/table inet ${FIREWALL_TABLE}_check_$$/" "${candidate}" > "${validation_candidate}"
+  nft -c -f "${validation_candidate}" || { rm -f "${validation_candidate}"; die "nftables 候选规则校验失败。"; }
+  rm -f "${validation_candidate}"
+  if [[ -f "${FIREWALL_CONFIG}" ]]; then
+    backup="${BACKUP_ROOT}/firewall-${timestamp}.nft"
+    cp -a "${FIREWALL_CONFIG}" "${backup}"
+  fi
+  cp -a "${candidate}" "${FIREWALL_CONFIG}"
+  : > "${marker}"
+  cat > "${rollback_script}" <<EOF
+#!/bin/sh
+sleep ${FIREWALL_ROLLBACK_SECONDS}
+if [ -e '${marker}' ]; then
+  nft delete table inet ${FIREWALL_TABLE} >/dev/null 2>&1 || true
+EOF
+  [[ -n "${backup}" ]] && printf "  nft -f '%s' >/dev/null 2>&1 || true\n" "${backup}" >> "${rollback_script}"
+  cat >> "${rollback_script}" <<EOF
+fi
+rm -f '${marker}' '${rollback_script}'
+EOF
+  chmod 700 "${rollback_script}"
+  nohup "${rollback_script}" >/dev/null 2>&1 &
+
+  nft delete table inet "${FIREWALL_TABLE}" >/dev/null 2>&1 || true
+  if ! nft -f "${FIREWALL_CONFIG}"; then
+    rm -f "${marker}"
+    [[ -n "${backup}" ]] && nft -f "${backup}" >/dev/null 2>&1 || true
+    die "应用规则失败，已尝试恢复旧规则。"
+  fi
+  printf '\n规则已临时应用，%s 秒内未确认将自动撤销。\n' "${FIREWALL_ROLLBACK_SECONDS}"
+  nft list table inet "${FIREWALL_TABLE}"
+  if prompt_yes_no "当前 SSH 会话正常，确认保存并启用开机加载" "0"; then
+    firewall_install_persistence
+    rm -f "${marker}"
+    log "防火墙已确认并持久化。"
+  else
+    nft delete table inet "${FIREWALL_TABLE}" >/dev/null 2>&1 || true
+    [[ -n "${backup}" ]] && nft -f "${backup}" >/dev/null 2>&1 || true
+    rm -f "${marker}"
+    warn "已撤销本次规则。"
+    return 1
+  fi
+}
+
+
+configure_firewall_mode() {
+  local mode="$1" candidate tcp_ports="" udp_ports="" ssh_ports=""
+  local proto port address process listeners=""
+  require_root
+  command -v nft >/dev/null 2>&1 || die "当前系统未安装 nftables。请先通过初始化环境安装必要工具。"
+  nft list ruleset >/dev/null 2>&1 || die "当前内核或容器没有可用的 nftables/NET_ADMIN 权限。"
+  ssh_ports="$(detect_ssh_ports)" || die "无法可靠识别 SSH 监听端口，已停止以避免失联。"
+  tcp_ports="$(printf '%s\n' "${ssh_ports}" | sort -nu | tr '\n' ' ' | sed 's/ $//')"
+  printf '\n检测到 SSH TCP 端口：%s\n' "${tcp_ports}"
+  if [[ "${mode}" == "proxy" ]]; then
+    listeners="$(list_public_listeners)"
+    printf '\n当前非回环 TCP/UDP 监听候选：\n'
+    printf '%-5s %-7s %-28s %s\n' "协议" "端口" "监听地址" "进程"
+    while IFS='|' read -r proto port address process; do
+      [[ -n "${proto}" ]] || continue
+      printf '%-5s %-7s %-28s %s\n' "${proto}" "${port}" "${address}" "${process}"
+      [[ "${proto}" == "tcp" ]] && tcp_ports+=" ${port}" || udp_ports+=" ${port}"
+    done <<< "${listeners}"
+    tcp_ports="$(printf '%s\n' ${tcp_ports} | sort -nu | tr '\n' ' ' | sed 's/ $//')"
+    if [[ -n "${udp_ports// /}" ]]; then udp_ports="$(printf '%s\n' ${udp_ports} | sort -nu | tr '\n' ' ' | sed 's/ $//')"; fi
+  fi
+  printf '\n拟开放 TCP：%s\n' "${tcp_ports:-无}"
+  printf '拟开放 UDP：%s\n' "${udp_ports:-无}"
+  printf '其余 IPv4/IPv6 入站将拒绝；出站、转发和其他 nftables 表不会修改。\n'
+  prompt_yes_no "确认生成并临时应用上述规则" "0" || { printf '已取消。\n'; return 0; }
+  candidate="$(mktemp /tmp/vps-manager-firewall.XXXXXX)"
+  firewall_write_rules "${tcp_ports}" "${udp_ports}" "${candidate}"
+  firewall_apply_with_rollback "${candidate}"
+  rm -f "${candidate}"
+}
+
+
+manually_update_firewall_ports() {
+  local current_tcp current_udp input tcp_ports udp_ports ssh_ports candidate
+  require_root
+  command -v nft >/dev/null 2>&1 || die "当前系统未安装 nftables。"
+  nft list ruleset >/dev/null 2>&1 || die "当前内核或容器没有可用的 nftables/NET_ADMIN 权限。"
+  ssh_ports="$(detect_ssh_ports)" || die "无法可靠识别 SSH 监听端口，已停止以避免失联。"
+  current_tcp="$(firewall_configured_ports tcp)"
+  current_udp="$(firewall_configured_ports udp)"
+  [[ -n "${current_tcp}" ]] || current_tcp="${ssh_ports//$'\n'/ }"
+
+  printf '\n当前 TCP 白名单：%s\n' "${current_tcp:-无}"
+  printf '当前 UDP 白名单：%s\n' "${current_udp:-无}"
+  printf '请输入完整的新白名单，可用空格或逗号分隔。UDP 可以留空。\n'
+  while true; do
+    input="$(prompt_default "TCP 端口" "${current_tcp}")"
+    if tcp_ports="$(normalize_port_list "${input}")"; then break; fi
+    warn "TCP 端口列表包含无效值，请重新输入。"
+  done
+  while true; do
+    input="$(prompt_default "UDP 端口" "${current_udp}")"
+    if udp_ports="$(normalize_port_list "${input}")"; then break; fi
+    warn "UDP 端口列表包含无效值，请重新输入。"
+  done
+  tcp_ports="$(normalize_port_list "${tcp_ports} ${ssh_ports//$'\n'/ }")"
+  printf '\n最终 TCP 白名单：%s（SSH 端口强制保留）\n' "${tcp_ports}"
+  printf '最终 UDP 白名单：%s\n' "${udp_ports:-无}"
+  prompt_yes_no "确认临时应用这份完整白名单" "0" || { printf '已取消。\n'; return 0; }
+  candidate="$(mktemp /tmp/vps-manager-firewall.XXXXXX)"
+  firewall_write_rules "${tcp_ports}" "${udp_ports}" "${candidate}"
+  firewall_apply_with_rollback "${candidate}"
+  rm -f "${candidate}"
+}
+
+
+disable_managed_firewall() {
+  require_root
+  if [[ ! -f "${FIREWALL_CONFIG}" ]] && ! nft list table inet "${FIREWALL_TABLE}" >/dev/null 2>&1; then
+    warn "脚本管理的防火墙尚未启用。"
+    return 0
+  fi
+  printf '停用后将立即移除脚本的入站限制，但保留配置文件，之后可以重新应用。\n'
+  prompt_yes_no "确认停用脚本管理的防火墙" "0" || { printf '已取消。\n'; return 0; }
+  if is_alpine; then
+    [[ -x "${FIREWALL_OPENRC_SERVICE}" ]] && rc-service vps-manager-firewall stop >/dev/null 2>&1 || true
+    rc-update del vps-manager-firewall default >/dev/null 2>&1 || true
+  else
+    systemctl disable --now vps-manager-firewall.service >/dev/null 2>&1 || true
+  fi
+  nft delete table inet "${FIREWALL_TABLE}" >/dev/null 2>&1 || true
+  log "防火墙已停用；保留的配置：${FIREWALL_CONFIG}"
+}
+
+
+firewall_management_menu() {
+  local choice
+  while true; do
+    printf '\n防火墙管理（nftables）\n'
+    printf '  1) 主站防火墙配置：仅开放 SSH\n'
+    printf '  2) 代理站防火墙配置/刷新：重新扫描当前监听端口\n'
+    printf '  3) 手动维护 TCP/UDP 白名单\n'
+    printf '  4) 查看脚本管理的防火墙规则\n'
+    printf '  5) 停用脚本管理的防火墙（保留配置）\n'
+    printf '  0) 返回\n'
+    read -r -p "请选择: " choice
+    case "${choice:-0}" in
+      1) configure_firewall_mode main ;;
+      2) configure_firewall_mode proxy ;;
+      3) manually_update_firewall_ports ;;
+      4) nft list table inet "${FIREWALL_TABLE}" 2>/dev/null || warn "脚本管理的防火墙尚未启用。" ;;
+      5) disable_managed_firewall ;;
+      0) return 0 ;;
+      *) warn "未知选项。" ;;
+    esac
+  done
+}
+
+
 show_help() {
   cat <<EOF
 ${SCRIPT_NAME} ${SCRIPT_VERSION}
@@ -5016,6 +5312,7 @@ main_menu() {
     printf '  6) 状态检查\n'
     printf '  7) 从 GitHub 更新当前脚本\n'
     printf '  8) 删除当前 .sh 脚本\n'
+    printf '  9) 防火墙管理\n'
     printf '  0) 退出\n'
     read -r -p "请选择: " choice
     case "${choice}" in
@@ -5032,6 +5329,7 @@ main_menu() {
           exit 0
         fi
         ;;
+      9) firewall_management_menu; pause_screen ;;
       0) printf '已退出。\n'; return 0 ;;
       *) warn "未知选项：${choice}" ;;
     esac
@@ -5050,6 +5348,7 @@ alpine_main_menu() {
     printf '  4) 状态检查\n'
     printf '  7) 从 GitHub 更新当前脚本\n'
     printf '  8) 删除当前 .sh 脚本\n'
+    printf '  9) 防火墙管理\n'
     printf '  0) 退出\n'
     read -r -p "请选择: " choice
     case "${choice}" in
@@ -5059,6 +5358,7 @@ alpine_main_menu() {
       4) show_system_status; pause_screen ;;
       7) update_current_script || true; pause_screen ;;
       8) if delete_current_script; then printf '脚本已删除，程序退出。\n'; exit 0; fi ;;
+      9) firewall_management_menu; pause_screen ;;
       0) printf '已退出。\n'; return 0 ;;
       *) warn "未知选项：${choice}" ;;
     esac
