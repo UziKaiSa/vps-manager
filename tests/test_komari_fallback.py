@@ -31,3 +31,18 @@ def test_systemd_working_directory_is_unquoted_and_verified():
     assert "WorkingDirectory=${install_dir}" in TEXT
     assert 'WorkingDirectory="${install_dir}"' not in TEXT
     assert 'systemd-analyze verify "${service_file}"' in TEXT
+
+
+def test_komari_ip_mode_defaults_to_agent_managed_auto_follow():
+    assert "公网 IPv4 上报方式" in TEXT
+    assert "1) 自动跟随（推荐，适合动态 IP）" in TEXT
+    assert "2) 固定覆盖（适合固定 IP、特殊出口）" in TEXT
+    assert 'local disable_ssh=1 gpu=1 ip_mode="auto"' in TEXT
+    assert '[[ "${ip_mode}" == "fixed" ]] && args+=(--custom-ipv4 "${public_ip}")' in TEXT
+
+
+def test_fixed_ip_is_preserved_for_local_and_download_fallbacks():
+    assert 'printf \'  IPv4: 自动跟随（由 Komari Agent 定期探测）\\n\'' in TEXT
+    assert 'printf \'  IPv4: 固定覆盖 %s\\n\' "${public_ip}"' in TEXT
+    assert '"${disable_ssh}" "${gpu}" "${public_ip}"' in TEXT
+    assert "detect_ip" not in TEXT

@@ -4046,7 +4046,7 @@ komari_download_repo_fallback() {
 
 komari_install_fallback_after_failure() {
   local home="$1" endpoint="$2" token="$3" install_dir="$4" day="$5"
-  local disable_ssh="$6" gpu="$7" detect_ip="$8" public_ip="${9:-}" local_agent=""
+  local disable_ssh="$6" gpu="$7" public_ip="${8:-}" local_agent=""
   local_agent="$(komari_local_agent_candidate "${home}" || true)"
   if [[ -n "${local_agent}" ]]; then
     prompt_yes_no "是否改用本机兜底 Agent：$(basename "${local_agent}")" 1 || return 1
@@ -4054,18 +4054,14 @@ komari_install_fallback_after_failure() {
     komari_download_repo_fallback || return 1
     local_agent="${KOMARI_REPO_FALLBACK_PATH}"
   fi
-  if [[ "${detect_ip}" == 1 && -z "${public_ip}" ]]; then
-    public_ip="$(curl -4 -fsS --max-time 10 https://api.ipify.org 2>/dev/null || true)"
-    [[ -n "${public_ip}" ]] || warn "公网 IPv4 探测失败。"
-  fi
   komari_install_local_agent "${local_agent}" "${endpoint}" "${token}" "${install_dir}" "${day}" \
     "${disable_ssh}" "${gpu}" "${public_ip}"
 }
 
 
 komari_install_agent() {
-  local endpoint="$1" token home install_dir day installer checksum public_ip local_agent=""
-  local disable_ssh=1 gpu=1 detect_ip=1
+  local endpoint="$1" token home install_dir day installer checksum public_ip="" local_agent=""
+  local disable_ssh=1 gpu=1 ip_mode="auto" ip_choice detected_ip
   local -a args=()
   home="$(komari_target_home)"
   local_agent="$(komari_local_agent_candidate "${home}" || true)"
@@ -4082,8 +4078,27 @@ komari_install_agent() {
   [[ "${day}" =~ ^([1-9]|[12][0-9]|3[01])$ ]] || { warn "重置日必须是 1-31。"; return 1; }
   prompt_yes_no "是否禁用 Web SSH" 1 || disable_ssh=0
   prompt_yes_no "是否启用 GPU 监控" 1 || gpu=0
-  prompt_yes_no "是否自动记录公网 IPv4" 1 || detect_ip=0
+  while true; do
+    printf '\n公网 IPv4 上报方式：\n  1) 自动跟随（推荐，适合动态 IP）\n     由 Komari Agent 定期探测并更新公网 IPv4\n  2) 固定覆盖（适合固定 IP、特殊出口）\n     始终向面板上报指定的 IPv4\n'
+    read -r -p "请选择 [1]: " ip_choice
+    case "${ip_choice:-1}" in
+      1) ip_mode="auto"; break ;;
+      2)
+        ip_mode="fixed"
+        detected_ip="$(curl -4 -fsS --max-time 10 https://api.ipify.org 2>/dev/null || true)"
+        public_ip="$(prompt_default "固定上报的公网 IPv4" "${detected_ip}")"
+        [[ -n "${public_ip}" ]] || { warn "固定覆盖模式必须填写 IPv4。"; continue; }
+        break
+        ;;
+      *) warn "未知选项。" ;;
+    esac
+  done
   printf '\nAgent 配置预览：\n  Endpoint: %s\n  安装目录: %s\n  重置日: %s\n  Token: <已隐藏>\n' "${endpoint}" "${install_dir}" "${day}"
+  if [[ "${ip_mode}" == "auto" ]]; then
+    printf '  IPv4: 自动跟随（由 Komari Agent 定期探测）\n'
+  else
+    printf '  IPv4: 固定覆盖 %s\n' "${public_ip}"
+  fi
   [[ -z "${local_agent}" ]] || printf '  本地 Agent: %s\n' "${local_agent}"
   if [[ "${DEMO_MODE}" == 1 ]]; then
     if [[ -n "${local_agent}" ]]; then printf '[演示] 将校验并优先使用本地 Komari Agent：%s\n' "${local_agent}"
@@ -4093,19 +4108,15 @@ komari_install_agent() {
   fi
   prompt_yes_no "确认安装或重装 Komari Agent" 0 || return 0
   if [[ -n "${local_agent}" ]] && prompt_yes_no "是否优先使用检测到的本地 Agent（跳过 GitHub Release 下载）" 1; then
-    if [[ "${detect_ip}" == 1 ]]; then
-      public_ip="$(curl -4 -fsS --max-time 10 https://api.ipify.org 2>/dev/null || true)"
-      [[ -n "${public_ip}" ]] || warn "公网 IPv4 探测失败。"
-    fi
     komari_install_local_agent "${local_agent}" "${endpoint}" "${token}" "${install_dir}" "${day}" \
-      "${disable_ssh}" "${gpu}" "${public_ip:-}"
+      "${disable_ssh}" "${gpu}" "${public_ip}"
     return $?
   fi
   ensure_work_dir; installer="${WORK_DIR}/install-komari-agent.sh"
   if ! curl -fL --retry 3 --connect-timeout 10 -o "${installer}" "${KOMARI_INSTALL_URL}"; then
     warn "Komari 官方安装器下载失败。"
     komari_install_fallback_after_failure "${home}" "${endpoint}" "${token}" "${install_dir}" "${day}" \
-      "${disable_ssh}" "${gpu}" "${detect_ip}" "${public_ip:-}"
+      "${disable_ssh}" "${gpu}" "${public_ip}"
     return $?
   fi
   chmod 700 "${installer}"
@@ -4114,14 +4125,11 @@ komari_install_agent() {
   args=(-e "${endpoint}" -t "${token}" --install-dir "${install_dir}" --month-rotate "${day}")
   [[ "${disable_ssh}" == 1 ]] && args+=(--disable-web-ssh)
   [[ "${gpu}" == 1 ]] && args+=(--gpu)
-  if [[ "${detect_ip}" == 1 ]]; then
-    public_ip="$(curl -4 -fsS --max-time 10 https://api.ipify.org 2>/dev/null || true)"
-    [[ -n "${public_ip}" ]] && args+=(--custom-ipv4 "${public_ip}") || warn "公网 IPv4 探测失败。"
-  fi
+  [[ "${ip_mode}" == "fixed" ]] && args+=(--custom-ipv4 "${public_ip}")
   if ! bash "${installer}" "${args[@]}"; then
     warn "Komari 官方安装流程失败，通常是 GitHub Release 文件链路不可用。"
     komari_install_fallback_after_failure "${home}" "${endpoint}" "${token}" "${install_dir}" "${day}" \
-      "${disable_ssh}" "${gpu}" "${detect_ip}" "${public_ip:-}"
+      "${disable_ssh}" "${gpu}" "${public_ip}"
     return $?
   fi
   service_status_text komari-agent | sed -n '1,60p' || true
