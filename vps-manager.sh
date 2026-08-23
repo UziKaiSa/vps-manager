@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.9.16-test"
+SCRIPT_VERSION="0.9.17-test"
 SCRIPT_NAME="VPS Manager"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh"
 
@@ -13,6 +13,10 @@ KOMARI_FALLBACK_VERSION="1.2.60"
 KOMARI_FALLBACK_AMD64_SHA256="113af112a914b918f315fa6cd3a98e8c0f932900f776c4c412b2a79477180859"
 KOMARI_FALLBACK_BASE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/assets"
 KOMARI_TOKEN_ENV_FILE="/root/warp-token.env"
+KOMARI_ACCESS_CONFIG="/etc/vps-manager/komari-access-nginx.conf"
+KOMARI_ACCESS_SYSTEMD_UNIT="/etc/systemd/system/vps-manager-komari-access.service"
+KOMARI_ACCESS_OPENRC_SERVICE="/etc/init.d/vps-manager-komari-access"
+KOMARI_ACCESS_LISTEN_PORT=18080
 KOMARI_WARP_MIN_ROOT_MIB=3072
 KOMARI_WARP_MIN_FREE_MIB=1536
 KOMARI_WARP_LEGACY_MIN_FREE_MIB=400
@@ -4111,8 +4115,8 @@ komari_install_fallback_after_failure() {
 
 
 komari_install_agent() {
-  local endpoint="$1" token home install_dir day installer checksum public_ip="" local_agent=""
-  local disable_ssh=1 gpu=1 ip_mode="auto" ip_choice detected_ip
+  local endpoint="$1" skip_recovery="${2:-0}" token home install_dir day installer checksum public_ip="" local_agent=""
+  local disable_ssh=1 gpu=1 ip_mode="auto" detected_ip
   local -a args=()
   home="$(komari_target_home)"
   local_agent="$(komari_local_agent_candidate "${home}" || true)"
@@ -4129,21 +4133,14 @@ komari_install_agent() {
   [[ "${day}" =~ ^([1-9]|[12][0-9]|3[01])$ ]] || { warn "重置日必须是 1-31。"; return 1; }
   prompt_yes_no "是否禁用 Web SSH" 1 || disable_ssh=0
   prompt_yes_no "是否启用 GPU 监控" 1 || gpu=0
-  while true; do
-    printf '\n公网 IPv4 上报方式：\n  1) 自动跟随（推荐，适合动态 IP）\n     由 Komari Agent 定期探测并更新公网 IPv4\n  2) 固定覆盖（适合固定 IP、特殊出口）\n     始终向面板上报指定的 IPv4\n'
-    read -r -p "请选择 [1]: " ip_choice
-    case "${ip_choice:-1}" in
-      1) ip_mode="auto"; break ;;
-      2)
-        ip_mode="fixed"
-        detected_ip="$(curl -4 -fsS --max-time 10 https://api.ipify.org 2>/dev/null || true)"
-        public_ip="$(prompt_default "固定上报的公网 IPv4" "${detected_ip}")"
-        [[ -n "${public_ip}" ]] || { warn "固定覆盖模式必须填写 IPv4。"; continue; }
-        break
-        ;;
-      *) warn "未知选项。" ;;
-    esac
-  done
+  if prompt_yes_no "是否让 Agent 定期探测并自动跟随公网 IPv4 变化" 1; then
+    ip_mode="auto"
+  else
+    ip_mode="fixed"
+    detected_ip="$(curl -4 -fsS --max-time 10 https://api.ipify.org 2>/dev/null || true)"
+    public_ip="$(prompt_default "固定上报的公网 IPv4" "${detected_ip}")"
+    [[ -n "${public_ip}" ]] || { warn "关闭自动跟随后必须填写固定 IPv4。"; return 1; }
+  fi
   printf '\nAgent 配置预览：\n  Endpoint: %s\n  安装目录: %s\n  重置日: %s\n  Token: <已隐藏>\n' "${endpoint}" "${install_dir}" "${day}"
   if [[ "${ip_mode}" == "auto" ]]; then
     printf '  IPv4: 自动跟随（由 Komari Agent 定期探测）\n'
@@ -4160,30 +4157,66 @@ komari_install_agent() {
   prompt_yes_no "确认安装或重装 Komari Agent" 0 || return 0
   if [[ -n "${local_agent}" ]] && prompt_yes_no "是否优先使用检测到的本地 Agent（跳过 GitHub Release 下载）" 1; then
     komari_install_local_agent "${local_agent}" "${endpoint}" "${token}" "${install_dir}" "${day}" \
-      "${disable_ssh}" "${gpu}" "${public_ip}"
-    return $?
-  fi
-  ensure_work_dir; installer="${WORK_DIR}/install-komari-agent.sh"
-  if ! curl -fL --retry 3 --connect-timeout 10 -o "${installer}" "${KOMARI_INSTALL_URL}"; then
-    warn "Komari 官方安装器下载失败。"
-    komari_install_fallback_after_failure "${home}" "${endpoint}" "${token}" "${install_dir}" "${day}" \
-      "${disable_ssh}" "${gpu}" "${public_ip}"
-    return $?
-  fi
-  chmod 700 "${installer}"
-  bash -n "${installer}" || { warn "Komari 官方安装器语法校验失败。"; return 1; }
-  checksum="$(sha256sum "${installer}" | awk '{print $1}')"; log "Komari 官方安装器 SHA-256: ${checksum}"
-  args=(-e "${endpoint}" -t "${token}" --install-dir "${install_dir}" --month-rotate "${day}")
-  [[ "${disable_ssh}" == 1 ]] && args+=(--disable-web-ssh)
-  [[ "${gpu}" == 1 ]] && args+=(--gpu)
-  [[ "${ip_mode}" == "fixed" ]] && args+=(--custom-ipv4 "${public_ip}")
-  if ! bash "${installer}" "${args[@]}"; then
-    warn "Komari 官方安装流程失败，通常是 GitHub Release 文件链路不可用。"
-    komari_install_fallback_after_failure "${home}" "${endpoint}" "${token}" "${install_dir}" "${day}" \
-      "${disable_ssh}" "${gpu}" "${public_ip}"
-    return $?
+      "${disable_ssh}" "${gpu}" "${public_ip}" || return 1
+  else
+    ensure_work_dir; installer="${WORK_DIR}/install-komari-agent.sh"
+    if ! curl -fL --retry 3 --connect-timeout 10 -o "${installer}" "${KOMARI_INSTALL_URL}"; then
+      warn "Komari 官方安装器下载失败。"
+      komari_install_fallback_after_failure "${home}" "${endpoint}" "${token}" "${install_dir}" "${day}" \
+        "${disable_ssh}" "${gpu}" "${public_ip}" || return 1
+    else
+      chmod 700 "${installer}"
+      bash -n "${installer}" || { warn "Komari 官方安装器语法校验失败。"; return 1; }
+      checksum="$(sha256sum "${installer}" | awk '{print $1}')"; log "Komari 官方安装器 SHA-256: ${checksum}"
+      args=(-e "${endpoint}" -t "${token}" --install-dir "${install_dir}" --month-rotate "${day}")
+      [[ "${disable_ssh}" == 1 ]] && args+=(--disable-web-ssh)
+      [[ "${gpu}" == 1 ]] && args+=(--gpu)
+      [[ "${ip_mode}" == "fixed" ]] && args+=(--custom-ipv4 "${public_ip}")
+      if ! bash "${installer}" "${args[@]}"; then
+        warn "Komari 官方安装流程失败，通常是 GitHub Release 文件链路不可用。"
+        komari_install_fallback_after_failure "${home}" "${endpoint}" "${token}" "${install_dir}" "${day}" \
+          "${disable_ssh}" "${gpu}" "${public_ip}" || return 1
+      fi
+    fi
   fi
   service_status_text komari-agent | sed -n '1,60p' || true
+  if komari_verify_agent_install "${endpoint}"; then
+    log "Komari Agent 服务和上报通道检查通过"
+    return 0
+  fi
+  [[ "${skip_recovery}" == 1 ]] && return 1
+  komari_install_failure_menu
+}
+
+
+komari_verify_agent_install() {
+  local endpoint="$1" attempt
+  log "检查 Komari Agent 状态和上报通道"
+  for attempt in 1 2 3; do
+    if service_is_active komari-agent \
+      && curl -fsS --connect-timeout 5 --max-time 12 -o /dev/null "${endpoint}"; then
+      return 0
+    fi
+    [[ "${attempt}" == 3 ]] || sleep 3
+  done
+  warn "Komari Agent 未通过安装后检查：服务未运行或上报地址不可达。"
+  service_status_text komari-agent | sed -n '1,60p' || true
+  return 1
+}
+
+
+komari_install_failure_menu() {
+  local choice
+  while true; do
+    printf '\n探针安装后检查失败，请选择恢复方式：\n  1) 重新使用内网/WARP 安装\n  2) 使用零信任公网 Service Token 兜底安装\n  3) 退出\n'
+    read -r -p "请选择 [3]: " choice
+    case "${choice:-3}" in
+      1) install_komari_warp 1 && return 0 ;;
+      2) install_komari_access_public 1 && return 0 ;;
+      3) return 1 ;;
+      *) warn "未知选项。" ;;
+    esac
+  done
 }
 
 
@@ -4823,14 +4856,162 @@ komari_verify_warp() {
 }
 
 
+komari_install_access_nginx() {
+  local nginx_was_present=0
+  command -v nginx >/dev/null 2>&1 && nginx_was_present=1
+  if [[ "${nginx_was_present}" == 0 ]]; then
+    log "安装零信任公网中继所需的 nginx"
+    if is_alpine; then
+      apk add --no-cache nginx || return 1
+    else
+      apt_update_safe || return 1
+      DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout="${APT_LOCK_WAIT_SECONDS}" \
+        install -y --no-install-recommends nginx || return 1
+      systemctl disable --now nginx.service >/dev/null 2>&1 || true
+    fi
+  fi
+  command -v nginx >/dev/null 2>&1 || { warn "nginx 安装失败。"; return 1; }
+}
+
+
+komari_write_access_proxy() {
+  local hostname="$1" client_id="$2" client_secret="$3" candidate backup=""
+  ensure_work_dir
+  candidate="${WORK_DIR}/komari-access-nginx.conf"
+  cat > "${candidate}" <<EOF
+worker_processes 1;
+pid /run/vps-manager-komari-access.pid;
+error_log /dev/null emerg;
+
+events { worker_connections 128; }
+
+http {
+    access_log off;
+    resolver 1.1.1.1 8.8.8.8 ipv6=off valid=300s;
+    map \$http_upgrade \$connection_upgrade {
+        default upgrade;
+        '' close;
+    }
+    server {
+        listen 127.0.0.1:${KOMARI_ACCESS_LISTEN_PORT};
+        location / {
+            set \$komari_upstream https://${hostname};
+            proxy_pass \$komari_upstream\$request_uri;
+            proxy_ssl_server_name on;
+            proxy_ssl_name ${hostname};
+            proxy_http_version 1.1;
+            proxy_set_header Host ${hostname};
+            proxy_set_header CF-Access-Client-Id "${client_id}";
+            proxy_set_header CF-Access-Client-Secret "${client_secret}";
+            proxy_set_header Upgrade \$http_upgrade;
+            proxy_set_header Connection \$connection_upgrade;
+            proxy_read_timeout 300s;
+            proxy_send_timeout 300s;
+        }
+    }
+}
+EOF
+  nginx -t -c "${candidate}" || { warn "零信任公网 nginx 配置校验失败。"; return 1; }
+  install -d -m 700 "$(dirname "${KOMARI_ACCESS_CONFIG}")"
+  [[ ! -e "${KOMARI_ACCESS_CONFIG}" ]] || backup="$(backup_file "${KOMARI_ACCESS_CONFIG}" komari-access-nginx)"
+  install -m 600 "${candidate}" "${KOMARI_ACCESS_CONFIG}"
+  [[ -z "${backup}" ]] || log "原零信任公网配置已备份到 ${backup}"
+}
+
+
+komari_install_access_service() {
+  local nginx_bin service_file candidate backup=""
+  nginx_bin="$(command -v nginx)"
+  ensure_work_dir
+  if is_alpine; then
+    service_file="${KOMARI_ACCESS_OPENRC_SERVICE}"
+    candidate="${WORK_DIR}/vps-manager-komari-access.openrc"
+    cat > "${candidate}" <<EOF
+#!/sbin/openrc-run
+name="VPS Manager Komari Access Proxy"
+command="${nginx_bin}"
+command_args="-c ${KOMARI_ACCESS_CONFIG}"
+pidfile="/run/vps-manager-komari-access.pid"
+
+depend() {
+    need net
+    after network
+}
+EOF
+    chmod 700 "${candidate}"
+  else
+    service_file="${KOMARI_ACCESS_SYSTEMD_UNIT}"
+    candidate="${WORK_DIR}/vps-manager-komari-access.service"
+    cat > "${candidate}" <<EOF
+[Unit]
+Description=VPS Manager Komari Cloudflare Access Proxy
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=${nginx_bin} -t -c ${KOMARI_ACCESS_CONFIG}
+ExecStart=${nginx_bin} -c ${KOMARI_ACCESS_CONFIG} -g "daemon off;"
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    chmod 600 "${candidate}"
+  fi
+  [[ ! -e "${service_file}" ]] || backup="$(backup_file "${service_file}" komari-access-service)"
+  install -m "$(is_alpine && printf 700 || printf 600)" "${candidate}" "${service_file}"
+  if ! is_alpine; then
+    systemctl daemon-reload
+    systemd-analyze verify "${service_file}" >/dev/null 2>&1 \
+      || { warn "零信任公网 systemd 服务校验失败。"; return 1; }
+  fi
+  service_enable_start vps-manager-komari-access \
+    || { warn "零信任公网本地中继启动失败。"; return 1; }
+  [[ -z "${backup}" ]] || log "原中继服务已备份到 ${backup}"
+}
+
+
+install_komari_access_public() {
+  local skip_recovery="${1:-0}" hostname client_id client_secret endpoint
+  require_root; check_supported_os
+  printf '\n该模式通过仅监听本机的 nginx 添加 Cloudflare Access Service Token。\n'
+  printf '不会修改 Cloudflare；请准备好已受 Access 保护的 Komari 公网域名和 Service Token。\n'
+  hostname="$(prompt_required "Komari 零信任公网域名（不含 https:// 和路径）")"
+  [[ "${hostname}" =~ ^[A-Za-z0-9.-]+$ && "${hostname}" == *.* ]] \
+    || { warn "公网域名格式不正确。"; return 1; }
+  client_id="$(prompt_secret "Cloudflare Access Client ID")"
+  client_secret="$(prompt_secret "Cloudflare Access Client Secret")"
+  [[ "${client_id}" =~ ^[A-Za-z0-9._-]+$ && "${client_secret}" =~ ^[A-Za-z0-9._-]+$ ]] \
+    || { warn "Service Token 不能为空，且只能包含字母、数字、点、下划线或连字符。"; return 1; }
+  endpoint="http://127.0.0.1:${KOMARI_ACCESS_LISTEN_PORT}"
+  printf '\n配置预览：\n  公网域名: https://%s\n  Agent Endpoint: %s\n  Service Token: <已隐藏>\n' \
+    "${hostname}" "${endpoint}"
+  if [[ "${DEMO_MODE}" == 1 ]]; then
+    printf '[演示] 将安装独立本机 nginx 中继，再进入完整 Agent 配置流程。\n'
+    komari_install_agent "${endpoint}" 1
+    return 0
+  fi
+  prompt_yes_no "确认配置零信任公网安装通道" 0 || return 0
+  komari_install_access_nginx || return 1
+  komari_write_access_proxy "${hostname}" "${client_id}" "${client_secret}" || return 1
+  komari_install_access_service || return 1
+  curl -fsS --connect-timeout 8 --max-time 20 -o /dev/null "${endpoint}" \
+    || { warn "零信任公网中继不可达，请核对域名、Access Application 和 Service Token。"; return 1; }
+  log "零信任公网中继已就绪；现在进入完整 Agent 配置流程"
+  komari_install_agent "${endpoint}" "${skip_recovery}"
+}
+
+
 install_komari_warp() {
-  local team endpoint install_agent=1
+  local skip_recovery="${1:-0}" team endpoint install_agent=1
   require_root; check_supported_os
   team="$(prompt_required "Cloudflare Zero Trust Team 名称")"
   endpoint="$(prompt_required "Komari 私网连接地址")"
   prompt_yes_no "WARP 完成后是否继续安装/重装 Agent" 1 || install_agent=0
   printf '\n配置预览：\n  Team: %s\n  私网地址: %s\n  MDM: /var/lib/cloudflare-warp/mdm.xml\n  Service Token: 环境变量、%s 或安全输入\n' "${team}" "${endpoint}" "${KOMARI_TOKEN_ENV_FILE}"
-  if [[ "${DEMO_MODE}" == 1 ]]; then printf '[演示] 使用主脚本内置流程，不下载 komari-warp-scripts 包装脚本。\n'; [[ "${install_agent}" == 1 ]] && komari_install_agent "${endpoint}"; return 0; fi
+  if [[ "${DEMO_MODE}" == 1 ]]; then printf '[演示] 使用主脚本内置流程，不下载 komari-warp-scripts 包装脚本。\n'; [[ "${install_agent}" == 1 ]] && komari_install_agent "${endpoint}" "${skip_recovery}"; return 0; fi
   prompt_yes_no "确认配置 WARP 私网" 0 || return 0
   log "安装 Cloudflare WARP"
   if ! komari_install_warp_client; then
@@ -4842,7 +5023,7 @@ install_komari_warp() {
   komari_write_mdm "${team}"
   komari_connect_warp
   komari_verify_warp "${endpoint}"
-  [[ "${install_agent}" == 1 ]] && komari_install_agent "${endpoint}"
+  [[ "${install_agent}" == 1 ]] && komari_install_agent "${endpoint}" "${skip_recovery}"
 }
 
 
@@ -4867,14 +5048,14 @@ komari_menu() {
   local choice
   while true; do
     if is_alpine; then
-      printf '\nAlpine Komari/WARP 管理：\n  1) 配置/修复 WARP 私网，并安装/重装 Agent\n  2) 查看 Agent/WARP 状态\n  3) 重连 WARP\n  0) 返回\n'
+      printf '\nAlpine Komari/WARP 管理：\n  1) 配置/修复 WARP 私网，并安装/重装 Agent\n  2) 零信任公网 Service Token 安装/重装 Agent\n  3) 查看 Agent/WARP 状态\n  4) 重连 WARP\n  0) 返回\n'
       read -r -p "请选择 [0]: " choice
-      case "${choice:-0}" in 1) install_komari_warp ;; 2) komari_status ;; 3) komari_reconnect_warp ;; 0) return 0 ;; *) warn "未知选项。" ;; esac
+      case "${choice:-0}" in 1) install_komari_warp ;; 2) install_komari_access_public ;; 3) komari_status ;; 4) komari_reconnect_warp ;; 0) return 0 ;; *) warn "未知选项。" ;; esac
       continue
     fi
-    printf '\nKomari Agent 安装/管理：\n  1) 配置/修复 WARP 私网，并可继续安装 Agent（内置流程）\n  2) 安装/重装普通公网 Agent\n  3) 查看 Agent/WARP 状态\n  4) 重连 WARP\n  0) 返回\n'
+    printf '\nKomari Agent 安装/管理：\n  1) 配置/修复 WARP 私网，并可继续安装 Agent（内置流程）\n  2) 安装/重装普通公网 Agent\n  3) 零信任公网 Service Token 安装/重装 Agent\n  4) 查看 Agent/WARP 状态\n  5) 重连 WARP\n  0) 返回\n'
     read -r -p "请选择 [0]: " choice
-    case "${choice:-0}" in 1) install_komari_warp ;; 2) install_komari_standard ;; 3) komari_status ;; 4) komari_reconnect_warp ;; 0) return 0 ;; *) warn "未知选项。" ;; esac
+    case "${choice:-0}" in 1) install_komari_warp ;; 2) install_komari_standard ;; 3) install_komari_access_public ;; 4) komari_status ;; 5) komari_reconnect_warp ;; 0) return 0 ;; *) warn "未知选项。" ;; esac
   done
 }
 

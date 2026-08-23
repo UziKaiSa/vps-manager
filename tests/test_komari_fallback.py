@@ -34,9 +34,8 @@ def test_systemd_working_directory_is_unquoted_and_verified():
 
 
 def test_komari_ip_mode_defaults_to_agent_managed_auto_follow():
-    assert "公网 IPv4 上报方式" in TEXT
-    assert "1) 自动跟随（推荐，适合动态 IP）" in TEXT
-    assert "2) 固定覆盖（适合固定 IP、特殊出口）" in TEXT
+    assert "是否让 Agent 定期探测并自动跟随公网 IPv4 变化" in TEXT
+    assert "公网 IPv4 上报方式" not in TEXT
     assert 'local disable_ssh=1 gpu=1 ip_mode="auto"' in TEXT
     assert '[[ "${ip_mode}" == "fixed" ]] && args+=(--custom-ipv4 "${public_ip}")' in TEXT
 
@@ -46,3 +45,17 @@ def test_fixed_ip_is_preserved_for_local_and_download_fallbacks():
     assert 'printf \'  IPv4: 固定覆盖 %s\\n\' "${public_ip}"' in TEXT
     assert '"${disable_ssh}" "${gpu}" "${public_ip}"' in TEXT
     assert "detect_ip" not in TEXT
+
+
+def test_failed_post_install_check_offers_private_public_or_exit():
+    assert 'komari_verify_agent_install "${endpoint}"' in TEXT
+    assert "1) 重新使用内网/WARP 安装" in TEXT
+    assert "2) 使用零信任公网 Service Token 兜底安装" in TEXT
+    assert "3) 退出" in TEXT
+
+
+def test_access_public_install_uses_loopback_proxy_and_full_agent_flow():
+    assert 'listen 127.0.0.1:${KOMARI_ACCESS_LISTEN_PORT}' in TEXT
+    assert "CF-Access-Client-Id" in TEXT
+    assert "CF-Access-Client-Secret" in TEXT
+    assert 'komari_install_agent "${endpoint}" "${skip_recovery}"' in TEXT

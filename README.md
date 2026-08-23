@@ -383,10 +383,25 @@ proxy-groups:
 ```text
 1) 配置/修复 WARP 私网，并可继续安装 Agent
 2) 安装/重装普通公网 Komari Agent
-3) 查看 Agent/WARP 状态
-4) 重连 WARP
+3) 零信任公网 Service Token 安装/重装 Agent
+4) 查看 Agent/WARP 状态
+5) 重连 WARP
 0) 返回
 ```
+
+Agent 安装完成后，脚本会同时检查服务状态和上报地址。检查失败时会提供“重新使用内网/WARP 安装”“使用零信任公网 Service Token 兜底安装”和“退出”三个选项。
+
+公网 IPv4 默认由 Agent 定期探测并自动跟随变化，交互提示使用 `[Y/n]`；只有选择 `N` 时才会要求填写固定上报 IPv4。
+
+### 零信任公网 Service Token 模式
+
+该模式适用于不能开启 TUN、又不希望调整现有 Zero Trust 私网路由的主机。脚本会要求输入受 Cloudflare Access 保护的 Komari 公网域名、Access Client ID 和 Client Secret，然后安装一个独立 nginx 中继：
+
+- 只监听 `127.0.0.1:18080`，不开放公网端口
+- 自动为 HTTP 和 WebSocket 上报添加 Service Token 请求头
+- Access 凭据保存在权限为 `600` 的 `/etc/vps-manager/komari-access-nginx.conf`
+- Agent 仍会依次配置 Token、安装目录、流量重置日、Web SSH、GPU 和公网 IP 跟随方式，只把 Endpoint 改为本机中继
+- 不修改 Cloudflare 平台配置
 
 ### WARP 私网模式
 
