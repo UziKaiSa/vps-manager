@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.9.14-test"
+SCRIPT_VERSION="0.9.15-test"
 SCRIPT_NAME="VPS Manager"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh"
 
@@ -5591,7 +5591,7 @@ alpine_main_menu() {
   while true; do
     show_banner
     printf ' Alpine 受限模式：只提供本机需要的功能\n'
-    printf '  1) 检查/开启 BBR（仅安装必要工具）\n'
+    printf '  1) 初始化环境：基础工具和可选 BBR\n'
     printf '  2) Xray 管理：安装、配置或更新\n'
     printf '  3) Komari + WARP 管理\n'
     printf '  4) 状态检查\n'
@@ -5601,7 +5601,7 @@ alpine_main_menu() {
     printf '  0) 退出\n'
     read -r -p "请选择: " choice
     case "${choice}" in
-      1) enable_bbr; pause_screen ;;
+      1) initialize_environment; pause_screen ;;
       2) xray_management_menu; pause_screen ;;
       3) komari_menu; pause_screen ;;
       4) show_system_status; pause_screen ;;

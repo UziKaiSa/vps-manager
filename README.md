@@ -2,7 +2,7 @@
 
 `VPS Manager` 是一个面向 Debian/Ubuntu VPS 的中文交互式管理脚本，并为小硬盘 Alpine/OpenRC NAT VPS 提供受限模式，用于完成服务器初始化、Xray 配置，以及 Komari Agent/WARP 私网接入。
 
-当前版本：`0.9.14-test`
+当前版本：`0.9.15-test`
 
 > 目前是测试版。首次在正式服务器上使用前，建议先运行预览模式，并保留一个已经登录的 SSH 终端。
 
@@ -28,7 +28,7 @@
 ## 支持环境
 
 - Debian 或 Ubuntu，并使用 `systemd`：支持完整功能
-- Alpine Linux `x86_64`，并使用 OpenRC：只支持 BBR 检查、Xray、Komari+WARP、状态检查和脚本更新/删除
+- Alpine Linux `x86_64`，并使用 OpenRC：支持基础工具与可选 BBR、Xray、Komari+WARP、状态检查和脚本更新/删除
 - 使用 root 运行，或者当前用户可以执行 `sudo`
 - 服务器能够访问所需的软件源
 
