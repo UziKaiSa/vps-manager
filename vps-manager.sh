@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.9.13-test"
+SCRIPT_VERSION="0.9.14-test"
 SCRIPT_NAME="VPS Manager"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh"
 
@@ -626,6 +626,7 @@ show_bbr_status() {
 enable_bbr() {
   local config="/etc/sysctl.d/99-vps-manager-bbr.conf"
   local backup=""
+  local config_existed=0
 
   require_root
   check_supported_os
@@ -653,6 +654,7 @@ enable_bbr() {
   fi
 
   if [[ -e "${config}" ]]; then
+    config_existed=1
     backup="$(backup_file "${config}" "bbr")"
   fi
 
@@ -663,7 +665,20 @@ enable_bbr() {
   fi
   printf '%s\n' 'net.ipv4.tcp_congestion_control=bbr' >> "${WORK_DIR}/bbr.conf"
   install -o root -g root -m 644 "${WORK_DIR}/bbr.conf" "${config}"
-  sysctl --system >/dev/null
+
+  if [[ -e /proc/sys/net/core/default_qdisc ]] \
+    && ! sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1; then
+    warn "容器不允许修改默认队列；将继续单独尝试启用 BBR。"
+  fi
+  if ! sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1; then
+    if (( config_existed == 1 )); then
+      cp -a -- "${backup}/$(basename "${config}")" "${config}"
+    else
+      rm -f -- "${config}"
+    fi
+    warn "内核提供 BBR，但容器不允许修改拥塞算法；基础工具已经安装，BBR 已跳过。"
+    return 0
+  fi
 
   if [[ "$(sysctl -n net.ipv4.tcp_congestion_control)" != "bbr" ]]; then
     die "BBR 配置未生效。"
@@ -1240,7 +1255,8 @@ install_base_tools() {
   fi
   if is_alpine; then
     log "安装 Alpine 基础工具"
-    apk add --no-cache bash ca-certificates curl wget vim unzip python3 py3-yaml openssl iproute2 openssh-client procps
+    apk add --no-cache bash ca-certificates curl wget vim unzip python3 py3-yaml openssl iproute2 openssh-client procps \
+      || { warn "Alpine 基础工具安装失败。"; return 1; }
     return 0
   fi
   repair_debian_bullseye_apt_sources
@@ -4984,7 +5000,7 @@ delete_current_script() {
 
 initialize_environment() {
   require_root
-  install_base_tools
+  install_base_tools || return 1
 
   if prompt_yes_no "基础工具已处理，是否继续开启 BBR" "1"; then
     enable_bbr
