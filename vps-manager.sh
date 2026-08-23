@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.9.15-test"
+SCRIPT_VERSION="0.9.16-test"
 SCRIPT_NAME="VPS Manager"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh"
 
@@ -4922,7 +4922,7 @@ current_script_path() {
 
 
 update_current_script() {
-  local target candidate staged new_version
+  local target candidate staged new_version download_url cache_bust separator
 
   require_root
   target="$(current_script_path)" \
@@ -4937,11 +4937,17 @@ update_current_script() {
 
   ensure_work_dir
   candidate="${WORK_DIR}/vps-manager.sh"
+  cache_bust="$(date -u '+%Y%m%d%H%M%S')-$$"
+  separator='?'
+  [[ "${SCRIPT_UPDATE_URL}" == *'?'* ]] && separator='&'
+  download_url="${SCRIPT_UPDATE_URL}${separator}vps_manager_nocache=${cache_bust}"
   if command -v curl >/dev/null 2>&1; then
-    curl -fL --retry 3 --connect-timeout 15 "${SCRIPT_UPDATE_URL}" -o "${candidate}" \
+    curl -fL --retry 3 --connect-timeout 15 \
+      -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' \
+      "${download_url}" -o "${candidate}" \
       || { warn "从 GitHub 下载脚本失败。"; return 1; }
   elif command -v wget >/dev/null 2>&1; then
-    wget -O "${candidate}" "${SCRIPT_UPDATE_URL}" \
+    wget -O "${candidate}" "${download_url}" \
       || { warn "从 GitHub 下载脚本失败。"; return 1; }
   else
     warn "缺少 curl 和 wget，请先运行初始化。"
