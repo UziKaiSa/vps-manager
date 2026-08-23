@@ -59,3 +59,12 @@ def test_access_public_install_uses_loopback_proxy_and_full_agent_flow():
     assert "CF-Access-Client-Id" in TEXT
     assert "CF-Access-Client-Secret" in TEXT
     assert 'komari_install_agent "${endpoint}" "${skip_recovery}"' in TEXT
+
+
+def test_access_fallback_removes_private_warp_runtime_first():
+    cleanup = TEXT.index("komari_remove_private_warp || return 1")
+    nginx = TEXT.index("komari_install_access_nginx || return 1", cleanup)
+    assert cleanup < nginx
+    assert 'rm -rf -- "${ALPINE_WARP_ROOT}"' in TEXT
+    assert "purge -y cloudflare-warp" in TEXT
+    assert "komari-private-warp-before-public" in TEXT

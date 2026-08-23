@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.9.17-test"
+SCRIPT_VERSION="0.9.18-test"
 SCRIPT_NAME="VPS Manager"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh"
 
@@ -4874,6 +4874,70 @@ komari_install_access_nginx() {
 }
 
 
+komari_remove_private_warp() {
+  local backup_dir root_real cron_candidate="" source backup_name
+  backup_dir="${BACKUP_ROOT}/komari-private-warp-before-public-$(date -u '+%Y%m%dT%H%M%SZ')"
+  install -d -m 700 "${backup_dir}"
+
+  log "清理原内网/WARP 上报链路"
+  service_is_active komari-agent && {
+    if is_alpine; then rc-service komari-agent stop; else systemctl stop komari-agent.service; fi
+  } || true
+
+  for source in /var/lib/cloudflare-warp/mdm.xml "${KOMARI_TOKEN_ENV_FILE}" \
+    /etc/init.d/warp-svc /usr/local/bin/warp-cli /usr/local/bin/warp-svc "${WARP_GUARD_PATH}" \
+    /etc/systemd/system/vps-manager-warp-guard.service \
+    /etc/systemd/system/vps-manager-warp-guard.timer \
+    "${ALPINE_WARP_ROOT}/PROFILE" "${ALPINE_WARP_ROOT}/VERSION" "${ALPINE_WARP_ROOT}/ARCH"; do
+    [[ -e "${source}" ]] || continue
+    backup_name="${source#/}"
+    backup_name="${backup_name//\//_}"
+    cp -a -- "${source}" "${backup_dir}/${backup_name}"
+  done
+  cat > "${backup_dir}/RESTORE.txt" <<EOF
+该目录保存从内网/WARP 切换到公网前的配置和服务入口。
+恢复方式：重新运行 VPS Manager 的“配置/修复 WARP 私网”，再按需恢复 mdm.xml 或 warp-token.env。
+大型 WARP 运行文件可由脚本校验后重新下载，因此未在本机重复保留。
+EOF
+  chmod 600 "${backup_dir}/RESTORE.txt"
+
+  if is_alpine; then
+    service_is_active warp-svc && rc-service warp-svc stop || true
+    rc-update del warp-svc default >/dev/null 2>&1 || true
+    if [[ -f /etc/crontabs/root ]]; then
+      cron_candidate="$(mktemp /etc/crontabs/root.vps-manager.XXXXXX)"
+      grep -Fv "${WARP_GUARD_PATH}" /etc/crontabs/root > "${cron_candidate}" || true
+      chmod --reference=/etc/crontabs/root "${cron_candidate}" 2>/dev/null || chmod 600 "${cron_candidate}"
+      mv -f -- "${cron_candidate}" /etc/crontabs/root
+    fi
+    root_real="$(readlink -f -- "${ALPINE_WARP_ROOT}" 2>/dev/null || true)"
+    if [[ -n "${root_real}" && "${root_real}" != "${ALPINE_WARP_ROOT}" ]]; then
+      warn "WARP 目录解析结果异常，拒绝递归清理：${root_real}"
+      return 1
+    fi
+    rm -f -- /etc/init.d/warp-svc /usr/local/bin/warp-cli /usr/local/bin/warp-svc "${WARP_GUARD_PATH}"
+    [[ ! -d "${ALPINE_WARP_ROOT}" ]] || rm -rf -- "${ALPINE_WARP_ROOT}"
+  else
+    systemctl disable --now vps-manager-warp-guard.timer vps-manager-warp-guard.service >/dev/null 2>&1 || true
+    systemctl disable --now warp-svc.service >/dev/null 2>&1 || true
+    apt-mark unhold cloudflare-warp >/dev/null 2>&1 || true
+    if dpkg-query -W -f='${Status}' cloudflare-warp 2>/dev/null | grep -q 'install ok installed'; then
+      wait_for_apt_locks "${APT_LOCK_WAIT_SECONDS}" || return 1
+      DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout="${APT_LOCK_WAIT_SECONDS}" \
+        purge -y cloudflare-warp || return 1
+    fi
+    rm -f -- /etc/systemd/system/vps-manager-warp-guard.service \
+      /etc/systemd/system/vps-manager-warp-guard.timer "${WARP_GUARD_PATH}"
+    systemctl daemon-reload
+  fi
+
+  rm -rf -- /var/lib/cloudflare-warp /var/log/cloudflare-warp
+  rm -f -- "${KOMARI_TOKEN_ENV_FILE}"
+  log "内网/WARP 运行文件已清理；可恢复配置和说明位于 ${backup_dir}"
+  df -h / | sed -n '1,2p'
+}
+
+
 komari_write_access_proxy() {
   local hostname="$1" client_id="$2" client_secret="$3" candidate backup=""
   ensure_work_dir
@@ -4994,6 +5058,7 @@ install_komari_access_public() {
     return 0
   fi
   prompt_yes_no "确认配置零信任公网安装通道" 0 || return 0
+  komari_remove_private_warp || return 1
   komari_install_access_nginx || return 1
   komari_write_access_proxy "${hostname}" "${client_id}" "${client_secret}" || return 1
   komari_install_access_service || return 1

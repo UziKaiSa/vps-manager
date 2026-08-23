@@ -402,6 +402,7 @@ Agent 安装完成后，脚本会同时检查服务状态和上报地址。检�
 - Access 凭据保存在权限为 `600` 的 `/etc/vps-manager/komari-access-nginx.conf`
 - Agent 仍会依次配置 Token、安装目录、流量重置日、Web SSH、GPU 和公网 IP 跟随方式，只把 Endpoint 改为本机中继
 - 不修改 Cloudflare 平台配置
+- 切换到该模式前会停止旧 Agent，清理 WARP 服务、运行目录、日志、MDM 和资源守护任务，再安装公网链路；可恢复配置、服务入口和恢复说明会先保存到 `/var/backups/vps-manager/komari-private-warp-before-public-*`，大型 WARP 运行文件可由脚本重新下载，因此不会重复留在磁盘上
 
 ### WARP 私网模式
 
