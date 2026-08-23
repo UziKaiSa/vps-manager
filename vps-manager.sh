@@ -736,6 +736,11 @@ random_high_port() {
 
 
 ssh_service_name() {
+  if is_alpine; then
+    [[ -x /etc/init.d/sshd ]] || return 1
+    printf 'sshd'
+    return 0
+  fi
   if systemctl cat ssh.service >/dev/null 2>&1; then
     printf 'ssh.service'
   elif systemctl cat sshd.service >/dev/null 2>&1; then
@@ -750,31 +755,57 @@ ensure_ssh_service_persistent() {
   local ssh_service="$1"
   local effective_ports
 
-  install -d -o root -g root -m 0755 /etc/tmpfiles.d \
-    || { warn "无法创建 systemd-tmpfiles 配置目录。"; return 1; }
-  printf 'd /run/sshd 0755 root root -\n' > "${SSHD_TMPFILES_CONFIG}" \
-    || { warn "无法写入 SSH 运行目录持久化规则。"; return 1; }
-  chmod 0644 "${SSHD_TMPFILES_CONFIG}" \
-    || { warn "无法设置 SSH tmpfiles 规则权限。"; return 1; }
-  systemd-tmpfiles --create "${SSHD_TMPFILES_CONFIG}" \
-    || { warn "无法通过 systemd-tmpfiles 创建 /run/sshd。"; return 1; }
-  [[ -d /run/sshd ]] \
-    || { warn "SSH 运行目录 /run/sshd 仍不存在。"; return 1; }
+  if is_alpine; then
+    install -d -o root -g root -m 0755 /run/sshd \
+      || { warn "无法创建 SSH 运行目录 /run/sshd。"; return 1; }
+  fi
   /usr/sbin/sshd -t \
     || { warn "SSH 配置语法检查失败，未启动服务。"; return 1; }
-  systemctl enable "${ssh_service}" >/dev/null \
-    || { warn "无法设置 ${ssh_service} 开机启动。"; return 1; }
-  systemctl start "${ssh_service}" \
-    || { warn "无法启动 ${ssh_service}。"; return 1; }
-  systemctl is-enabled --quiet "${ssh_service}" \
-    || { warn "${ssh_service} 未保持开机启用状态。"; return 1; }
-  systemctl is-active --quiet "${ssh_service}" \
-    || { warn "${ssh_service} 当前未运行。"; return 1; }
+  if is_alpine; then
+    rc-update add "${ssh_service}" default >/dev/null \
+      || { warn "无法设置 ${ssh_service} 开机启动。"; return 1; }
+    rc-service "${ssh_service}" start >/dev/null \
+      || { warn "无法启动 ${ssh_service}。"; return 1; }
+    rc-update show default 2>/dev/null | awk '{print $1}' | grep -Fxq "${ssh_service}" \
+      || { warn "${ssh_service} 未保持开机启用状态。"; return 1; }
+    rc-service "${ssh_service}" status >/dev/null 2>&1 \
+      || { warn "${ssh_service} 当前未运行。"; return 1; }
+  else
+    install -d -o root -g root -m 0755 /etc/tmpfiles.d \
+      || { warn "无法创建 systemd-tmpfiles 配置目录。"; return 1; }
+    printf 'd /run/sshd 0755 root root -\n' > "${SSHD_TMPFILES_CONFIG}" \
+      || { warn "无法写入 SSH 运行目录持久化规则。"; return 1; }
+    chmod 0644 "${SSHD_TMPFILES_CONFIG}" \
+      || { warn "无法设置 SSH tmpfiles 规则权限。"; return 1; }
+    systemd-tmpfiles --create "${SSHD_TMPFILES_CONFIG}" \
+      || { warn "无法通过 systemd-tmpfiles 创建 /run/sshd。"; return 1; }
+    [[ -d /run/sshd ]] \
+      || { warn "SSH 运行目录 /run/sshd 仍不存在。"; return 1; }
+    systemctl enable "${ssh_service}" >/dev/null \
+      || { warn "无法设置 ${ssh_service} 开机启动。"; return 1; }
+    systemctl start "${ssh_service}" \
+      || { warn "无法启动 ${ssh_service}。"; return 1; }
+    systemctl is-enabled --quiet "${ssh_service}" \
+      || { warn "${ssh_service} 未保持开机启用状态。"; return 1; }
+    systemctl is-active --quiet "${ssh_service}" \
+      || { warn "${ssh_service} 当前未运行。"; return 1; }
+  fi
   effective_ports="$(/usr/sbin/sshd -T 2>/dev/null | awk '$1 == "port" {print $2}' | paste -sd, -)"
   [[ -n "${effective_ports}" ]] \
     || { warn "无法读取 SSH 生效端口。"; return 1; }
   printf 'SSH 重启持久性检查通过：%s 已启用并运行；监听端口配置：%s\n' \
     "${ssh_service}" "${effective_ports}"
+}
+
+
+reload_ssh_service() {
+  local ssh_service="$1"
+  if is_alpine; then
+    rc-service "${ssh_service}" reload >/dev/null 2>&1 \
+      || rc-service "${ssh_service}" restart
+  else
+    systemctl reload "${ssh_service}"
+  fi
 }
 
 
@@ -785,6 +816,7 @@ switch_ssh_socket_to_service() {
   SSH_SOCKET_TRANSITIONED=0
   SSH_SOCKET_WAS_ENABLED=0
   SSH_SOCKET_WAS_ACTIVE=0
+  is_alpine && return 0
   systemctl cat ssh.socket >/dev/null 2>&1 || return 0
   systemctl is-active --quiet ssh.socket || return 0
 
@@ -917,7 +949,7 @@ rollback_ssh_hardening() {
     restore_ssh_socket_state "${ssh_service}" || warn "Failed to restore ssh.socket; keep this session open and check immediately."
   else
   if /usr/sbin/sshd -t; then
-    systemctl reload "${ssh_service}" \
+    reload_ssh_service "${ssh_service}" \
       || warn "SSH 配置已恢复，但 reload 失败；请保持当前会话并手动检查。"
   else
     warn "SSH 配置恢复后的语法检查失败；请保持当前会话并立即检查。"
@@ -1014,11 +1046,15 @@ EOF
   fi
 
   if [[ ! -x /usr/sbin/sshd ]]; then
-    apt_update_safe
-    apt-get install -y openssh-server
+    if is_alpine; then
+      apk add --no-cache openssh
+    else
+      apt_update_safe
+      apt-get install -y openssh-server
+    fi
   fi
   command -v ssh-keygen >/dev/null 2>&1 || die "未找到 ssh-keygen。"
-  ssh_service="$(ssh_service_name)" || die "未找到 SSH systemd 服务。"
+  ssh_service="$(ssh_service_name)" || die "未找到 SSH 服务。"
 
   grep -Eq '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config.d/\*\.conf' \
     "${SSHD_MAIN_CONFIG}" \
@@ -1197,7 +1233,7 @@ EOF
 
   if [[ "${SSH_SOCKET_TRANSITIONED}" != "1" ]]; then
 
-  if ! systemctl reload "${ssh_service}"; then
+  if ! reload_ssh_service "${ssh_service}"; then
     rollback_ssh_hardening \
       "${config_existed}" "${config_before}" \
       "${authorized_existed}" "${authorized_before}" "${authorized_keys}" \
@@ -3450,7 +3486,7 @@ add_ssh_public_key() {
     && awk -v blob="${key_blob}" '$2 == blob { found=1 } END { exit !found }' "${authorized_keys}"; then
     printf '该公钥已存在，无需重复写入。\n'
     ssh_service="$(ssh_service_name)" \
-      || { warn "未找到 SSH systemd 服务。"; return 1; }
+      || { warn "未找到 SSH 服务。"; return 1; }
     ensure_ssh_service_persistent "${ssh_service}"
     return 0
   fi
@@ -3486,7 +3522,7 @@ add_ssh_public_key() {
   log "公钥已添加到 ${authorized_keys}"
   [[ -n "${backup_dir}" ]] && printf '原文件备份：%s\n' "${backup_dir}"
   ssh_service="$(ssh_service_name)" \
-    || { warn "公钥已写入，但未找到 SSH systemd 服务。"; return 1; }
+    || { warn "公钥已写入，但未找到 SSH 服务。"; return 1; }
   ensure_ssh_service_persistent "${ssh_service}" \
     || { warn "公钥已写入，但 SSH 重启持久性检查失败；请保持当前会话并立即检查。"; return 1; }
 }
@@ -5776,7 +5812,7 @@ ${SCRIPT_NAME} ${SCRIPT_VERSION}
   bash $0 --version     显示版本
   bash $0 --help        显示帮助
 
-完整模式支持 Debian/Ubuntu + systemd；Alpine + OpenRC 进入 BBR、Xray、Komari/WARP 受限模式。
+完整模式支持 Debian/Ubuntu + systemd；Alpine + OpenRC 支持 SSH、BBR、Xray、Komari/WARP 等适配功能。
 SSH 加固会在 reload 后要求使用第二个终端验证，失败则自动恢复。
 首次生成或更新 Xray 配置时，仅检测新增或链接变化的 SOCKS5 出口。
 SSH 密钥与加固管理可以写入公钥，但不会在 VPS 上创建或显示客户端私钥。
@@ -5842,11 +5878,12 @@ alpine_main_menu() {
   local choice
   while true; do
     show_banner
-    printf ' Alpine 受限模式：只提供本机需要的功能\n'
+    printf ' Alpine + OpenRC 适配模式\n'
     printf '  1) 初始化环境：基础工具和可选 BBR\n'
     printf '  2) Xray 管理：安装、配置或更新\n'
     printf '  3) Komari + WARP 管理\n'
     printf '  4) 状态检查\n'
+    printf '  5) SSH 密钥与加固管理\n'
     printf '  7) 从 GitHub 更新当前脚本\n'
     printf '  8) 删除当前 .sh 脚本\n'
     printf '  9) 防火墙管理\n'
@@ -5857,6 +5894,7 @@ alpine_main_menu() {
       2) xray_management_menu; pause_screen ;;
       3) komari_menu; pause_screen ;;
       4) show_system_status; pause_screen ;;
+      5) ssh_key_helper_menu; pause_screen ;;
       7) update_current_script || true; pause_screen ;;
       8) if delete_current_script; then printf '脚本已删除，程序退出。\n'; exit 0; fi ;;
       9) firewall_management_menu; pause_screen ;;

@@ -54,6 +54,23 @@ require(
     'systemctl is-active --quiet "${ssh_service}"',
     "SSH service active state is not verified",
 )
+require('printf \'sshd\'', "Alpine OpenRC sshd service is not detected")
+require(
+    'rc-update add "${ssh_service}" default',
+    "Alpine SSH service is not enabled for the next boot",
+)
+require(
+    'install -d -o root -g root -m 0755 /run/sshd',
+    "Alpine SSH runtime directory is not created before validation",
+)
+require(
+    'rc-service "${ssh_service}" status',
+    "Alpine SSH active state is not verified",
+)
+require(
+    '5) ssh_key_helper_menu; pause_screen ;;',
+    "Alpine menu hides SSH key and hardening management",
+)
 
 if text.count('ensure_ssh_service_persistent "${ssh_service}"') < 4:
     raise AssertionError("SSH hardening and public-key paths must both run persistence checks")
