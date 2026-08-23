@@ -16,6 +16,19 @@ def require(fragment: str, message: str) -> None:
 require("APT_LOCK_WAIT_SECONDS=600", "APT lock timeout must be bounded")
 require("apt_lock_holders() {", "APT lock holder discovery is missing")
 require("wait_for_apt_locks() {", "APT lock wait helper is missing")
+require("ensure_fuser_for_apt_locks() {", "minimal Debian fuser bootstrap is missing")
+require(
+    'install -y --no-install-recommends psmisc',
+    "minimal Debian cannot bootstrap the fuser provider",
+)
+require(
+    'ca-certificates curl wget vim unzip python3 python3-yaml openssl iproute2 openssh-client psmisc',
+    "psmisc is not retained in the Debian/Ubuntu base tool set",
+)
+require(
+    "检测到 APT/dpkg 相关进程；为避免并发操作",
+    "fuser bootstrap does not stop for an active package manager",
+)
 require("/var/lib/dpkg/lock-frontend", "dpkg frontend lock is not checked")
 require("/var/cache/apt/archives/lock", "APT archive lock is not checked")
 require("未删除锁文件、未终止系统更新", "safe timeout guidance is missing")

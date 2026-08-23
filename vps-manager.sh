@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.9.12-test"
+SCRIPT_VERSION="0.9.13-test"
 SCRIPT_NAME="VPS Manager"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh"
 
@@ -45,6 +45,15 @@ FIREWALL_SYSTEMD_UNIT="/etc/systemd/system/vps-manager-firewall.service"
 FIREWALL_OPENRC_SERVICE="/etc/init.d/vps-manager-firewall"
 FIREWALL_TABLE="vps_manager_firewall"
 FIREWALL_ROLLBACK_SECONDS=300
+FIREWALL_LOG_PREFIX="VPSMGR_DROP"
+FIREWALL_LOG_DIR="/var/log/vps-manager"
+FIREWALL_LOG_FILE="${FIREWALL_LOG_DIR}/firewall.log"
+FIREWALL_LOG_ARCHIVE="${FIREWALL_LOG_FILE}.1.gz"
+FIREWALL_LOG_COLLECTOR="/usr/local/sbin/vps-manager-firewall-log"
+FIREWALL_LOG_MAX_BYTES=4194304
+FIREWALL_LOG_TAIL_BYTES=1048576
+FIREWALL_LOG_ULTRA_MAX_BYTES=524288
+FIREWALL_LOG_ULTRA_TAIL_BYTES=131072
 
 OS_ID=""
 INIT_SYSTEM=""
@@ -425,12 +434,38 @@ apt_lock_holders() {
 }
 
 
+ensure_fuser_for_apt_locks() {
+  local active_processes
+  command -v fuser >/dev/null 2>&1 && return 0
+  command -v apt-get >/dev/null 2>&1 \
+    || { warn "缺少 fuser，且当前系统无法通过 apt-get 安装 psmisc。"; return 1; }
+
+  active_processes="$(ps -eo pid=,comm=,args= 2>/dev/null | awk '
+    $2 ~ /^(apt|apt-get|dpkg|unattended-upgrade|unattended-upgrade-shutdown)$/ {
+      sub(/^[[:space:]]+/, ""); print
+    }
+  ')"
+  if [[ -n "${active_processes}" ]]; then
+    warn "缺少 fuser，且检测到 APT/dpkg 相关进程；为避免并发操作，已停止自动安装 psmisc。"
+    printf '%s\n' "${active_processes}"
+    return 1
+  fi
+
+  warn "缺少 fuser，正在引导安装提供该命令的 psmisc，以便安全识别 APT/dpkg 锁。"
+  DEBIAN_FRONTEND=noninteractive apt-get \
+    -o DPkg::Lock::Timeout="${APT_LOCK_WAIT_SECONDS}" \
+    install -y --no-install-recommends psmisc \
+    || { warn "psmisc 安装失败，无法安全识别 APT/dpkg 锁持有者。"; return 1; }
+  command -v fuser >/dev/null 2>&1 \
+    || { warn "psmisc 已执行安装，但仍找不到 fuser。"; return 1; }
+}
+
+
 wait_for_apt_locks() {
   local timeout="${1:-${APT_LOCK_WAIT_SECONDS}}"
   local elapsed=0
   local holders details
-  command -v fuser >/dev/null 2>&1 \
-    || { warn "缺少 fuser，无法安全识别 APT/dpkg 锁持有者。"; return 1; }
+  ensure_fuser_for_apt_locks || return 1
   while true; do
     holders="$(apt_lock_holders)"
     [[ -n "${holders}" ]] || return 0
@@ -1214,7 +1249,7 @@ install_base_tools() {
   export DEBIAN_FRONTEND=noninteractive
   apt_update_safe
   apt-get install -y --no-install-recommends \
-    ca-certificates curl wget vim unzip python3 python3-yaml openssl iproute2 openssh-client
+    ca-certificates curl wget vim unzip python3 python3-yaml openssl iproute2 openssh-client psmisc
 }
 
 
@@ -5048,23 +5083,112 @@ firewall_configured_ports() {
 firewall_write_rules() {
   local tcp_ports="$1" udp_ports="$2" candidate="$3"
   local tcp_set="" udp_set=""
-  [[ -n "${tcp_ports}" ]] && tcp_set="    tcp dport { ${tcp_ports// /, } } accept"
-  [[ -n "${udp_ports}" ]] && udp_set="    udp dport { ${udp_ports// /, } } accept"
+  [[ -n "${tcp_ports}" ]] && tcp_set="    tcp dport { ${tcp_ports// /, } } counter accept comment \"VPSMGR_ALLOW_TCP\""
+  [[ -n "${udp_ports}" ]] && udp_set="    udp dport { ${udp_ports// /, } } counter accept comment \"VPSMGR_ALLOW_UDP\""
   mkdir -p "${STATE_DIR}" "${BACKUP_ROOT}"
   cat > "${candidate}" <<EOF
 table inet ${FIREWALL_TABLE} {
   chain input {
     type filter hook input priority 10; policy drop;
-    iifname "lo" accept
-    iifname "CloudflareWARP" accept
-    ct state established,related accept
-    ct state invalid drop
-    meta l4proto { icmp, ipv6-icmp } accept
+    iifname "lo" counter accept
+    iifname "CloudflareWARP" counter accept
+    ct state established,related counter accept
+    ct state invalid counter drop
+    meta l4proto { icmp, ipv6-icmp } counter accept
 ${tcp_set}
 ${udp_set}
+    counter jump log_drop comment "VPSMGR_DROP_TOTAL"
+  }
+  chain log_drop {
+    limit rate 6/minute burst 20 packets log prefix "${FIREWALL_LOG_PREFIX} " flags all
   }
 }
 EOF
+}
+
+
+firewall_install_log_collector() {
+  local max_bytes="${FIREWALL_LOG_MAX_BYTES}" tail_bytes="${FIREWALL_LOG_TAIL_BYTES}" root_free_kib
+  root_free_kib="$(df -Pk / 2>/dev/null | awk 'NR == 2 {print $4}')"
+  if { [[ -r "${ALPINE_WARP_ROOT}/PROFILE" ]] && grep -qx 'ultra-low-disk' "${ALPINE_WARP_ROOT}/PROFILE"; } \
+    || { [[ "${root_free_kib:-}" =~ ^[0-9]+$ ]] && (( root_free_kib < 262144 )); }; then
+    max_bytes="${FIREWALL_LOG_ULTRA_MAX_BYTES}"
+    tail_bytes="${FIREWALL_LOG_ULTRA_TAIL_BYTES}"
+  fi
+  install -d -m 700 "${FIREWALL_LOG_DIR}" /usr/local/sbin
+  touch "${FIREWALL_LOG_FILE}"
+  chmod 600 "${FIREWALL_LOG_FILE}"
+  cat > "${FIREWALL_LOG_COLLECTOR}" <<EOF
+#!/bin/sh
+set -eu
+LOG_FILE='${FIREWALL_LOG_FILE}'
+ARCHIVE_FILE='${FIREWALL_LOG_ARCHIVE}'
+PREFIX='${FIREWALL_LOG_PREFIX}'
+MAX_BYTES=${max_bytes}
+TAIL_BYTES=${tail_bytes}
+mkdir -p '${FIREWALL_LOG_DIR}'
+touch "\${LOG_FILE}"
+chmod 600 "\${LOG_FILE}"
+consume() {
+  while IFS= read -r line; do
+    case "\${line}" in *"\${PREFIX}"*) ;; *) continue ;; esac
+    printf '%s\n' "\${line}" >> "\${LOG_FILE}"
+    size="\$(wc -c < "\${LOG_FILE}" 2>/dev/null || echo 0)"
+    if [ "\${size}" -gt "\${MAX_BYTES}" ]; then
+      tmp="\${LOG_FILE}.tail.\$\$"
+      archive_tmp="\${ARCHIVE_FILE}.tmp.\$\$"
+      tail -c "\${TAIL_BYTES}" "\${LOG_FILE}" > "\${tmp}" 2>/dev/null || cp "\${LOG_FILE}" "\${tmp}"
+      gzip -c "\${tmp}" > "\${archive_tmp}"
+      chmod 600 "\${archive_tmp}"
+      mv -f "\${archive_tmp}" "\${ARCHIVE_FILE}"
+      : > "\${LOG_FILE}"
+      rm -f "\${tmp}"
+    fi
+  done
+}
+if command -v journalctl >/dev/null 2>&1; then
+  journalctl -k -f -n 0 -o short-iso | consume
+elif command -v logread >/dev/null 2>&1; then
+  logread -f | consume
+elif dmesg --help 2>&1 | grep -q -- '-w'; then
+  dmesg -w | consume
+else
+  exit 1
+fi
+EOF
+  chmod 700 "${FIREWALL_LOG_COLLECTOR}"
+  if is_alpine; then
+    cat > /etc/init.d/vps-manager-firewall-log <<EOF
+#!/sbin/openrc-run
+description="VPS Manager firewall log collector"
+command="${FIREWALL_LOG_COLLECTOR}"
+supervisor="supervise-daemon"
+respawn_delay=5
+respawn_max=0
+depend() { need net; after vps-manager-firewall; }
+EOF
+    chmod 700 /etc/init.d/vps-manager-firewall-log
+    rc-update add vps-manager-firewall-log default >/dev/null
+    rc-service vps-manager-firewall-log restart >/dev/null
+  else
+    cat > /etc/systemd/system/vps-manager-firewall-log.service <<EOF
+[Unit]
+Description=VPS Manager firewall log collector
+After=vps-manager-firewall.service systemd-journald.service
+Requires=vps-manager-firewall.service
+[Service]
+Type=simple
+ExecStart=${FIREWALL_LOG_COLLECTOR}
+Restart=always
+RestartSec=5
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --now vps-manager-firewall-log.service >/dev/null
+  fi
+  printf '防火墙日志：%s（上限 %s KiB，另保留最多 %s KiB 的压缩历史源数据）\n' \
+    "${FIREWALL_LOG_FILE}" "$((max_bytes / 1024))" "$((tail_bytes / 1024))"
 }
 
 
@@ -5110,6 +5234,7 @@ EOF
     systemctl enable vps-manager-firewall.service >/dev/null
     systemctl restart vps-manager-firewall.service
   fi
+  firewall_install_log_collector
 }
 
 
@@ -5230,6 +5355,101 @@ manually_update_firewall_ports() {
 }
 
 
+firewall_log_stream() {
+  [[ ! -f "${FIREWALL_LOG_ARCHIVE}" ]] || gzip -cd "${FIREWALL_LOG_ARCHIVE}" 2>/dev/null || true
+  [[ ! -f "${FIREWALL_LOG_FILE}" ]] || cat "${FIREWALL_LOG_FILE}"
+}
+
+
+firewall_show_counters() {
+  local tcp_ports udp_ports
+  tcp_ports="$(firewall_configured_ports tcp)"
+  udp_ports="$(firewall_configured_ports udp)"
+  printf '\n当前白名单：\n  TCP: %s\n  UDP: %s\n\n累计统计（规则重载或重启后重新计数）：\n' \
+    "${tcp_ports:-无}" "${udp_ports:-无}"
+  nft list chain inet "${FIREWALL_TABLE}" input 2>/dev/null | awk '
+    /VPSMGR_ALLOW_TCP/ {kind="允许 TCP 白名单"}
+    /VPSMGR_ALLOW_UDP/ {kind="允许 UDP 白名单"}
+    /VPSMGR_DROP_TOTAL/ {kind="拒绝其他入站"}
+    kind != "" && match($0, /counter packets [0-9]+ bytes [0-9]+/) {
+      value=substr($0, RSTART, RLENGTH); sub("counter packets ", "", value); sub(" bytes ", " 个包，", value)
+      printf "  %-18s %s 字节\n", kind ":", value; kind=""
+    }
+  '
+}
+
+
+firewall_show_recent_blocks() {
+  local limit="${1:-50}"
+  firewall_log_stream | awk -v prefix="${FIREWALL_LOG_PREFIX}" '
+    index($0, prefix) {
+      source=proto=port=iface="未知"
+      for (i=1; i<=NF; i++) {
+        if ($i ~ /^SRC=/) {source=$i; sub(/^SRC=/,"",source)}
+        else if ($i ~ /^PROTO=/) {proto=$i; sub(/^PROTO=/,"",proto)}
+        else if ($i ~ /^DPT=/) {port=$i; sub(/^DPT=/,"",port)}
+        else if ($i ~ /^IN=/) {iface=$i; sub(/^IN=/,"",iface)}
+      }
+      before=substr($0,1,index($0,prefix)-1); gsub(/[[:space:]]+$/, "", before)
+      printf "%s | 来源 %s | 本机 %s/%s | 网卡 %s | 已拒绝：端口不在白名单\n", before, source, proto, port, iface
+    }
+  ' | tail -n "${limit}"
+}
+
+
+firewall_show_top_blocks() {
+  local field="$1" label="$2"
+  printf '\n%s：\n' "${label}"
+  firewall_log_stream | awk -v prefix="${FIREWALL_LOG_PREFIX}" -v wanted="${field}" '
+    index($0,prefix) {
+      value=""
+      for (i=1; i<=NF; i++) if ($i ~ ("^" wanted "=")) {value=$i; sub("^" wanted "=", "", value)}
+      if (value != "") count[value]++
+    }
+    END {for (value in count) printf "%8d %s\n", count[value], value}
+  ' | sort -nr | head -n 10
+}
+
+
+firewall_log_management_menu() {
+  local choice
+  while true; do
+    printf '\n防火墙日志与统计\n'
+    printf '  1) 中文流量统计\n'
+    printf '  2) 最近 50 条被拒绝连接\n'
+    printf '  3) 最常扫描的来源 IP（当前保留日志）\n'
+    printf '  4) 最常被扫描的目标端口（当前保留日志）\n'
+    printf '  5) 查看日志容量\n'
+    printf '  6) 清空脚本专属防火墙日志\n'
+    printf '  0) 返回\n'
+    read -r -p "请选择: " choice
+    case "${choice:-0}" in
+      1) firewall_show_counters ;;
+      2) firewall_show_recent_blocks 50 ;;
+      3) firewall_show_top_blocks SRC "最常扫描的来源 IP" ;;
+      4) firewall_show_top_blocks DPT "最常被扫描的目标端口" ;;
+      5)
+        if [[ -f "${FIREWALL_LOG_FILE}" || -f "${FIREWALL_LOG_ARCHIVE}" ]]; then
+          [[ ! -f "${FIREWALL_LOG_FILE}" ]] || du -h "${FIREWALL_LOG_FILE}"
+          [[ ! -f "${FIREWALL_LOG_ARCHIVE}" ]] || du -h "${FIREWALL_LOG_ARCHIVE}"
+        else
+          printf '尚未产生脚本专属日志。\n'
+        fi
+        printf '普通机器上限 4096 KiB；极限低磁盘 Alpine 上限 512 KiB；另保留一份压缩历史。\n'
+        ;;
+      6)
+        prompt_yes_no "确认清空脚本专属防火墙日志" 0 || continue
+        : > "${FIREWALL_LOG_FILE}"
+        rm -f -- "${FIREWALL_LOG_ARCHIVE}"
+        log "防火墙日志已清空；流量计数未重置。"
+        ;;
+      0) return 0 ;;
+      *) warn "未知选项。" ;;
+    esac
+  done
+}
+
+
 disable_managed_firewall() {
   require_root
   if [[ ! -f "${FIREWALL_CONFIG}" ]] && ! nft list table inet "${FIREWALL_TABLE}" >/dev/null 2>&1; then
@@ -5239,9 +5459,12 @@ disable_managed_firewall() {
   printf '停用后将立即移除脚本的入站限制，但保留配置文件，之后可以重新应用。\n'
   prompt_yes_no "确认停用脚本管理的防火墙" "0" || { printf '已取消。\n'; return 0; }
   if is_alpine; then
+    [[ -x /etc/init.d/vps-manager-firewall-log ]] && rc-service vps-manager-firewall-log stop >/dev/null 2>&1 || true
+    rc-update del vps-manager-firewall-log default >/dev/null 2>&1 || true
     [[ -x "${FIREWALL_OPENRC_SERVICE}" ]] && rc-service vps-manager-firewall stop >/dev/null 2>&1 || true
     rc-update del vps-manager-firewall default >/dev/null 2>&1 || true
   else
+    systemctl disable --now vps-manager-firewall-log.service >/dev/null 2>&1 || true
     systemctl disable --now vps-manager-firewall.service >/dev/null 2>&1 || true
   fi
   nft delete table inet "${FIREWALL_TABLE}" >/dev/null 2>&1 || true
@@ -5257,7 +5480,8 @@ firewall_management_menu() {
     printf '  2) 代理站防火墙配置/刷新：重新扫描当前监听端口\n'
     printf '  3) 手动维护 TCP/UDP 白名单\n'
     printf '  4) 查看脚本管理的防火墙规则\n'
-    printf '  5) 停用脚本管理的防火墙（保留配置）\n'
+    printf '  5) 防火墙日志与中文统计\n'
+    printf '  6) 停用脚本管理的防火墙（保留配置）\n'
     printf '  0) 返回\n'
     read -r -p "请选择: " choice
     case "${choice:-0}" in
@@ -5265,7 +5489,8 @@ firewall_management_menu() {
       2) configure_firewall_mode proxy ;;
       3) manually_update_firewall_ports ;;
       4) nft list table inet "${FIREWALL_TABLE}" 2>/dev/null || warn "脚本管理的防火墙尚未启用。" ;;
-      5) disable_managed_firewall ;;
+      5) firewall_log_management_menu ;;
+      6) disable_managed_firewall ;;
       0) return 0 ;;
       *) warn "未知选项。" ;;
     esac
