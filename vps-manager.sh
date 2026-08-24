@@ -957,6 +957,160 @@ rollback_ssh_hardening() {
   fi
 }
 
+rollback_ssh_config_change() {
+  local config_existed="$1" config_before="$2" ssh_service="$3"
+  local port_config_backup_dir="${4:-}"
+  restore_ssh_port_configs "${port_config_backup_dir}"
+  if [[ "${config_existed}" == "1" ]]; then
+    install -o root -g root -m 644 "${config_before}" "${SSHD_MANAGED_CONFIG}"
+  else
+    rm -f -- "${SSHD_MANAGED_CONFIG}"
+  fi
+  if [[ "${SSH_SOCKET_TRANSITIONED}" == "1" ]]; then
+    restore_ssh_socket_state "${ssh_service}" || warn "Failed to restore ssh.socket; keep this session open and check immediately."
+  elif /usr/sbin/sshd -t; then
+    reload_ssh_service "${ssh_service}" || warn "SSH 配置已恢复，但 reload 失败；请保持当前会话并手动检查。"
+  else
+    warn "SSH 配置恢复后的语法检查失败；请保持当前会话并立即检查。"
+  fi
+}
+
+configure_ssh_high_port() {
+  local admin_user default_port ssh_port ssh_service public_address
+  local config_existed=0 config_before effective_ports port_config_backup_dir=""
+  SSH_SOCKET_TRANSITIONED=0
+  SSH_SOCKET_WAS_ENABLED=0
+  SSH_SOCKET_WAS_ACTIVE=0
+  require_root
+  check_supported_os
+  admin_user="$(default_ssh_admin_user)"
+  default_port="$(random_high_port)"
+  while true; do
+    ssh_port="$(prompt_default "新的 SSH 高位端口（10000-65535）" "${default_port}")"
+    if ! validate_port "${ssh_port}" || (( ssh_port < 10000 )); then
+      warn "SSH 高位端口必须在 10000-65535 之间。"
+      continue
+    fi
+    port_is_listening "${ssh_port}" && { warn "端口 ${ssh_port} 已被占用，请换一个端口。"; continue; }
+    break
+  done
+  if [[ "${DEMO_MODE}" == "1" ]]; then
+    log "[预览] 仅修改 SSH 端口（不会修改密码或密钥登录方式）"
+    printf '将停用现有 SSH 配置中的显式 Port，并改为：Port %s\n' "${ssh_port}"
+    return 0
+  fi
+  if [[ ! -x /usr/sbin/sshd ]]; then
+    if is_alpine; then apk add --no-cache openssh; else apt_update_safe; apt-get install -y openssh-server; fi
+  fi
+  ssh_service="$(ssh_service_name)" || die "未找到 SSH 服务。"
+  warn "不要关闭当前 SSH 窗口。修改后必须用第二个终端测试。"
+  printf '请先在云厂商安全组中放行：%s/tcp\n' "${ssh_port}"
+  prompt_yes_no "确认云安全组已经放行 ${ssh_port}/tcp" "0" || { printf '已取消修改，系统没有变化。\n'; return 0; }
+  ensure_work_dir
+  install -d -o root -g root -m 755 "${SSHD_DROPIN_DIR}"
+  config_before="${WORK_DIR}/sshd-managed.before"
+  if [[ -e "${SSHD_MANAGED_CONFIG}" ]]; then
+    config_existed=1
+    cp -a -- "${SSHD_MANAGED_CONFIG}" "${config_before}"
+    awk 'tolower($1) != "port"' "${SSHD_MANAGED_CONFIG}" > "${WORK_DIR}/sshd-port.conf"
+  else
+    : > "${WORK_DIR}/sshd-port.conf"
+  fi
+  sed -i "1iPort ${ssh_port}" "${WORK_DIR}/sshd-port.conf"
+  if ! port_config_backup_dir="$(backup_and_disable_ssh_ports)"; then
+    rollback_ssh_config_change "${config_existed}" "${config_before}" "${ssh_service}"
+    die "无法安全替换现有 SSH Port 配置，已恢复。"
+  fi
+  install -o root -g root -m 644 "${WORK_DIR}/sshd-port.conf" "${SSHD_MANAGED_CONFIG}"
+  if ! /usr/sbin/sshd -t; then
+    rollback_ssh_config_change "${config_existed}" "${config_before}" "${ssh_service}" "${port_config_backup_dir}"
+    die "新 SSH 端口配置语法检查失败，已恢复。"
+  fi
+  effective_ports="$(/usr/sbin/sshd -T | awk '$1 == "port" {print $2}' | paste -sd, -)"
+  if [[ "${effective_ports}" != "${ssh_port}" ]]; then
+    rollback_ssh_config_change "${config_existed}" "${config_before}" "${ssh_service}" "${port_config_backup_dir}"
+    die "SSH 生效端口与预期不一致，已恢复。实际值：${effective_ports:-未知}"
+  fi
+  switch_ssh_socket_to_service "${ssh_service}" || { rollback_ssh_config_change "${config_existed}" "${config_before}" "${ssh_service}" "${port_config_backup_dir}"; die "切换 SSH 监听模式失败，已恢复。"; }
+  [[ "${SSH_SOCKET_TRANSITIONED}" == "1" ]] || reload_ssh_service "${ssh_service}" || { rollback_ssh_config_change "${config_existed}" "${config_before}" "${ssh_service}" "${port_config_backup_dir}"; die "SSH reload 失败，已恢复。"; }
+  ensure_ssh_service_persistent "${ssh_service}" && wait_for_port_listening "${ssh_port}" 10 || { rollback_ssh_config_change "${config_existed}" "${config_before}" "${ssh_service}" "${port_config_backup_dir}"; die "新 SSH 端口未稳定监听，已恢复。"; }
+  public_address="$(detect_public_address)"
+  printf '\n请在第二个终端使用当前登录方式验证：\nssh -p %s %s@%s\n\n' "${ssh_port}" "${admin_user}" "${public_address}"
+  if ! prompt_yes_no "是否已经成功登录新端口" "0"; then
+    rollback_ssh_config_change "${config_existed}" "${config_before}" "${ssh_service}" "${port_config_backup_dir}"
+    warn "验证未通过，已恢复原 SSH 端口；认证方式始终未修改。"
+    return 0
+  fi
+  log "SSH 高位端口配置完成（登录认证方式未修改）"
+}
+
+disable_ssh_password_login() {
+  local admin_user admin_home authorized_keys ssh_service public_address current_ports current_port host_name
+  local config_existed=0 config_before effective effective_password effective_kbd effective_pubkey effective_methods
+  SSH_SOCKET_TRANSITIONED=0
+  SSH_SOCKET_WAS_ENABLED=0
+  SSH_SOCKET_WAS_ACTIVE=0
+  require_root
+  check_supported_os
+  admin_user="$(default_ssh_admin_user)"
+  admin_home="$(getent passwd "${admin_user}" | cut -d: -f6)"
+  authorized_keys="${admin_home}/.ssh/authorized_keys"
+  if [[ ! -s "${authorized_keys}" ]] || ! ssh-keygen -l -f "${authorized_keys}" >/dev/null 2>&1; then
+    warn "禁用密码登录前必须先为当前管理用户添加有效公钥。"
+    add_ssh_public_key || return 1
+  fi
+  prompt_yes_no "确认你持有 authorized_keys 中至少一把公钥对应的私钥" "0" || { printf '已取消修改，系统没有变化。\n'; return 0; }
+  if [[ "${DEMO_MODE}" == "1" ]]; then
+    log "[预览] 仅禁用密码登录并启用仅密钥认证（不会修改 SSH 端口）"
+    return 0
+  fi
+  ssh_service="$(ssh_service_name)" || die "未找到 SSH 服务。"
+  current_ports="$(/usr/sbin/sshd -T | awk '$1 == "port" {print $2}' | paste -sd, -)"
+  current_port="${current_ports%%,*}"
+  host_name="$(hostname -f 2>/dev/null || hostname)"
+  ensure_work_dir
+  install -d -o root -g root -m 755 "${SSHD_DROPIN_DIR}"
+  config_before="${WORK_DIR}/sshd-managed.before"
+  if [[ -e "${SSHD_MANAGED_CONFIG}" ]]; then
+    config_existed=1
+    cp -a -- "${SSHD_MANAGED_CONFIG}" "${config_before}"
+    awk 'BEGIN{IGNORECASE=1} $1 !~ /^(PubkeyAuthentication|PasswordAuthentication|KbdInteractiveAuthentication|ChallengeResponseAuthentication|AuthenticationMethods|PermitEmptyPasswords|AuthorizedKeysFile)$/ {print}' "${SSHD_MANAGED_CONFIG}" > "${WORK_DIR}/sshd-auth.conf"
+  else
+    : > "${WORK_DIR}/sshd-auth.conf"
+  fi
+  cat >> "${WORK_DIR}/sshd-auth.conf" <<'EOF'
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
+AuthenticationMethods publickey
+PermitEmptyPasswords no
+AuthorizedKeysFile .ssh/authorized_keys
+EOF
+  install -o root -g root -m 644 "${WORK_DIR}/sshd-auth.conf" "${SSHD_MANAGED_CONFIG}"
+  if ! /usr/sbin/sshd -t; then
+    rollback_ssh_config_change "${config_existed}" "${config_before}" "${ssh_service}"
+    die "仅密钥登录配置语法检查失败，已恢复。"
+  fi
+  effective="$(/usr/sbin/sshd -T -C "user=${admin_user},host=${host_name},addr=127.0.0.1,laddr=127.0.0.1,lport=${current_port}")"
+  effective_password="$(printf '%s\n' "${effective}" | awk '$1 == "passwordauthentication" {print $2; exit}')"
+  effective_kbd="$(printf '%s\n' "${effective}" | awk '$1 == "kbdinteractiveauthentication" {print $2; exit}')"
+  effective_pubkey="$(printf '%s\n' "${effective}" | awk '$1 == "pubkeyauthentication" {print $2; exit}')"
+  effective_methods="$(printf '%s\n' "${effective}" | awk '$1 == "authenticationmethods" {print $2; exit}')"
+  if [[ "${effective_password}" != "no" || "${effective_kbd}" != "no" || "${effective_pubkey}" != "yes" || "${effective_methods}" != "publickey" ]]; then
+    rollback_ssh_config_change "${config_existed}" "${config_before}" "${ssh_service}"
+    die "SSH 认证生效值与预期不一致，已恢复。"
+  fi
+  reload_ssh_service "${ssh_service}" && ensure_ssh_service_persistent "${ssh_service}" || { rollback_ssh_config_change "${config_existed}" "${config_before}" "${ssh_service}"; die "SSH reload 或持久性检查失败，已恢复。"; }
+  public_address="$(detect_public_address)"
+  printf '\nSSH 端口保持不变（%s）。请在第二个终端使用私钥验证登录：\nssh -p %s %s@%s\n\n' "${current_ports}" "${current_port}" "${admin_user}" "${public_address}"
+  if ! prompt_yes_no "是否已经使用私钥成功登录" "0"; then
+    rollback_ssh_config_change "${config_existed}" "${config_before}" "${ssh_service}"
+    warn "验证未通过，已恢复原认证配置；SSH 端口始终未修改。"
+    return 0
+  fi
+  log "密码登录已禁用，SSH 端口保持不变：${current_ports}"
+}
 
 configure_ssh_hardening() {
   local admin_user
@@ -3675,7 +3829,7 @@ EOF
 ssh_key_helper_menu() {
   local choice public_key key_file admin_user admin_home authorized_keys
   while true; do
-    printf '\nSSH 密钥与加固管理：\n  1) 本机 Linux 生成密钥并可配置快捷名称\n  2) 校验 SSH 公钥并显示指纹\n  3) 配置 SSH 高位端口和仅密钥登录\n  4) 添加公钥到当前管理用户 authorized_keys\n  5) 查看当前管理用户 authorized_keys\n  0) 返回\n'
+    printf '\nSSH 密钥与加固管理：\n  1) 本机 Linux 生成密钥并可配置快捷名称\n  2) 校验 SSH 公钥并显示指纹\n  3) 配置 SSH 高位端口（不改登录方式）\n  4) 禁用密码登录（不改 SSH 端口）\n  5) 添加公钥到当前管理用户 authorized_keys\n  6) 查看当前管理用户 authorized_keys\n  0) 返回\n'
     read -r -p "请选择 [0]: " choice
     case "${choice:-0}" in
       1)
@@ -3689,12 +3843,15 @@ ssh_key_helper_menu() {
         ssh-keygen -l -f "${key_file}" && printf '公钥有效，可粘贴到 SSH 加固流程。\n' || warn "公钥格式无效。"
         ;;
       3)
-        configure_ssh_hardening || true
+        configure_ssh_high_port || true
         ;;
       4)
-        add_ssh_public_key || true
+        disable_ssh_password_login || true
         ;;
       5)
+        add_ssh_public_key || true
+        ;;
+      6)
         admin_user="$(default_ssh_admin_user)"; admin_home="$(getent passwd "${admin_user}" 2>/dev/null | cut -d: -f6)"
         authorized_keys="${admin_home}/.ssh/authorized_keys"
         printf '管理用户：%s\n文件：%s\n\n' "${admin_user}" "${authorized_keys}"
