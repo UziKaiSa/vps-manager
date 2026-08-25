@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.9.20-test"
+SCRIPT_VERSION="0.9.21-test"
 SCRIPT_NAME="VPS Manager"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh"
 
 XRAY_BIN="/usr/local/bin/xray"
 XRAY_CONFIG="/usr/local/etc/xray/config.json"
 XRAY_INSTALL_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
+XRAY_FALLBACK_VERSION="26.7.28"
+XRAY_FALLBACK_AMD64_SHA256="8195d909f1109b8f3d99eefe401a3c451d7bf4af71f24d3815420f77e5dd2a40"
+XRAY_FALLBACK_BASE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/assets"
 KOMARI_INSTALL_URL="https://raw.githubusercontent.com/komari-monitor/komari-agent/refs/heads/main/install.sh"
 KOMARI_FALLBACK_VERSION="1.2.60"
 KOMARI_FALLBACK_AMD64_SHA256="113af112a914b918f315fa6cd3a98e8c0f932900f776c4c412b2a79477180859"
@@ -1497,8 +1500,44 @@ install_base_tools() {
 }
 
 
+download_alpine_xray_archive() {
+  local archive_name="$1" archive="$2" checksum_file="$3" expected_sha256="" fallback_url=""
+
+  if curl -fL --retry 3 --connect-timeout 10 --max-time 300 -o "${archive}" \
+      "https://github.com/XTLS/Xray-core/releases/latest/download/${archive_name}" \
+    && curl -fL --retry 3 --connect-timeout 10 --max-time 60 -o "${checksum_file}" \
+      "https://github.com/XTLS/Xray-core/releases/latest/download/${archive_name}.dgst"; then
+    expected_sha256="$(awk -F'= ' '/^SHA2-256= / {print $2; exit}' "${checksum_file}")"
+    if [[ "${expected_sha256}" =~ ^[0-9a-f]{64}$ ]] \
+      && printf '%s  %s\n' "${expected_sha256}" "${archive}" | sha256sum -c -; then
+      return 0
+    fi
+    warn "Xray 官方 Release 下载内容未通过 SHA-256 校验，将尝试固定版本兜底。"
+  else
+    warn "Xray 官方 Release 链路不可用，将尝试适合 IPv6-only 主机的 Raw 固定版本兜底。"
+  fi
+
+  rm -f -- "${archive}" "${checksum_file}"
+  case "${archive_name}" in
+    Xray-linux-64.zip)
+      expected_sha256="${XRAY_FALLBACK_AMD64_SHA256}"
+      fallback_url="${XRAY_FALLBACK_BASE_URL}/Xray-linux-64-v${XRAY_FALLBACK_VERSION}.zip"
+      ;;
+    *)
+      warn "仓库暂未提供 ${archive_name} 的 IPv6-only 固定版本兜底。"
+      return 1
+      ;;
+  esac
+  curl -fL --retry 3 --connect-timeout 10 --max-time 300 -o "${archive}" "${fallback_url}" \
+    || { warn "Xray 固定版本兜底下载失败：${fallback_url}"; return 1; }
+  printf '%s  %s\n' "${expected_sha256}" "${archive}" | sha256sum -c - \
+    || { warn "Xray 固定版本兜底 SHA-256 校验失败，已拒绝执行。"; rm -f -- "${archive}"; return 1; }
+  log "已使用 Xray ${XRAY_FALLBACK_VERSION} IPv6-only 固定版本兜底"
+}
+
+
 install_or_upgrade_xray() {
-  local installer archive stage alpine_arch archive_name checksum_file expected_sha256
+  local installer archive stage alpine_arch archive_name checksum_file
 
   require_root
   check_supported_os
@@ -1524,13 +1563,8 @@ install_or_upgrade_xray() {
     checksum_file="${WORK_DIR}/xray.zip.dgst"
     stage="${WORK_DIR}/xray"
     mkdir -p "${stage}"
-    curl -fL --retry 3 --connect-timeout 10 -o "${archive}" \
-      "https://github.com/XTLS/Xray-core/releases/latest/download/${archive_name}"
-    curl -fL --retry 3 --connect-timeout 10 -o "${checksum_file}" \
-      "https://github.com/XTLS/Xray-core/releases/latest/download/${archive_name}.dgst"
-    expected_sha256="$(awk -F'= ' '/^SHA2-256= / {print $2; exit}' "${checksum_file}")"
-    [[ "${expected_sha256}" =~ ^[0-9a-f]{64}$ ]] || die "无法读取 Xray 官方 SHA-256。"
-    printf '%s  %s\n' "${expected_sha256}" "${archive}" | sha256sum -c -
+    download_alpine_xray_archive "${archive_name}" "${archive}" "${checksum_file}" \
+      || die "Xray 官方 Release 和 IPv6-only 固定版本兜底均不可用。"
     unzip -tq "${archive}" >/dev/null || die "Xray 官方压缩包校验失败。"
     unzip -q "${archive}" -d "${stage}"
     [[ -x "${stage}/xray" ]] || die "Xray 压缩包中缺少可执行文件。"

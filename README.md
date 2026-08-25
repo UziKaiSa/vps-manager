@@ -2,7 +2,7 @@
 
 `VPS Manager` 是一个面向 Debian/Ubuntu VPS 的中文交互式管理脚本，并为小硬盘 Alpine/OpenRC NAT VPS 提供受限模式，用于完成服务器初始化、Xray 配置，以及 Komari Agent/WARP 私网接入。
 
-当前版本：`0.9.20-test`
+当前版本：`0.9.21-test`
 
 > 目前是测试版。首次在正式服务器上使用前，建议先运行预览模式，并保留一个已经登录的 SSH 终端。
 
@@ -38,7 +38,7 @@
 
 Alpine 使用宿主机内核。脚本只有在 `tcp_available_congestion_control` 确实包含 `bbr` 时才会写入并启用 BBR；如果 NAT/容器宿主机没有加载 `tcp_bbr`，脚本只会说明限制，不会写入一个看似成功但实际无效的配置。
 
-Xray 使用 XTLS 官方发布的 Linux amd64 静态压缩包，并由 OpenRC 管理。生成或更新配置后仍会先校验候选 JSON，再替换文件并重启 Xray。
+Xray 使用 XTLS 官方发布的 Linux 静态压缩包，并由 OpenRC 管理。脚本优先访问官方 Release 并校验官方摘要；如果纯 IPv6 主机无法访问 GitHub Release/Release Assets，则从本仓库的 IPv6 可达 Raw 地址下载固定版本 `26.7.28`（目前提供 amd64），并校验预置的官方 SHA-256。生成或更新配置后仍会先校验候选 JSON，再替换文件并重启 Xray。
 
 [Cloudflare 官方支持列表](https://developers.cloudflare.com/cloudflare-one/team-and-resources/devices/cloudflare-one-client/download/)目前没有 Alpine。为了让小硬盘 Alpine 机器仍可使用 Zero Trust Team、MDM 和 Service Token，脚本会安装并锁定 Cloudflare WARP `2026.1.150.0`，将官方 Debian 程序及其经过 SHA-256 校验的 glibc 依赖隔离在 `/opt/cloudflare-warp`。它不会替换 Alpine 的 musl，但属于兼容方案而不是 Cloudflare 官方支持的 Alpine 安装方式。
 
