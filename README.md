@@ -2,7 +2,7 @@
 
 `VPS Manager` 是一个面向 Debian/Ubuntu VPS 的中文交互式管理脚本，并为小硬盘 Alpine/OpenRC NAT VPS 提供受限模式，用于完成服务器初始化、Xray 配置，以及 Komari Agent/WARP 私网接入。
 
-当前版本：`0.9.19-test`
+当前版本：`0.9.20-test`
 
 > 目前是测试版。首次在正式服务器上使用前，建议先运行预览模式，并保留一个已经登录的 SSH 终端。
 
@@ -43,6 +43,8 @@ Xray 使用 XTLS 官方发布的 Linux amd64 静态压缩包，并由 OpenRC 管
 [Cloudflare 官方支持列表](https://developers.cloudflare.com/cloudflare-one/team-and-resources/devices/cloudflare-one-client/download/)目前没有 Alpine。为了让小硬盘 Alpine 机器仍可使用 Zero Trust Team、MDM 和 Service Token，脚本会安装并锁定 Cloudflare WARP `2026.1.150.0`，将官方 Debian 程序及其经过 SHA-256 校验的 glibc 依赖隔离在 `/opt/cloudflare-warp`。它不会替换 Alpine 的 musl，但属于兼容方案而不是 Cloudflare 官方支持的 Alpine 安装方式。
 
 Alpine 安装流程还会部署一个每 5 分钟执行的资源保护器：`warp-svc.log` 超过 8 MiB 时保留末尾 2 MiB 并压缩归档，`warp-svc` 的 RSS 超过 160 MiB 时自动重启服务。日志轮转不影响隧道；内存保护触发时会有一次短暂的 WARP 重连。
+
+Alpine WARP 安装只长期保留 `bash`、证书、下载工具、D-Bus、`iproute2` 和 `nftables` 等运行期包。解包 Debian 归档所需的 `binutils`、`xz` 作为临时构建依赖单独安装，候选运行时提取完成后立即清理；如果这些包在执行脚本前已经存在，脚本不会把它们删除。未被安装链路使用的 `libcap`、`nss-tools` 和 `libpcap` 不再安装。
 
 对于 `x86_64` 且根分区可用空间不足 300 MiB 的极小 Alpine 容器，脚本提供实验性极限小磁盘模式。该模式要求根分区至少剩余 105 MiB、`/run` 或 `/dev/shm` 至少剩余 60 MiB：官方安装包只暂存在 tmpfs，客户端包只提取 `warp-svc` 和 `warp-cli`，glibc 运行时按递归 ELF 依赖白名单裁剪，并把 `warp-cli` 压缩保存、使用时解压到 `/run`。资源保护器会直接读取已安装的 `PROFILE`，把日志限制为 512 KiB并保留末尾128 KiB，`warp-svc` RSS达到96MiB时重启；重复安装或更新保护器不会退回普通阈值。安装前仍会再次检查依赖安装后的根分区空间；不足时会清理候选文件并停止，不会强行写满磁盘。此模式只完成了 `amd64` 依赖审计，不对 `arm64` 开放。
 

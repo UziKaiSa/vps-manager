@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.9.19-test"
+SCRIPT_VERSION="0.9.20-test"
 SCRIPT_NAME="VPS Manager"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh"
 
@@ -42,6 +42,9 @@ ALPINE_WARP_LOG_TAIL_BYTES=2097152
 ALPINE_WARP_ULTRA_LOG_MAX_BYTES=524288
 ALPINE_WARP_ULTRA_LOG_TAIL_BYTES=131072
 ALPINE_WARP_ULTRA_RSS_MAX_KIB=98304
+ALPINE_WARP_RUNTIME_PACKAGES=(bash ca-certificates curl dbus iproute2 nftables)
+ALPINE_WARP_BUILD_PACKAGES=(binutils xz)
+ALPINE_WARP_BUILD_VIRTUAL=""
 APT_LOCK_WAIT_SECONDS=600
 APT_LOCK_REPORT_SECONDS=15
 FIREWALL_CONFIG="/etc/vps-manager/firewall.nft"
@@ -116,6 +119,7 @@ declare -a CFG_PROXY_LINKS=()
 
 
 cleanup() {
+  cleanup_alpine_warp_build_deps || true
   if [[ -n "${WORK_DIR}" \
     && ( "${WORK_DIR}" == /tmp/vps-manager.* || "${WORK_DIR}" == /run/vps-manager.* ) \
     && -d "${WORK_DIR}" ]]; then
@@ -257,6 +261,36 @@ check_supported_os() {
 
 is_alpine() {
   [[ "${OS_ID:-}" == "alpine" ]]
+}
+
+
+install_alpine_warp_build_deps() {
+  local package
+  local -a missing_packages=()
+
+  for package in "${ALPINE_WARP_BUILD_PACKAGES[@]}"; do
+    apk info -e "${package}" >/dev/null 2>&1 || missing_packages+=("${package}")
+  done
+  (( ${#missing_packages[@]} > 0 )) || return 0
+
+  ALPINE_WARP_BUILD_VIRTUAL=".vps-manager-warp-build-deps"
+  if ! apk add --no-cache --virtual "${ALPINE_WARP_BUILD_VIRTUAL}" \
+    "${missing_packages[@]}"; then
+    warn "无法安装 Alpine WARP 临时构建依赖。"
+    return 1
+  fi
+}
+
+
+cleanup_alpine_warp_build_deps() {
+  local virtual_package="${ALPINE_WARP_BUILD_VIRTUAL:-}"
+  [[ -n "${virtual_package}" ]] || return 0
+  ALPINE_WARP_BUILD_VIRTUAL=""
+  if apk info -e "${virtual_package}" >/dev/null 2>&1; then
+    apk del "${virtual_package}" >/dev/null \
+      || { warn "Alpine WARP 临时构建依赖清理失败：${virtual_package}"; return 1; }
+    log "Alpine WARP 构建依赖已清理；安装前已存在的包保持不变"
+  fi
 }
 
 
@@ -4815,6 +4849,7 @@ EOF
 komari_install_warp_alpine() {
   local free_kib free_mib stage package_file hash path url alpine_arch deb_arch lib_arch loader
   local package_url package_sha256 installed_arch="" backup="" ultra_low_disk=0 package_dir=""
+  local root_free_before_kib root_free_after_kib runtime_size_kib
   local mirror="https://deb.debian.org/debian"
   alpine_arch="$(apk --print-arch)"
   case "${alpine_arch}" in
@@ -4854,6 +4889,7 @@ komari_install_warp_alpine() {
     warn "检测到不可用或架构不匹配的 Alpine WARP 安装（记录架构：${installed_arch:-未知}，当前：${deb_arch}），将重新安装。"
   fi
   free_kib="$(df -Pk / | awk 'NR == 2 {print $4}')"
+  root_free_before_kib="${free_kib}"
   free_mib=$((free_kib / 1024))
   if (( free_mib < ALPINE_WARP_MIN_FREE_MIB )); then
     if [[ "${deb_arch}" != "amd64" ]]; then
@@ -4872,9 +4908,11 @@ komari_install_warp_alpine() {
   printf '\nAlpine 没有 Cloudflare 官方 WARP 包。脚本将安装固定版本 %s，\n' "${KOMARI_WARP_LEGACY_VERSION}"
   printf '并把官方 Debian 程序及其 glibc 依赖隔离在 %s，不替换 Alpine musl。\n' "${ALPINE_WARP_ROOT}"
   prompt_yes_no "是否继续安装 Alpine WARP 兼容运行时" 1 || return 1
-  apk add --no-cache bash ca-certificates curl dbus iproute2 nftables libcap nss-tools libpcap binutils xz
-  service_enable_start dbus
   ensure_work_dir
+  apk add --no-cache "${ALPINE_WARP_RUNTIME_PACKAGES[@]}" \
+    || { warn "Alpine WARP 运行期依赖安装失败。"; return 1; }
+  service_enable_start dbus \
+    || { warn "D-Bus 启动失败，停止安装 Alpine WARP。"; return 1; }
   if (( ultra_low_disk == 1 )); then
     package_dir="$(alpine_warp_tmpfs_dir)" \
       || { warn "tmpfs 至少需要 ${ALPINE_WARP_ULTRA_TMPFS_MIB} MiB 可用空间，无法安全暂存官方包。"; return 1; }
@@ -4885,38 +4923,52 @@ komari_install_warp_alpine() {
     package_dir="${WORK_DIR}"
     stage="${WORK_DIR}/cloudflare-warp"
   fi
-  rm -rf -- "${stage}"
-  mkdir -p "${stage}/runtime" "${stage}/client"
+  install_alpine_warp_build_deps || return 1
+  rm -rf -- "${stage}" \
+    || { cleanup_alpine_warp_build_deps; warn "无法清理旧的 WARP 候选目录。"; return 1; }
+  mkdir -p "${stage}/runtime" "${stage}/client" \
+    || { cleanup_alpine_warp_build_deps; warn "无法创建 WARP 候选目录。"; return 1; }
   while IFS='|' read -r hash path; do
     [[ -n "${hash}" ]] || continue
     package_file="${package_dir}/runtime.deb"
     url="${mirror}/${path}"
-    curl -fL --retry 3 --connect-timeout 10 --max-time 300 -o "${package_file}" "${url}"
-    printf '%s  %s\n' "${hash}" "${package_file}" | sha256sum -c -
-    extract_deb_to "${package_file}" "${stage}/runtime"
-    rm -f -- "${package_file}"
+    curl -fL --retry 3 --connect-timeout 10 --max-time 300 -o "${package_file}" "${url}" \
+      || { cleanup_alpine_warp_build_deps; warn "下载 WARP 运行库失败：${url}"; return 1; }
+    printf '%s  %s\n' "${hash}" "${package_file}" | sha256sum -c - \
+      || { cleanup_alpine_warp_build_deps; warn "WARP 运行库校验失败：${path}"; return 1; }
+    extract_deb_to "${package_file}" "${stage}/runtime" \
+      || { cleanup_alpine_warp_build_deps; warn "WARP 运行库解包失败：${path}"; return 1; }
+    rm -f -- "${package_file}" \
+      || { cleanup_alpine_warp_build_deps; warn "无法清理 WARP 运行库下载文件。"; return 1; }
   done < <(komari_alpine_runtime_manifest "${deb_arch}")
   if (( ultra_low_disk == 1 )); then
-    prune_alpine_warp_runtime "${stage}/runtime"
+    prune_alpine_warp_runtime "${stage}/runtime" \
+      || { cleanup_alpine_warp_build_deps; warn "WARP 极限运行时裁剪失败。"; return 1; }
     free_kib="$(df -Pk / | awk 'NR == 2 {print $4}')"
     (( free_kib >= 90 * 1024 )) \
-      || { warn "依赖安装后根分区不足 90 MiB，停止并清理候选运行时。"; rm -rf -- "${stage}" "${package_dir}"; return 1; }
+      || { warn "依赖安装后根分区不足 90 MiB，停止并清理候选运行时。"; cleanup_alpine_warp_build_deps; rm -rf -- "${stage}" "${package_dir}"; return 1; }
   fi
   package_file="${package_dir}/cloudflare-warp.deb"
-  curl -fL --retry 3 --connect-timeout 10 --max-time 240 -o "${package_file}" "${package_url}"
-  printf '%s  %s\n' "${package_sha256}" "${package_file}" | sha256sum -c -
+  curl -fL --retry 3 --connect-timeout 10 --max-time 240 -o "${package_file}" "${package_url}" \
+    || { cleanup_alpine_warp_build_deps; warn "下载 Cloudflare WARP 包失败。"; return 1; }
+  printf '%s  %s\n' "${package_sha256}" "${package_file}" | sha256sum -c - \
+    || { cleanup_alpine_warp_build_deps; warn "Cloudflare WARP 包校验失败。"; return 1; }
   if (( ultra_low_disk == 1 )); then
-    extract_deb_members_to "${package_file}" "${stage}/client" ./bin/warp-cli ./bin/warp-svc
+    extract_deb_members_to "${package_file}" "${stage}/client" ./bin/warp-cli ./bin/warp-svc \
+      || { cleanup_alpine_warp_build_deps; warn "WARP 极限客户端解包失败。"; return 1; }
   else
-    extract_deb_to "${package_file}" "${stage}/client"
+    extract_deb_to "${package_file}" "${stage}/client" \
+      || { cleanup_alpine_warp_build_deps; warn "WARP 客户端解包失败。"; return 1; }
   fi
-  rm -f -- "${package_file}"
+  rm -f -- "${package_file}" \
+    || { cleanup_alpine_warp_build_deps; warn "无法清理 WARP 安装包。"; return 1; }
   [[ -x "${stage}/client/bin/warp-cli" && -x "${stage}/client/bin/warp-svc" ]] \
-    || { warn "WARP 包内缺少程序文件。"; return 1; }
+    || { warn "WARP 包内缺少程序文件。"; cleanup_alpine_warp_build_deps; return 1; }
+  cleanup_alpine_warp_build_deps \
+    || { warn "临时构建依赖未能完全清理，停止发布 WARP 运行时。"; return 1; }
   printf '%s\n' "${KOMARI_WARP_LEGACY_VERSION}" > "${stage}/VERSION"
   printf '%s\n' "${deb_arch}" > "${stage}/ARCH"
   if (( ultra_low_disk == 1 )); then
-    apk del binutils xz >/dev/null 2>&1 || true
     gzip -9 "${stage}/client/bin/warp-cli"
     printf '%s\n' 'ultra-low-disk' > "${stage}/PROFILE"
   fi
@@ -4928,7 +4980,8 @@ komari_install_warp_alpine() {
     log "原 Alpine WARP 运行时已备份到 ${backup}"
   fi
   install -d -m 755 "$(dirname "${ALPINE_WARP_ROOT}")"
-  mv "${stage}" "${ALPINE_WARP_ROOT}"
+  mv "${stage}" "${ALPINE_WARP_ROOT}" \
+    || { warn "无法发布 Alpine WARP 运行时。"; return 1; }
   ALPINE_WARP_STAGE_DIR=""
   if (( ultra_low_disk == 1 )); then
     cat > /usr/local/bin/warp-cli <<EOF
@@ -4953,7 +5006,8 @@ EOF
 #!/bin/sh
 exec ${ALPINE_WARP_ROOT}/runtime/lib/${lib_arch}/${loader} --library-path ${ALPINE_WARP_ROOT}/runtime/lib/${lib_arch}:${ALPINE_WARP_ROOT}/runtime/usr/lib/${lib_arch} ${ALPINE_WARP_ROOT}/client/bin/warp-svc "\$@"
 EOF
-  chmod 755 /usr/local/bin/warp-cli /usr/local/bin/warp-svc
+  chmod 755 /usr/local/bin/warp-cli /usr/local/bin/warp-svc \
+    || { warn "无法设置 WARP 启动器权限。"; return 1; }
   install -d -m 755 /var/log/cloudflare-warp
   cat > /etc/init.d/warp-svc <<'EOF'
 #!/sbin/openrc-run
@@ -4966,10 +5020,18 @@ output_log="/var/log/cloudflare-warp/warp-svc.log"
 error_log="/var/log/cloudflare-warp/warp-svc.log"
 depend() { need net dbus; after firewall; }
 EOF
-  chmod 755 /etc/init.d/warp-svc
-  service_enable_start warp-svc
-  install_alpine_warp_guard
-  warp-cli --version
+  chmod 755 /etc/init.d/warp-svc \
+    || { warn "无法设置 WARP OpenRC 服务权限。"; return 1; }
+  service_enable_start warp-svc \
+    || { warn "WARP 服务启动失败。"; return 1; }
+  install_alpine_warp_guard \
+    || { warn "WARP 资源保护器安装失败。"; return 1; }
+  warp-cli --version \
+    || { warn "WARP 客户端运行校验失败。"; return 1; }
+  runtime_size_kib="$(du -sk "${ALPINE_WARP_ROOT}" | awk '{print $1}')"
+  root_free_after_kib="$(df -Pk / | awk 'NR == 2 {print $4}')"
+  printf 'Alpine WARP 磁盘验证：安装前可用 %s MiB，安装后可用 %s MiB，隔离运行时 %s MiB。\n' \
+    "$((root_free_before_kib / 1024))" "$((root_free_after_kib / 1024))" "$(((runtime_size_kib + 1023) / 1024))"
   rm -rf -- "${package_dir}"
   ALPINE_WARP_TMP_DIR=""
   log "Alpine WARP ${deb_arch} 兼容运行时安装完成并已锁定版本"
