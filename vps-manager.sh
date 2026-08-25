@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.9.21-test"
+SCRIPT_VERSION="0.9.22-test"
 SCRIPT_NAME="VPS Manager"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh"
 
@@ -638,17 +638,49 @@ wait_for_port_listening() {
 }
 
 
-detect_public_address() {
-  local address
+is_public_ip_address() {
+  command -v python3 >/dev/null 2>&1 || return 1
+  python3 - "$1" <<'PY'
+import ipaddress
+import sys
 
-  address="$(curl -4 -fsS --max-time 6 https://api.ipify.org 2>/dev/null || true)"
-  if [[ -z "${address}" ]]; then
-    address="$(curl -4 -fsS --max-time 6 https://ifconfig.me 2>/dev/null || true)"
-  fi
-  if [[ -z "${address}" ]]; then
-    address="$(hostname -I 2>/dev/null | awk '{print $1}')"
-  fi
-  printf '%s' "${address:-127.0.0.1}"
+try:
+    address = ipaddress.ip_address(sys.argv[1].strip())
+except ValueError:
+    raise SystemExit(1)
+raise SystemExit(0 if address.is_global else 1)
+PY
+}
+
+
+detect_public_address() {
+  local family url address candidate
+
+  while IFS='|' read -r family url; do
+    if command -v ip >/dev/null 2>&1; then
+      [[ "${family}" != 4 ]] || ip -4 route show default 2>/dev/null | grep -q . || continue
+      [[ "${family}" != 6 ]] || ip -6 route show default 2>/dev/null | grep -q . || continue
+    fi
+    address="$(curl "-${family}" -fsS --connect-timeout 4 --max-time 8 "${url}" 2>/dev/null \
+      | tr -d '[:space:]' || true)"
+    if [[ -n "${address}" ]] && is_public_ip_address "${address}"; then
+      printf '%s' "${address}"
+      return 0
+    fi
+  done <<'EOF'
+4|https://api.ipify.org
+4|https://ifconfig.me
+6|https://api64.ipify.org
+6|https://ifconfig.co/ip
+EOF
+
+  for candidate in $(hostname -I 2>/dev/null || true); do
+    if is_public_ip_address "${candidate}"; then
+      printf '%s' "${candidate}"
+      return 0
+    fi
+  done
+  return 0
 }
 
 
@@ -1072,6 +1104,7 @@ configure_ssh_high_port() {
   [[ "${SSH_SOCKET_TRANSITIONED}" == "1" ]] || reload_ssh_service "${ssh_service}" || { rollback_ssh_config_change "${config_existed}" "${config_before}" "${ssh_service}" "${port_config_backup_dir}"; die "SSH reload 失败，已恢复。"; }
   ensure_ssh_service_persistent "${ssh_service}" && wait_for_port_listening "${ssh_port}" 10 || { rollback_ssh_config_change "${config_existed}" "${config_before}" "${ssh_service}" "${port_config_backup_dir}"; die "新 SSH 端口未稳定监听，已恢复。"; }
   public_address="$(detect_public_address)"
+  [[ -n "${public_address}" ]] || public_address="<服务器公网地址>"
   printf '\n请在第二个终端使用当前登录方式验证：\nssh -p %s %s@%s\n\n' "${ssh_port}" "${admin_user}" "${public_address}"
   if ! prompt_yes_no "是否已经成功登录新端口" "0"; then
     rollback_ssh_config_change "${config_existed}" "${config_before}" "${ssh_service}" "${port_config_backup_dir}"
@@ -1140,6 +1173,7 @@ EOF
   fi
   reload_ssh_service "${ssh_service}" && ensure_ssh_service_persistent "${ssh_service}" || { rollback_ssh_config_change "${config_existed}" "${config_before}" "${ssh_service}"; die "SSH reload 或持久性检查失败，已恢复。"; }
   public_address="$(detect_public_address)"
+  [[ -n "${public_address}" ]] || public_address="<服务器公网地址>"
   printf '\nSSH 端口保持不变（%s）。请在第二个终端使用私钥验证登录：\nssh -p %s %s@%s\n\n' "${current_ports}" "${current_port}" "${admin_user}" "${public_address}"
   if ! prompt_yes_no "是否已经使用私钥成功登录" "0"; then
     rollback_ssh_config_change "${config_existed}" "${config_before}" "${ssh_service}"
@@ -1450,6 +1484,7 @@ EOF
   fi
 
   public_address="$(detect_public_address)"
+  [[ -n "${public_address}" ]] || public_address="<服务器公网地址>"
   printf '\n请保持当前窗口，在第二个终端执行：\n'
   printf 'ssh -p %s %s@%s\n\n' \
     "${ssh_port}" "${admin_user}" "${public_address}"
@@ -1689,7 +1724,12 @@ collect_xray_configuration() {
   default_name="$(hostname)"
   CFG_NODE_NAME="$(prompt_default "节点名称（用于生成 AWS YAML）" "${default_name}")"
   CFG_PUBLIC_ADDRESS="$(detect_public_address)"
-  printf '自动检测到节点地址：%s（仅用于生成 AWS YAML）\n' "${CFG_PUBLIC_ADDRESS}"
+  if [[ -n "${CFG_PUBLIC_ADDRESS}" ]]; then
+    printf '自动检测到节点地址：%s（仅用于生成 AWS YAML）\n' "${CFG_PUBLIC_ADDRESS}"
+  else
+    warn "无法可靠检测公网 IPv4/IPv6；不会使用环回、链路本地或 ULA 地址。"
+    CFG_PUBLIC_ADDRESS="$(prompt_required "节点公网 IPv4、IPv6 或域名（仅用于客户端 YAML）")"
+  fi
 
   default_port="$(random_available_port 20000 60000)"
   while true; do
