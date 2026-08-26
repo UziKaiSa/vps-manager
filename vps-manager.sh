@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.9.26-test"
+SCRIPT_VERSION="0.9.27-test"
 SCRIPT_NAME="VPS Manager"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh"
 
@@ -73,9 +73,15 @@ SSHD_DROPIN_DIR="/etc/ssh/sshd_config.d"
 SSHD_MANAGED_CONFIG="${SSHD_DROPIN_DIR}/00-00-vps-manager-hardening.conf"
 SSHD_LEGACY_MANAGED_CONFIG="${SSHD_DROPIN_DIR}/00-vps-manager-hardening.conf"
 SSHD_TMPFILES_CONFIG="/etc/tmpfiles.d/vps-manager-sshd.conf"
+SSHD_SOCKET_DROPIN_DIR="/etc/systemd/system/ssh.socket.d"
+SSHD_SOCKET_MANAGED_CONFIG="${SSHD_SOCKET_DROPIN_DIR}/99-vps-manager-listen.conf"
 SSH_SOCKET_TRANSITIONED=0
 SSH_SOCKET_WAS_ENABLED=0
 SSH_SOCKET_WAS_ACTIVE=0
+SSH_SOCKET_CONFIG_EXISTED=0
+SSH_SOCKET_CONFIG_BEFORE=""
+SSH_FIREWALL_TRANSITIONED=0
+SSH_FIREWALL_CONFIG_BEFORE=""
 
 STATE_DIR="/etc/vps-manager"
 STATE_FILE="${STATE_DIR}/state.json"
@@ -830,12 +836,129 @@ ssh_service_name() {
 }
 
 
+detect_ssh_backend() {
+  if is_alpine; then
+    printf 'openrc'
+    return 0
+  fi
+  if systemctl cat ssh.socket >/dev/null 2>&1 \
+    && { systemctl is-active --quiet ssh.socket \
+      || systemctl is-enabled --quiet ssh.socket; }; then
+    printf 'systemd-socket'
+  else
+    printf 'systemd-service'
+  fi
+}
+
+
+ensure_ssh_runtime_directory() {
+  install -d -o root -g root -m 0755 /run/sshd \
+    || { warn "无法创建 SSH 运行目录 /run/sshd。"; return 1; }
+}
+
+
+ensure_ssh_socket_persistent() {
+  local expected_port="${1:-}"
+  systemctl enable ssh.socket >/dev/null \
+    || { warn "无法设置 ssh.socket 开机启动。"; return 1; }
+  systemctl is-active --quiet ssh.socket \
+    || systemctl start ssh.socket >/dev/null \
+    || { warn "ssh.socket 当前未运行。"; return 1; }
+  systemctl is-enabled --quiet ssh.socket \
+    || { warn "ssh.socket 未保持开机启用状态。"; return 1; }
+  [[ -z "${expected_port}" ]] \
+    || wait_for_port_listening "${expected_port}" 10 \
+    || { warn "ssh.socket 未监听预期端口 ${expected_port}。"; return 1; }
+  printf 'SSH socket 持久性检查通过：ssh.socket 已启用并运行%s\n' \
+    "$([[ -n "${expected_port}" ]] && printf '；监听端口：%s' "${expected_port}" || true)"
+}
+
+
+restore_ssh_socket_listener() {
+  local ssh_service="$1"
+  systemctl stop ssh.socket >/dev/null 2>&1 || true
+  systemctl stop "${ssh_service}" >/dev/null 2>&1 || true
+  if [[ "${SSH_SOCKET_CONFIG_EXISTED}" == "1" && -r "${SSH_SOCKET_CONFIG_BEFORE}" ]]; then
+    install -d -o root -g root -m 0755 "${SSHD_SOCKET_DROPIN_DIR}"
+    install -o root -g root -m 0644 \
+      "${SSH_SOCKET_CONFIG_BEFORE}" "${SSHD_SOCKET_MANAGED_CONFIG}"
+  else
+    rm -f -- "${SSHD_SOCKET_MANAGED_CONFIG}"
+  fi
+  systemctl daemon-reload >/dev/null 2>&1 || return 1
+  if [[ "${SSH_SOCKET_WAS_ENABLED}" == "1" ]]; then
+    systemctl enable ssh.socket >/dev/null 2>&1 || return 1
+  else
+    systemctl disable ssh.socket >/dev/null 2>&1 || true
+  fi
+  if [[ "${SSH_SOCKET_WAS_ACTIVE}" == "1" ]]; then
+    systemctl start ssh.socket >/dev/null 2>&1 || return 1
+  fi
+  SSH_SOCKET_TRANSITIONED=0
+}
+
+
+configure_ssh_socket_port() {
+  local ssh_port="$1" ssh_service="$2" candidate
+  SSH_SOCKET_CONFIG_EXISTED=0
+  SSH_SOCKET_CONFIG_BEFORE="${WORK_DIR}/ssh-socket-listen.before"
+  SSH_SOCKET_WAS_ACTIVE=0
+  SSH_SOCKET_WAS_ENABLED=0
+  systemctl is-active --quiet ssh.socket && SSH_SOCKET_WAS_ACTIVE=1
+  systemctl is-enabled --quiet ssh.socket && SSH_SOCKET_WAS_ENABLED=1
+  if [[ -e "${SSHD_SOCKET_MANAGED_CONFIG}" ]]; then
+    SSH_SOCKET_CONFIG_EXISTED=1
+    cp -a -- "${SSHD_SOCKET_MANAGED_CONFIG}" "${SSH_SOCKET_CONFIG_BEFORE}"
+  fi
+  ensure_ssh_runtime_directory || return 1
+  /usr/sbin/sshd -t || { warn "SSH 配置语法检查失败。"; return 1; }
+  install -d -o root -g root -m 0755 "${SSHD_SOCKET_DROPIN_DIR}"
+  candidate="${WORK_DIR}/ssh-socket-listen.conf"
+  cat > "${candidate}" <<EOF
+[Socket]
+ListenStream=
+ListenStream=0.0.0.0:${ssh_port}
+ListenStream=[::]:${ssh_port}
+EOF
+  install -o root -g root -m 0644 "${candidate}" "${SSHD_SOCKET_MANAGED_CONFIG}"
+  SSH_SOCKET_TRANSITIONED=1
+  if ! systemctl stop ssh.socket \
+    || ! systemctl stop "${ssh_service}" \
+    || ! systemctl daemon-reload \
+    || ! systemctl enable ssh.socket >/dev/null \
+    || ! systemctl start ssh.socket \
+    || ! ensure_ssh_socket_persistent "${ssh_port}"; then
+    restore_ssh_socket_listener "${ssh_service}" || true
+    return 1
+  fi
+}
+
+
+reload_ssh_backend_auth() {
+  local ssh_backend="$1" ssh_service="$2"
+  ensure_ssh_runtime_directory || return 1
+  /usr/sbin/sshd -t || return 1
+  case "${ssh_backend}" in
+    systemd-socket)
+      if systemctl is-active --quiet "${ssh_service}"; then
+        systemctl reload "${ssh_service}" || return 1
+      fi
+      ensure_ssh_socket_persistent
+      ;;
+    systemd-service|openrc)
+      reload_ssh_service "${ssh_service}" \
+        && ensure_ssh_service_persistent "${ssh_service}"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+
 ensure_ssh_service_persistent() {
   local ssh_service="$1"
   local effective_ports
 
-  install -d -o root -g root -m 0755 /run/sshd \
-    || { warn "无法创建 SSH 运行目录 /run/sshd。"; return 1; }
+  ensure_ssh_runtime_directory || return 1
   /usr/sbin/sshd -t \
     || { warn "SSH 配置语法检查失败，未启动服务。"; return 1; }
   if is_alpine; then
@@ -886,50 +1009,16 @@ reload_ssh_service() {
 }
 
 
-
-switch_ssh_socket_to_service() {
-  local ssh_service="$1"
-
-  SSH_SOCKET_TRANSITIONED=0
-  SSH_SOCKET_WAS_ENABLED=0
-  SSH_SOCKET_WAS_ACTIVE=0
-  is_alpine && return 0
-  systemctl cat ssh.socket >/dev/null 2>&1 || return 0
-  systemctl is-active --quiet ssh.socket || return 0
-
-  SSH_SOCKET_WAS_ACTIVE=1
-  if systemctl is-enabled --quiet ssh.socket; then
-    SSH_SOCKET_WAS_ENABLED=1
-  fi
-  SSH_SOCKET_TRANSITIONED=1
-  log "Detected ssh.socket with a fixed listener; switching SSH to ssh.service/sshd_config"
-
-  systemctl stop ssh.socket \
-    && systemctl stop "${ssh_service}" \
-    && systemctl disable ssh.socket >/dev/null \
-    && systemctl daemon-reload \
-    && ensure_ssh_service_persistent "${ssh_service}"
+configure_combined_ssh_listener_backend() {
+  local ssh_service="$1" ssh_backend effective_port
+  ssh_backend="$(detect_ssh_backend)" || return 1
+  [[ "${ssh_backend}" == "systemd-socket" ]] || return 0
+  effective_port="$(/usr/sbin/sshd -T 2>/dev/null | awk '$1 == "port" {print $2; exit}')"
+  validate_port "${effective_port}" || return 1
+  log "Detected native ssh.socket backend; keeping socket activation and updating ListenStream"
+  configure_ssh_socket_port "${effective_port}" "${ssh_service}"
 }
 
-
-restore_ssh_socket_state() {
-  local ssh_service="$1"
-  [[ "${SSH_SOCKET_TRANSITIONED}" == "1" ]] || return 0
-
-  systemctl stop "${ssh_service}" >/dev/null 2>&1 || true
-  if [[ "${SSH_SOCKET_WAS_ENABLED}" == "1" ]]; then
-    systemctl enable ssh.socket >/dev/null 2>&1 || true
-  else
-    systemctl disable ssh.socket >/dev/null 2>&1 || true
-  fi
-  systemctl daemon-reload >/dev/null 2>&1 || true
-  if [[ "${SSH_SOCKET_WAS_ACTIVE}" == "1" ]]; then
-    systemctl start ssh.socket >/dev/null 2>&1 || return 1
-    SSH_SOCKET_TRANSITIONED=0
-    return 0
-  fi
-  systemctl start "${ssh_service}" >/dev/null 2>&1
-}
 
 
 restore_ssh_port_configs() {
@@ -1025,7 +1114,7 @@ rollback_ssh_hardening() {
   fi
 
   if [[ "${SSH_SOCKET_TRANSITIONED}" == "1" ]]; then
-    restore_ssh_socket_state "${ssh_service}" || warn "Failed to restore ssh.socket; keep this session open and check immediately."
+    restore_ssh_socket_listener "${ssh_service}" || warn "Failed to restore ssh.socket listener; keep this session open and check immediately."
   else
   if /usr/sbin/sshd -t; then
     reload_ssh_service "${ssh_service}" \
@@ -1038,7 +1127,7 @@ rollback_ssh_hardening() {
 
 rollback_ssh_config_change() {
   local config_existed="$1" config_before="$2" ssh_service="$3"
-  local port_config_backup_dir="${4:-}"
+  local port_config_backup_dir="${4:-}" ssh_backend
   restore_ssh_port_configs "${port_config_backup_dir}"
   if [[ "${config_existed}" == "1" ]]; then
     install -o root -g root -m 644 "${config_before}" "${SSHD_MANAGED_CONFIG}"
@@ -1046,20 +1135,123 @@ rollback_ssh_config_change() {
     rm -f -- "${SSHD_MANAGED_CONFIG}"
   fi
   if [[ "${SSH_SOCKET_TRANSITIONED}" == "1" ]]; then
-    restore_ssh_socket_state "${ssh_service}" || warn "Failed to restore ssh.socket; keep this session open and check immediately."
+    restore_ssh_socket_listener "${ssh_service}" || warn "Failed to restore ssh.socket listener; keep this session open and check immediately."
   elif /usr/sbin/sshd -t; then
-    reload_ssh_service "${ssh_service}" || warn "SSH 配置已恢复，但 reload 失败；请保持当前会话并手动检查。"
+    ssh_backend="$(detect_ssh_backend 2>/dev/null || true)"
+    reload_ssh_backend_auth "${ssh_backend}" "${ssh_service}" \
+      || warn "SSH 配置已恢复，但后端刷新失败；请保持当前会话并手动检查。"
   else
     warn "SSH 配置恢复后的语法检查失败；请保持当前会话并立即检查。"
   fi
 }
 
+
+render_managed_firewall_with_ports() {
+  local tcp_ports="$1" udp_ports="$2" candidate="$3"
+  local mode external_guard allow_icmp allow_ipv6 trust_warp external_interfaces
+  mode="$(firewall_configured_option MODE custom)"
+  external_guard="$(firewall_configured_option EXTERNAL_GUARD 0)"
+  allow_icmp="$(firewall_configured_option ALLOW_ICMP 1)"
+  allow_ipv6="$(firewall_configured_option ALLOW_IPV6 1)"
+  trust_warp="$(firewall_configured_option TRUST_WARP 1)"
+  external_interfaces="$(firewall_configured_option EXTERNAL_INTERFACES '')"
+  if [[ "${external_guard}" == "1" && -z "${external_interfaces}" ]]; then
+    external_interfaces="$(detect_external_interfaces | tr '\n' ' ' | sed 's/ $//')"
+    [[ -n "${external_interfaces}" ]] || return 1
+  fi
+  firewall_write_rules "${tcp_ports}" "${udp_ports}" "${candidate}" "${mode}" \
+    "${external_guard}" "${allow_icmp}" "${allow_ipv6}" "${trust_warp}" "${external_interfaces}"
+}
+
+
+reload_managed_firewall_config() {
+  nft -c -f "${FIREWALL_CONFIG}" || return 1
+  if ! is_alpine && systemctl is-active --quiet vps-manager-firewall.service; then
+    systemctl reload vps-manager-firewall.service
+  elif is_alpine && rc-service vps-manager-firewall status >/dev/null 2>&1; then
+    rc-service vps-manager-firewall reload
+  else
+    nft delete table inet "${FIREWALL_TABLE}" >/dev/null 2>&1 || true
+    nft -f "${FIREWALL_CONFIG}"
+  fi
+}
+
+
+rollback_managed_firewall_ssh_transition() {
+  [[ "${SSH_FIREWALL_TRANSITIONED}" == "1" ]] || return 0
+  [[ -r "${SSH_FIREWALL_CONFIG_BEFORE}" ]] || return 1
+  install -o root -g root -m 0600 "${SSH_FIREWALL_CONFIG_BEFORE}" "${FIREWALL_CONFIG}"
+  reload_managed_firewall_config || return 1
+  SSH_FIREWALL_TRANSITIONED=0
+}
+
+
+prepare_managed_firewall_ssh_transition() {
+  local ssh_port="$1" current_tcp current_udp candidate
+  SSH_FIREWALL_TRANSITIONED=0
+  SSH_FIREWALL_CONFIG_BEFORE="${WORK_DIR}/firewall-before-ssh-port.nft"
+  [[ -f "${FIREWALL_CONFIG}" ]] || return 0
+  nft list table inet "${FIREWALL_TABLE}" >/dev/null 2>&1 || return 0
+  cp -a -- "${FIREWALL_CONFIG}" "${SSH_FIREWALL_CONFIG_BEFORE}" || return 1
+  current_tcp="$(firewall_configured_ports tcp)"
+  current_udp="$(firewall_configured_ports udp)"
+  current_tcp="$(normalize_port_list "${current_tcp} ${ssh_port}")" || return 1
+  candidate="${WORK_DIR}/firewall-ssh-transition.nft"
+  render_managed_firewall_with_ports "${current_tcp}" "${current_udp}" "${candidate}" || return 1
+  nft -c -f "${candidate}" || return 1
+  install -o root -g root -m 0600 "${candidate}" "${FIREWALL_CONFIG}" || return 1
+  SSH_FIREWALL_TRANSITIONED=1
+  reload_managed_firewall_config \
+    || { rollback_managed_firewall_ssh_transition || true; return 1; }
+}
+
+
+finalize_managed_firewall_ssh_transition() {
+  local ssh_port="$1" old_ports="$2" current_tcp current_udp candidate port old keep_tcp=""
+  [[ "${SSH_FIREWALL_TRANSITIONED}" == "1" ]] || return 0
+  current_tcp="$(firewall_configured_ports tcp)"
+  current_udp="$(firewall_configured_ports udp)"
+  for port in ${current_tcp}; do
+    [[ "${port}" == "${ssh_port}" ]] && { keep_tcp+=" ${port}"; continue; }
+    for old in ${old_ports}; do
+      [[ "${port}" != "${old}" ]] || continue 2
+    done
+    keep_tcp+=" ${port}"
+  done
+  keep_tcp="$(normalize_port_list "${keep_tcp} ${ssh_port}")" || return 1
+  candidate="${WORK_DIR}/firewall-ssh-final.nft"
+  render_managed_firewall_with_ports "${keep_tcp}" "${current_udp}" "${candidate}" || return 1
+  nft -c -f "${candidate}" || return 1
+  install -o root -g root -m 0600 "${candidate}" "${FIREWALL_CONFIG}" || return 1
+  reload_managed_firewall_config || return 1
+  SSH_FIREWALL_TRANSITIONED=0
+}
+
+
+current_ssh_listener_ports() {
+  local connection_port="" detected="" ssh_backend
+  ssh_backend="$(detect_ssh_backend 2>/dev/null || true)"
+  if [[ "${ssh_backend}" == "systemd-socket" ]]; then
+    detected="$(systemctl show ssh.socket -p Listen --value 2>/dev/null \
+      | awk '$NF == "(Stream)" {port=$1; sub(/^.*:/, "", port); print port}' \
+      | sort -nu | tr '\n' ' ')"
+  else
+    detected="$(detect_ssh_ports 2>/dev/null | tr '\n' ' ' || true)"
+  fi
+  if [[ -z "${detected// /}" && -n "${SSH_CONNECTION:-}" ]]; then
+    connection_port="${SSH_CONNECTION##* }"
+    validate_port "${connection_port}" || connection_port=""
+  fi
+  normalize_port_list "${connection_port} ${detected}"
+}
+
 configure_ssh_high_port() {
-  local admin_user default_port ssh_port ssh_service public_address
+  local admin_user default_port ssh_port ssh_service ssh_backend public_address old_ports
   local config_existed=0 config_before effective_ports port_config_backup_dir=""
   SSH_SOCKET_TRANSITIONED=0
   SSH_SOCKET_WAS_ENABLED=0
   SSH_SOCKET_WAS_ACTIVE=0
+  SSH_FIREWALL_TRANSITIONED=0
   require_root
   check_supported_os
   admin_user="$(default_ssh_admin_user)"
@@ -1075,57 +1267,95 @@ configure_ssh_high_port() {
   done
   if [[ "${DEMO_MODE}" == "1" ]]; then
     log "[预览] 仅修改 SSH 端口（不会修改密码或密钥登录方式）"
-    printf '将停用现有 SSH 配置中的显式 Port，并改为：Port %s\n' "${ssh_port}"
+    printf '将自动检测 SSH 后端：socket 模式修改 ListenStream，service/OpenRC 修改 sshd Port。\n'
+    printf '受管防火墙会在验证期间同时保留旧端口和新端口，成功后再移除旧端口。\n'
+    printf '目标端口：%s\n' "${ssh_port}"
     return 0
   fi
   if [[ ! -x /usr/sbin/sshd ]]; then
     if is_alpine; then apk add --no-cache openssh; else apt_update_safe; apt-get install -y openssh-server; fi
   fi
   ssh_service="$(ssh_service_name)" || die "未找到 SSH 服务。"
+  ssh_backend="$(detect_ssh_backend)" || die "无法识别 SSH 监听后端。"
+  old_ports="$(current_ssh_listener_ports)"
+  [[ -n "${old_ports}" ]] || die "无法识别当前 SSH 连接端口，已停止以避免失联。"
+  printf '检测到 SSH 后端：%s；当前管理连接端口：%s\n' "${ssh_backend}" "${old_ports}"
   warn "不要关闭当前 SSH 窗口。修改后必须用第二个终端测试。"
   printf '请先在云厂商安全组中放行：%s/tcp\n' "${ssh_port}"
   prompt_yes_no "确认云安全组已经放行 ${ssh_port}/tcp" "0" || { printf '已取消修改，系统没有变化。\n'; return 0; }
   ensure_work_dir
-  install -d -o root -g root -m 755 "${SSHD_DROPIN_DIR}"
-  config_before="${WORK_DIR}/sshd-managed.before"
-  if [[ -e "${SSHD_MANAGED_CONFIG}" ]]; then
-    config_existed=1
-    cp -a -- "${SSHD_MANAGED_CONFIG}" "${config_before}"
-    awk 'tolower($1) != "port"' "${SSHD_MANAGED_CONFIG}" > "${WORK_DIR}/sshd-port.conf"
-  else
-    : > "${WORK_DIR}/sshd-port.conf"
-  fi
-  sed -i "1iPort ${ssh_port}" "${WORK_DIR}/sshd-port.conf"
-  if ! port_config_backup_dir="$(backup_and_disable_ssh_ports)"; then
-    rollback_ssh_config_change "${config_existed}" "${config_before}" "${ssh_service}"
-    die "无法安全替换现有 SSH Port 配置，已恢复。"
-  fi
-  install -o root -g root -m 644 "${WORK_DIR}/sshd-port.conf" "${SSHD_MANAGED_CONFIG}"
-  if ! /usr/sbin/sshd -t; then
-    rollback_ssh_config_change "${config_existed}" "${config_before}" "${ssh_service}" "${port_config_backup_dir}"
-    die "新 SSH 端口配置语法检查失败，已恢复。"
-  fi
-  effective_ports="$(/usr/sbin/sshd -T | awk '$1 == "port" {print $2}' | paste -sd, -)"
-  if [[ "${effective_ports}" != "${ssh_port}" ]]; then
-    rollback_ssh_config_change "${config_existed}" "${config_before}" "${ssh_service}" "${port_config_backup_dir}"
-    die "SSH 生效端口与预期不一致，已恢复。实际值：${effective_ports:-未知}"
-  fi
-  switch_ssh_socket_to_service "${ssh_service}" || { rollback_ssh_config_change "${config_existed}" "${config_before}" "${ssh_service}" "${port_config_backup_dir}"; die "切换 SSH 监听模式失败，已恢复。"; }
-  [[ "${SSH_SOCKET_TRANSITIONED}" == "1" ]] || reload_ssh_service "${ssh_service}" || { rollback_ssh_config_change "${config_existed}" "${config_before}" "${ssh_service}" "${port_config_backup_dir}"; die "SSH reload 失败，已恢复。"; }
-  ensure_ssh_service_persistent "${ssh_service}" && wait_for_port_listening "${ssh_port}" 10 || { rollback_ssh_config_change "${config_existed}" "${config_before}" "${ssh_service}" "${port_config_backup_dir}"; die "新 SSH 端口未稳定监听，已恢复。"; }
+  prepare_managed_firewall_ssh_transition "${ssh_port}" \
+    || die "无法在受管防火墙中临时同时放行旧/新 SSH 端口，系统没有变化。"
+
+  case "${ssh_backend}" in
+    systemd-socket)
+      if ! configure_ssh_socket_port "${ssh_port}" "${ssh_service}"; then
+        rollback_managed_firewall_ssh_transition || true
+        die "ssh.socket 新监听端口未生效，已恢复原 socket 和防火墙。"
+      fi
+      ;;
+    systemd-service|openrc)
+      install -d -o root -g root -m 755 "${SSHD_DROPIN_DIR}"
+      config_before="${WORK_DIR}/sshd-managed.before"
+      if [[ -e "${SSHD_MANAGED_CONFIG}" ]]; then
+        config_existed=1
+        cp -a -- "${SSHD_MANAGED_CONFIG}" "${config_before}"
+        awk 'tolower($1) != "port"' "${SSHD_MANAGED_CONFIG}" > "${WORK_DIR}/sshd-port.conf"
+      else
+        : > "${WORK_DIR}/sshd-port.conf"
+      fi
+      sed -i "1iPort ${ssh_port}" "${WORK_DIR}/sshd-port.conf"
+      if ! port_config_backup_dir="$(backup_and_disable_ssh_ports)"; then
+        rollback_managed_firewall_ssh_transition || true
+        die "无法安全替换现有 SSH Port 配置，已恢复防火墙。"
+      fi
+      install -o root -g root -m 644 "${WORK_DIR}/sshd-port.conf" "${SSHD_MANAGED_CONFIG}"
+      if ! /usr/sbin/sshd -t; then
+        rollback_ssh_config_change "${config_existed}" "${config_before}" "${ssh_service}" "${port_config_backup_dir}"
+        rollback_managed_firewall_ssh_transition || true
+        die "新 SSH 端口配置语法检查失败，已恢复。"
+      fi
+      effective_ports="$(/usr/sbin/sshd -T | awk '$1 == "port" {print $2}' | paste -sd, -)"
+      if [[ "${effective_ports}" != "${ssh_port}" ]]; then
+        rollback_ssh_config_change "${config_existed}" "${config_before}" "${ssh_service}" "${port_config_backup_dir}"
+        rollback_managed_firewall_ssh_transition || true
+        die "SSH 生效端口与预期不一致，已恢复。实际值：${effective_ports:-未知}"
+      fi
+      if ! reload_ssh_service "${ssh_service}" \
+        || ! ensure_ssh_service_persistent "${ssh_service}" \
+        || ! wait_for_port_listening "${ssh_port}" 10; then
+        rollback_ssh_config_change "${config_existed}" "${config_before}" "${ssh_service}" "${port_config_backup_dir}"
+        rollback_managed_firewall_ssh_transition || true
+        die "新 SSH 端口未稳定监听，已恢复。"
+      fi
+      ;;
+    *)
+      rollback_managed_firewall_ssh_transition || true
+      die "不支持的 SSH 后端：${ssh_backend}"
+      ;;
+  esac
   public_address="$(detect_public_address)"
   [[ -n "${public_address}" ]] || public_address="<服务器公网地址>"
   printf '\n请在第二个终端使用当前登录方式验证：\nssh -p %s %s@%s\n\n' "${ssh_port}" "${admin_user}" "${public_address}"
   if ! prompt_yes_no "是否已经成功登录新端口" "0"; then
-    rollback_ssh_config_change "${config_existed}" "${config_before}" "${ssh_service}" "${port_config_backup_dir}"
+    if [[ "${ssh_backend}" == "systemd-socket" ]]; then
+      restore_ssh_socket_listener "${ssh_service}" || warn "ssh.socket 恢复失败，请保持当前会话。"
+    else
+      rollback_ssh_config_change "${config_existed}" "${config_before}" "${ssh_service}" "${port_config_backup_dir}"
+    fi
+    rollback_managed_firewall_ssh_transition || warn "防火墙回滚失败，请保持当前会话。"
     warn "验证未通过，已恢复原 SSH 端口；认证方式始终未修改。"
     return 0
   fi
+  if ! finalize_managed_firewall_ssh_transition "${ssh_port}" "${old_ports}"; then
+    warn "SSH 新端口已验证，但防火墙未能移除旧端口；新旧端口暂时都保持放行，请稍后刷新主站防火墙。"
+  fi
+  SSH_SOCKET_TRANSITIONED=0
   log "SSH 高位端口配置完成（登录认证方式未修改）"
 }
 
 disable_ssh_password_login() {
-  local admin_user admin_home authorized_keys ssh_service public_address current_ports current_port host_name
+  local admin_user admin_home authorized_keys ssh_service ssh_backend public_address current_ports current_port host_name
   local config_existed=0 config_before effective effective_password effective_kbd effective_pubkey effective_methods
   SSH_SOCKET_TRANSITIONED=0
   SSH_SOCKET_WAS_ENABLED=0
@@ -1145,7 +1375,9 @@ disable_ssh_password_login() {
     return 0
   fi
   ssh_service="$(ssh_service_name)" || die "未找到 SSH 服务。"
-  current_ports="$(/usr/sbin/sshd -T | awk '$1 == "port" {print $2}' | paste -sd, -)"
+  ssh_backend="$(detect_ssh_backend)" || die "无法识别 SSH 监听后端。"
+  current_ports="$(current_ssh_listener_ports)"
+  [[ -n "${current_ports}" ]] || current_ports="$(/usr/sbin/sshd -T | awk '$1 == "port" {print $2}' | paste -sd, -)"
   current_port="${current_ports%%,*}"
   host_name="$(hostname -f 2>/dev/null || hostname)"
   ensure_work_dir
@@ -1181,7 +1413,8 @@ EOF
     rollback_ssh_config_change "${config_existed}" "${config_before}" "${ssh_service}"
     die "SSH 认证生效值与预期不一致，已恢复。"
   fi
-  reload_ssh_service "${ssh_service}" && ensure_ssh_service_persistent "${ssh_service}" || { rollback_ssh_config_change "${config_existed}" "${config_before}" "${ssh_service}"; die "SSH reload 或持久性检查失败，已恢复。"; }
+  reload_ssh_backend_auth "${ssh_backend}" "${ssh_service}" \
+    || { rollback_ssh_config_change "${config_existed}" "${config_before}" "${ssh_service}"; die "SSH 认证配置刷新或持久性检查失败，已恢复。"; }
   public_address="$(detect_public_address)"
   [[ -n "${public_address}" ]] || public_address="<服务器公网地址>"
   printf '\nSSH 端口保持不变（%s）。请在第二个终端使用私钥验证登录：\nssh -p %s %s@%s\n\n' "${current_ports}" "${current_port}" "${admin_user}" "${public_address}"
@@ -1458,12 +1691,12 @@ EOF
   [[ "${SSHD_LEGACY_MANAGED_CONFIG}" == "${SSHD_MANAGED_CONFIG}" ]] \
     || rm -f -- "${SSHD_LEGACY_MANAGED_CONFIG}"
 
-  if ! switch_ssh_socket_to_service "${ssh_service}"; then
+  if ! configure_combined_ssh_listener_backend "${ssh_service}"; then
     rollback_ssh_hardening \
       "${config_existed}" "${config_before}" \
       "${authorized_existed}" "${authorized_before}" "${authorized_keys}" \
       "${admin_user}" "${admin_group}" "${ssh_service}" "${port_config_backup_dir}"
-    die "Failed to switch SSH listener mode; previous configuration was restored."
+    die "SSH 监听后端配置失败，已恢复。"
   fi
 
   if [[ "${SSH_SOCKET_TRANSITIONED}" != "1" ]]; then
@@ -1477,13 +1710,17 @@ EOF
   fi
   fi
 
-  if ! ensure_ssh_service_persistent "${ssh_service}"; then
+  if [[ "${SSH_SOCKET_TRANSITIONED}" == "1" ]]; then
+    ensure_ssh_socket_persistent "${ssh_port}"
+  else
+    ensure_ssh_service_persistent "${ssh_service}"
+  fi || {
     rollback_ssh_hardening \
       "${config_existed}" "${config_before}" \
       "${authorized_existed}" "${authorized_before}" "${authorized_keys}" \
       "${admin_user}" "${admin_group}" "${ssh_service}" "${port_config_backup_dir}"
     die "SSH 当前可用但重启持久性检查失败，已恢复原配置。"
-  fi
+  }
 
   if ! wait_for_port_listening "${ssh_port}" 10; then
     rollback_ssh_hardening \

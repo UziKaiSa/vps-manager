@@ -31,7 +31,15 @@ assert "SSH 端口始终未修改" in auth_body
 assert 'SSH_SOCKET_TRANSITIONED=0' in auth_body
 assert '/usr/sbin/sshd -T -C' in auth_body
 assert 'user=${admin_user},host=${host_name}' in auth_body
-assert 'reload_ssh_service "${ssh_service}"' in port_body
-assert 'reload_ssh_service "${ssh_service}"' in auth_body
+assert 'ssh_backend="$(detect_ssh_backend)"' in port_body
+assert 'case "${ssh_backend}" in' in port_body
+assert 'systemd-socket)' in port_body
+assert 'configure_ssh_socket_port "${ssh_port}" "${ssh_service}"' in port_body
+assert 'switch_ssh_socket_to_service' not in port_body
+assert 'prepare_managed_firewall_ssh_transition' in port_body
+assert 'finalize_managed_firewall_ssh_transition' in port_body
+assert 'rollback_managed_firewall_ssh_transition' in port_body
+assert 'reload_ssh_backend_auth "${ssh_backend}" "${ssh_service}"' in auth_body
+assert 'systemctl show ssh.socket -p Listen --value' in text
 
 print("Independent SSH setting regression checks passed")

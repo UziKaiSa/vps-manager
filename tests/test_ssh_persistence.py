@@ -77,22 +77,28 @@ require(
     '5) ssh_key_helper_menu; pause_screen ;;',
     "Alpine menu hides SSH key and hardening management",
 )
+require(
+    'SSHD_SOCKET_MANAGED_CONFIG="${SSHD_SOCKET_DROPIN_DIR}/99-vps-manager-listen.conf"',
+    "managed ssh.socket listener drop-in is missing",
+)
+require('detect_ssh_backend() {', "SSH backend detection is missing")
+require('configure_ssh_socket_port() {', "native ssh.socket port management is missing")
+require('restore_ssh_socket_listener() {', "ssh.socket listener rollback is missing")
+require('ensure_ssh_socket_persistent() {', "ssh.socket persistence verification is missing")
+require('ListenStream=0.0.0.0:${ssh_port}', "ssh.socket IPv4 listener is missing")
+require('ListenStream=[::]:${ssh_port}', "ssh.socket IPv6 listener is missing")
 
 if text.count('ensure_ssh_service_persistent "${ssh_service}"') < 4:
     raise AssertionError("SSH hardening and public-key paths must both run persistence checks")
 
 ensure_body = function_body("ensure_ssh_service_persistent")
-if ensure_body.index('install -d -o root -g root -m 0755 /run/sshd') > ensure_body.index('/usr/sbin/sshd -t'):
+if ensure_body.index('ensure_ssh_runtime_directory') > ensure_body.index('/usr/sbin/sshd -t'):
     raise AssertionError("/run/sshd must exist before the first sshd syntax check")
 
-switch_body = function_body("switch_ssh_socket_to_service")
-if switch_body.index('systemctl stop ssh.socket') > switch_body.index('systemctl stop "${ssh_service}"'):
+socket_body = function_body("configure_ssh_socket_port")
+if socket_body.index('systemctl stop ssh.socket') > socket_body.index('systemctl stop "${ssh_service}"'):
     raise AssertionError("ssh.socket must stop before ssh.service to avoid socket reactivation")
-
-restore_body = function_body("restore_ssh_socket_state")
-socket_start = restore_body.index('systemctl start ssh.socket')
-service_start = restore_body.index('systemctl start "${ssh_service}"')
-if "return 0" not in restore_body[socket_start:service_start]:
-    raise AssertionError("socket-mode rollback must not also force-start ssh.service")
+if 'systemctl disable ssh.socket' in socket_body:
+    raise AssertionError("native socket port changes must not disable ssh.socket")
 
 print("SSH persistence regression checks passed")

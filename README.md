@@ -2,7 +2,7 @@
 
 `VPS Manager` 是一个面向 Debian/Ubuntu VPS 的中文交互式管理脚本，并为小硬盘 Alpine/OpenRC NAT VPS 提供受限模式，用于完成服务器初始化、Xray 配置，以及 Komari Agent/WARP 私网接入。
 
-当前版本：`0.9.26-test`
+当前版本：`0.9.27-test`
 
 > 目前是测试版。首次在正式服务器上使用前，建议先运行预览模式，并保留一个已经登录的 SSH 终端。
 
@@ -320,7 +320,7 @@ ss://BASE64(加密方式:密码)@IP或域名:端口
 
 “添加公钥”只校验并写入 `~/.ssh/authorized_keys`，会避免重复添加相同密钥；它不会修改 SSH 端口，也不会关闭密码登录。已有文件在变更前会保存到 `/var/backups/vps-manager/`。
 
-菜单 3、菜单 4 和菜单 5 完成后都会检查 SSH 的重启持久性：所有系统先确保 `/run/sshd` 存在，再执行 `sshd -t`；Debian/Ubuntu 写入 `/etc/tmpfiles.d/vps-manager-sshd.conf`，Alpine 使用 OpenRC。由 `ssh.socket` 切换到高位端口服务模式时，脚本先停止 socket、再停止 service，并启用普通 service；回滚到 socket 模式时只恢复 socket，避免两种监听方式互相触发或冲突。
+菜单 3、菜单 4 和菜单 5 会先检测当前 SSH 后端：Ubuntu `ssh.socket` 使用独立 `ListenStream` drop-in 并保留 socket activation；普通 systemd service 和 Alpine/OpenRC 才修改 `sshd_config` 的 `Port`。认证设置始终只修改 sshd 配置。所有后端先确保 `/run/sshd` 存在，再执行 `sshd -t`；受管防火墙会在第二终端验证期间同时允许旧、新端口，成功后才移除旧端口，失败则连同 SSH 后端一起恢复。
 
 脚本只会显示客户端生成密钥的命令、读取你粘贴的公钥，不会在 VPS 上生成、保存或显示客户端私钥。
 
