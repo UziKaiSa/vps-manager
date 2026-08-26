@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.9.27-test"
+SCRIPT_VERSION="0.9.28-test"
 SCRIPT_NAME="VPS Manager"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh"
 
@@ -4036,9 +4036,85 @@ add_ssh_public_key() {
     || { warn "公钥已写入，但 SSH 重启持久性检查失败；请保持当前会话并立即检查。"; return 1; }
 }
 
+show_ssh_listener_status() {
+  local ssh_backend ssh_service listener_ports
+
+  check_supported_os
+  ssh_backend="$(detect_ssh_backend 2>/dev/null || true)"
+  ssh_service="$(ssh_service_name 2>/dev/null || true)"
+  listener_ports="$(current_ssh_listener_ports 2>/dev/null || true)"
+
+  printf '\nSSH 当前监听状态：\n'
+  printf '  后端：%s\n' "${ssh_backend:-未知}"
+  printf '  服务：%s\n' "${ssh_service:-未知}"
+  printf '  实际监听端口：%s\n' "${listener_ports:-无法识别}"
+
+  case "${ssh_backend}" in
+    systemd-socket)
+      printf '  ssh.socket active：%s\n' "$(systemctl is-active ssh.socket 2>/dev/null || printf 'unknown')"
+      printf '  ssh.socket enabled：%s\n' "$(systemctl is-enabled ssh.socket 2>/dev/null || printf 'unknown')"
+      printf '\nssh.socket ListenStream：\n'
+      systemctl show ssh.socket -p Listen --value 2>/dev/null \
+        || warn "无法读取 ssh.socket ListenStream。"
+      ;;
+    systemd-service)
+      printf '  %s active：%s\n' "${ssh_service:-ssh service}" \
+        "$(systemctl is-active "${ssh_service}" 2>/dev/null || printf 'unknown')"
+      printf '  %s enabled：%s\n' "${ssh_service:-ssh service}" \
+        "$(systemctl is-enabled "${ssh_service}" 2>/dev/null || printf 'unknown')"
+      ;;
+    openrc)
+      rc-service "${ssh_service:-sshd}" status 2>/dev/null \
+        || warn "无法读取 OpenRC SSH 服务状态。"
+      ;;
+    *) warn "无法识别 SSH 监听后端。" ;;
+  esac
+}
+
+show_effective_ssh_config() {
+  local admin_user host_name current_ports current_port sshd_binary
+
+  check_supported_os
+  if command -v sshd >/dev/null 2>&1; then
+    sshd_binary="$(command -v sshd)"
+  elif [[ -x /usr/sbin/sshd ]]; then
+    sshd_binary="/usr/sbin/sshd"
+  else
+    warn "未找到 sshd，无法读取生效配置。"
+    return 1
+  fi
+
+  admin_user="$(default_ssh_admin_user)"
+  host_name="$(hostname -f 2>/dev/null || hostname)"
+  current_ports="$(current_ssh_listener_ports 2>/dev/null || true)"
+  current_port="${current_ports%%,*}"
+
+  printf '\nSSH 配置来源（仅显示文件名，不读取主机私钥）：\n'
+  printf '  /etc/ssh/sshd_config\n'
+  { find /etc/ssh/sshd_config.d -maxdepth 1 -type f -name '*.conf' -print 2>/dev/null || true; } \
+    | sort | sed 's/^/  /'
+  if [[ "$(detect_ssh_backend 2>/dev/null || true)" == "systemd-socket" ]]; then
+    { find /etc/systemd/system/ssh.socket.d -maxdepth 1 -type f -name '*.conf' -print 2>/dev/null || true; } \
+      | sort | sed 's/^/  /'
+  fi
+
+  if validate_port "${current_port:-}"; then
+    printf '\nsshd 完整生效配置（管理用户=%s，连接端口=%s）：\n' \
+      "${admin_user}" "${current_port}"
+    "${sshd_binary}" -T -C \
+      "user=${admin_user},host=${host_name},addr=127.0.0.1,laddr=127.0.0.1,lport=${current_port}" \
+      || { warn "无法读取 sshd 生效配置。"; return 1; }
+  else
+    warn "无法识别当前连接端口；以下为不带连接上下文的全局生效配置。"
+    "${sshd_binary}" -T \
+      || { warn "无法读取 sshd 生效配置。"; return 1; }
+  fi
+}
+
 generate_local_ssh_key() {
   local admin_user admin_home admin_group key_suffix key_name key_comment
   local private_key public_key ssh_config shortcut_name shortcut_host shortcut_user shortcut_port
+  local shortcut_default_port
   local candidate staged
   local -a keygen_cmd
 
@@ -4142,8 +4218,17 @@ generate_local_ssh_key() {
   shortcut_user="$(prompt_default "SSH 用户名" "root")"
   [[ "${shortcut_user}" =~ ^[A-Za-z0-9._-]+$ ]] \
     || { warn "SSH 用户名无效，未写入配置。"; return 1; }
+  shortcut_default_port="$(current_ssh_listener_ports 2>/dev/null | cut -d, -f1)"
+  if ! validate_port "${shortcut_default_port:-}"; then
+    warn "无法识别当前 SSH 实际监听端口，请手动输入目标服务器端口。"
+    shortcut_default_port=""
+  fi
   while true; do
-    shortcut_port="$(prompt_default "SSH 端口" "22")"
+    if [[ -n "${shortcut_default_port}" ]]; then
+      shortcut_port="$(prompt_default "SSH 端口" "${shortcut_default_port}")"
+    else
+      read -r -p "SSH 端口: " shortcut_port
+    fi
     validate_port "${shortcut_port}" && break
     warn "SSH 端口必须在 1-65535 之间。"
   done
@@ -4184,7 +4269,7 @@ EOF
 ssh_key_helper_menu() {
   local choice public_key key_file admin_user admin_home authorized_keys
   while true; do
-    printf '\nSSH 密钥与加固管理：\n  1) 本机 Linux 生成密钥并可配置快捷名称\n  2) 校验 SSH 公钥并显示指纹\n  3) 配置 SSH 高位端口（不改登录方式）\n  4) 禁用密码登录（不改 SSH 端口）\n  5) 添加公钥到当前管理用户 authorized_keys\n  6) 查看当前管理用户 authorized_keys\n  0) 返回\n'
+    printf '\nSSH 密钥与加固管理：\n  1) 本机 Linux 生成密钥并可配置快捷名称\n  2) 校验 SSH 公钥并显示指纹\n  3) 配置 SSH 高位端口（不改登录方式）\n  4) 禁用密码登录（不改 SSH 端口）\n  5) 添加公钥到当前管理用户 authorized_keys\n  6) 查看当前管理用户 authorized_keys\n  7) 查看当前 SSH 端口与监听状态\n  8) 查看 SSH 完整生效配置\n  0) 返回\n'
     read -r -p "请选择 [0]: " choice
     case "${choice:-0}" in
       1)
@@ -4211,6 +4296,12 @@ ssh_key_helper_menu() {
         authorized_keys="${admin_home}/.ssh/authorized_keys"
         printf '管理用户：%s\n文件：%s\n\n' "${admin_user}" "${authorized_keys}"
         [[ -r "${authorized_keys}" ]] && cat "${authorized_keys}" || warn "文件不存在或当前用户无权读取。"
+        ;;
+      7)
+        show_ssh_listener_status || true
+        ;;
+      8)
+        show_effective_ssh_config || true
         ;;
       0) return 0 ;;
       *) warn "未知选项。" ;;

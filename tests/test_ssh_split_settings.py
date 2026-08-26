@@ -15,6 +15,9 @@ def function_body(name: str) -> str:
 
 port_body = function_body("configure_ssh_high_port")
 auth_body = function_body("disable_ssh_password_login")
+key_body = function_body("generate_local_ssh_key")
+status_body = function_body("show_ssh_listener_status")
+config_body = function_body("show_effective_ssh_config")
 assert "配置 SSH 高位端口（不改登录方式）" in text
 assert "禁用密码登录（不改 SSH 端口）" in text
 assert "configure_ssh_high_port || true" in text
@@ -41,5 +44,18 @@ assert 'finalize_managed_firewall_ssh_transition' in port_body
 assert 'rollback_managed_firewall_ssh_transition' in port_body
 assert 'reload_ssh_backend_auth "${ssh_backend}" "${ssh_service}"' in auth_body
 assert 'systemctl show ssh.socket -p Listen --value' in text
+assert 'shortcut_default_port="$(current_ssh_listener_ports 2>/dev/null | cut -d, -f1)"' in key_body
+assert 'prompt_default "SSH 端口" "22"' not in key_body
+assert 'prompt_default "SSH 端口" "${shortcut_default_port}"' in key_body
+assert 'read -r -p "SSH 端口: " shortcut_port' in key_body
+assert "查看当前 SSH 端口与监听状态" in text
+assert "查看 SSH 完整生效配置" in text
+assert "show_ssh_listener_status || true" in text
+assert "show_effective_ssh_config || true" in text
+assert 'listener_ports="$(current_ssh_listener_ports 2>/dev/null || true)"' in status_body
+assert 'systemctl show ssh.socket -p Listen --value' in status_body
+assert '"${sshd_binary}" -T -C' in config_body
+assert "sshd 完整生效配置" in config_body
+assert "/etc/ssh/ssh_host" not in config_body
 
 print("Independent SSH setting regression checks passed")
