@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.9.22-test"
+SCRIPT_VERSION="0.9.23-test"
 SCRIPT_NAME="VPS Manager"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh"
 
@@ -5668,6 +5668,43 @@ normalize_port_list() {
 }
 
 
+detect_external_interfaces() {
+  local device
+  command -v ip >/dev/null 2>&1 || return 1
+  {
+    {
+      ip -o route show default 2>/dev/null || true
+      ip -o -6 route show default 2>/dev/null || true
+    } | awk '{for (i=1; i<=NF; i++) if ($i == "dev" && (i+1) <= NF) print $(i+1)}'
+    for device in /sys/class/net/*; do
+      [[ -e "${device}/device" ]] || continue
+      basename "${device}"
+    done
+  } | awk '$0 != "lo"' | sort -u
+}
+
+
+format_nft_ifname_set() {
+  local interface output=""
+  for interface in $1; do
+    [[ "${interface}" =~ ^[a-zA-Z0-9_.:-]+$ ]] || return 1
+    [[ -z "${output}" ]] || output+=", "
+    output+="\"${interface}\""
+  done
+  [[ -n "${output}" ]] || return 1
+  printf '{ %s }' "${output}"
+}
+
+
+firewall_configured_option() {
+  local key="$1" fallback="$2" value=""
+  if [[ -f "${FIREWALL_CONFIG}" ]]; then
+    value="$(sed -n "s/^# VPSMGR_${key}=//p" "${FIREWALL_CONFIG}" | head -n 1)"
+  fi
+  printf '%s' "${value:-${fallback}}"
+}
+
+
 firewall_configured_ports() {
   local protocol="$1"
   [[ -f "${FIREWALL_CONFIG}" ]] || return 0
@@ -5678,20 +5715,72 @@ firewall_configured_ports() {
 
 
 firewall_write_rules() {
-  local tcp_ports="$1" udp_ports="$2" candidate="$3"
-  local tcp_set="" udp_set=""
-  [[ -n "${tcp_ports}" ]] && tcp_set="    tcp dport { ${tcp_ports// /, } } counter accept comment \"VPSMGR_ALLOW_TCP\""
-  [[ -n "${udp_ports}" ]] && udp_set="    udp dport { ${udp_ports// /, } } counter accept comment \"VPSMGR_ALLOW_UDP\""
+  local tcp_ports="$1" udp_ports="$2" candidate="$3" mode="${4:-custom}"
+  local external_guard="${5:-0}" allow_icmp="${6:-1}" allow_ipv6="${7:-1}" trust_warp="${8:-1}"
+  local external_interfaces="${9:-}" tcp_set="" udp_set="" icmp_set="" warp_set=""
+  local guard_chain="" guard_tcp="" guard_udp="" guard_icmp="" guard_return="" external_set=""
+  local family_prefix=""
+
+  [[ "${allow_ipv6}" == "1" ]] || family_prefix="meta nfproto ipv4 "
+  [[ -n "${tcp_ports}" ]] && tcp_set="    ${family_prefix}tcp dport { ${tcp_ports// /, } } counter accept comment \"VPSMGR_ALLOW_TCP\""
+  [[ -n "${udp_ports}" ]] && udp_set="    ${family_prefix}udp dport { ${udp_ports// /, } } counter accept comment \"VPSMGR_ALLOW_UDP\""
+  if [[ "${allow_icmp}" == "1" ]]; then
+    if [[ "${allow_ipv6}" == "1" ]]; then
+      icmp_set='    meta l4proto { icmp, ipv6-icmp } counter accept comment "VPSMGR_ALLOW_ICMP"'
+    else
+      icmp_set='    ip protocol icmp counter accept comment "VPSMGR_ALLOW_ICMP"'
+    fi
+  fi
+  [[ "${trust_warp}" == "1" ]] && warp_set='    iifname "CloudflareWARP" counter accept comment "VPSMGR_TRUST_WARP"'
+
+  if [[ "${external_guard}" == "1" ]]; then
+    external_set="$(format_nft_ifname_set "${external_interfaces}")" \
+      || die "无法生成外部网卡 nftables 集合。"
+    if [[ "${allow_ipv6}" == "1" ]]; then
+      guard_return="    iifname ${external_set} ct state established,related counter accept comment \"VPSMGR_GUARD_RETURN\""
+    else
+      guard_return="    iifname ${external_set} meta nfproto ipv4 ct state established,related counter accept comment \"VPSMGR_GUARD_RETURN\""
+    fi
+    [[ -n "${tcp_ports}" ]] && guard_tcp="    iifname ${external_set} ${family_prefix}tcp dport { ${tcp_ports// /, } } counter accept comment \"VPSMGR_GUARD_TCP\""
+    [[ -n "${udp_ports}" ]] && guard_udp="    iifname ${external_set} ${family_prefix}udp dport { ${udp_ports// /, } } counter accept comment \"VPSMGR_GUARD_UDP\""
+    if [[ "${allow_icmp}" == "1" ]]; then
+      if [[ "${allow_ipv6}" == "1" ]]; then
+        guard_icmp="    iifname ${external_set} meta l4proto { icmp, ipv6-icmp } counter accept comment \"VPSMGR_GUARD_ICMP\""
+      else
+        guard_icmp="    iifname ${external_set} ip protocol icmp counter accept comment \"VPSMGR_GUARD_ICMP\""
+      fi
+    fi
+    guard_chain="  chain ingress_guard {
+    type filter hook prerouting priority -150; policy accept;
+    iifname ${external_set} ct state invalid counter drop
+${guard_return}
+${guard_tcp}
+${guard_udp}
+${guard_icmp}
+    iifname ${external_set} counter jump ingress_drop comment \"VPSMGR_GUARD_DROP\"
+  }
+  chain ingress_drop {
+    limit rate 6/minute burst 20 packets log prefix \"${FIREWALL_LOG_PREFIX} \" flags all
+    counter drop
+  }"
+  fi
   mkdir -p "${STATE_DIR}" "${BACKUP_ROOT}"
   cat > "${candidate}" <<EOF
+# VPSMGR_MODE=${mode}
+# VPSMGR_EXTERNAL_GUARD=${external_guard}
+# VPSMGR_ALLOW_ICMP=${allow_icmp}
+# VPSMGR_ALLOW_IPV6=${allow_ipv6}
+# VPSMGR_TRUST_WARP=${trust_warp}
+# VPSMGR_EXTERNAL_INTERFACES=${external_interfaces}
 table inet ${FIREWALL_TABLE} {
+${guard_chain}
   chain input {
     type filter hook input priority 10; policy drop;
     iifname "lo" counter accept
-    iifname "CloudflareWARP" counter accept
+${warp_set}
     ct state established,related counter accept
     ct state invalid counter drop
-    meta l4proto { icmp, ipv6-icmp } counter accept
+${icmp_set}
 ${tcp_set}
 ${udp_set}
     counter jump log_drop comment "VPSMGR_DROP_TOTAL"
@@ -5816,6 +5905,7 @@ EOF
 Description=VPS Manager firewall
 After=network-online.target
 Wants=network-online.target
+Before=docker.service podman.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
@@ -5888,14 +5978,24 @@ EOF
 
 configure_firewall_mode() {
   local mode="$1" candidate tcp_ports="" udp_ports="" ssh_ports=""
-  local proto port address process listeners=""
+  local proto port address process listeners="" external_interfaces=""
+  local external_guard="0" allow_icmp="1" allow_ipv6="1" trust_warp="1"
   require_root
   command -v nft >/dev/null 2>&1 || die "当前系统未安装 nftables。请先通过初始化环境安装必要工具。"
   nft list ruleset >/dev/null 2>&1 || die "当前内核或容器没有可用的 nftables/NET_ADMIN 权限。"
   ssh_ports="$(detect_ssh_ports)" || die "无法可靠识别 SSH 监听端口，已停止以避免失联。"
   tcp_ports="$(printf '%s\n' "${ssh_ports}" | sort -nu | tr '\n' ' ' | sed 's/ $//')"
   printf '\n检测到 SSH TCP 端口：%s\n' "${tcp_ports}"
-  if [[ "${mode}" == "proxy" ]]; then
+  if [[ "${mode}" == "main" ]]; then
+    external_guard="1"
+    allow_icmp="0"
+    allow_ipv6="0"
+    trust_warp="0"
+    prompt_yes_no "是否启用 Docker/转发前的统一外部入口隔离" "1" && external_guard="1" || external_guard="0"
+    prompt_yes_no "是否允许公网 ICMP/ICMPv6 主动入站" "0" && allow_icmp="1" || allow_icmp="0"
+    prompt_yes_no "是否允许 IPv6 新入站连接" "0" && allow_ipv6="1" || allow_ipv6="0"
+    prompt_yes_no "是否信任本机 CloudflareWARP 网卡直接入站" "0" && trust_warp="1" || trust_warp="0"
+  else
     listeners="$(list_public_listeners)"
     printf '\n当前非回环 TCP/UDP 监听候选：\n'
     printf '%-5s %-7s %-28s %s\n' "协议" "端口" "监听地址" "进程"
@@ -5907,25 +6007,45 @@ configure_firewall_mode() {
     tcp_ports="$(printf '%s\n' ${tcp_ports} | sort -nu | tr '\n' ' ' | sed 's/ $//')"
     if [[ -n "${udp_ports// /}" ]]; then udp_ports="$(printf '%s\n' ${udp_ports} | sort -nu | tr '\n' ' ' | sed 's/ $//')"; fi
   fi
+  if [[ "${external_guard}" == "1" ]]; then
+    external_interfaces="$(detect_external_interfaces | tr '\n' ' ' | sed 's/ $//')"
+    [[ -n "${external_interfaces}" ]] || die "无法识别默认路由的外部网卡，不能安全启用统一入口隔离。"
+  fi
   printf '\n拟开放 TCP：%s\n' "${tcp_ports:-无}"
   printf '拟开放 UDP：%s\n' "${udp_ports:-无}"
-  printf '其余 IPv4/IPv6 入站将拒绝；出站、转发和其他 nftables 表不会修改。\n'
+  printf '外部入口统一隔离：%s%s\n' "$([[ "${external_guard}" == "1" ]] && printf '开启' || printf '关闭')" "$([[ -n "${external_interfaces}" ]] && printf '（%s）' "${external_interfaces}" || true)"
+  printf '公网 ICMP/ICMPv6：%s\n' "$([[ "${allow_icmp}" == "1" ]] && printf '允许' || printf '拒绝')"
+  printf 'IPv6 新入站：%s\n' "$([[ "${allow_ipv6}" == "1" ]] && printf '允许同一白名单' || printf '拒绝')"
+  printf 'CloudflareWARP 网卡直入：%s\n' "$([[ "${trust_warp}" == "1" ]] && printf '信任' || printf '不信任')"
+  printf '出站保持允许；其余宿主机入站将拒绝。\n'
   prompt_yes_no "确认生成并临时应用上述规则" "0" || { printf '已取消。\n'; return 0; }
   candidate="$(mktemp /tmp/vps-manager-firewall.XXXXXX)"
-  firewall_write_rules "${tcp_ports}" "${udp_ports}" "${candidate}"
+  firewall_write_rules "${tcp_ports}" "${udp_ports}" "${candidate}" "${mode}" \
+    "${external_guard}" "${allow_icmp}" "${allow_ipv6}" "${trust_warp}" "${external_interfaces}"
   firewall_apply_with_rollback "${candidate}"
   rm -f "${candidate}"
 }
 
 
 manually_update_firewall_ports() {
-  local current_tcp current_udp input tcp_ports udp_ports ssh_ports candidate
+  local current_tcp current_udp input tcp_ports udp_ports ssh_ports candidate mode
+  local external_guard allow_icmp allow_ipv6 trust_warp external_interfaces
   require_root
   command -v nft >/dev/null 2>&1 || die "当前系统未安装 nftables。"
   nft list ruleset >/dev/null 2>&1 || die "当前内核或容器没有可用的 nftables/NET_ADMIN 权限。"
   ssh_ports="$(detect_ssh_ports)" || die "无法可靠识别 SSH 监听端口，已停止以避免失联。"
   current_tcp="$(firewall_configured_ports tcp)"
   current_udp="$(firewall_configured_ports udp)"
+  mode="$(firewall_configured_option MODE custom)"
+  external_guard="$(firewall_configured_option EXTERNAL_GUARD 0)"
+  allow_icmp="$(firewall_configured_option ALLOW_ICMP 1)"
+  allow_ipv6="$(firewall_configured_option ALLOW_IPV6 1)"
+  trust_warp="$(firewall_configured_option TRUST_WARP 1)"
+  external_interfaces="$(firewall_configured_option EXTERNAL_INTERFACES '')"
+  if [[ "${external_guard}" == "1" && -z "${external_interfaces}" ]]; then
+    external_interfaces="$(detect_external_interfaces | tr '\n' ' ' | sed 's/ $//')"
+    [[ -n "${external_interfaces}" ]] || die "无法识别默认路由的外部网卡。"
+  fi
   [[ -n "${current_tcp}" ]] || current_tcp="${ssh_ports//$'\n'/ }"
 
   printf '\n当前 TCP 白名单：%s\n' "${current_tcp:-无}"
@@ -5946,7 +6066,8 @@ manually_update_firewall_ports() {
   printf '最终 UDP 白名单：%s\n' "${udp_ports:-无}"
   prompt_yes_no "确认临时应用这份完整白名单" "0" || { printf '已取消。\n'; return 0; }
   candidate="$(mktemp /tmp/vps-manager-firewall.XXXXXX)"
-  firewall_write_rules "${tcp_ports}" "${udp_ports}" "${candidate}"
+  firewall_write_rules "${tcp_ports}" "${udp_ports}" "${candidate}" "${mode}" \
+    "${external_guard}" "${allow_icmp}" "${allow_ipv6}" "${trust_warp}" "${external_interfaces}"
   firewall_apply_with_rollback "${candidate}"
   rm -f "${candidate}"
 }
@@ -5964,9 +6085,14 @@ firewall_show_counters() {
   udp_ports="$(firewall_configured_ports udp)"
   printf '\n当前白名单：\n  TCP: %s\n  UDP: %s\n\n累计统计（规则重载或重启后重新计数）：\n' \
     "${tcp_ports:-无}" "${udp_ports:-无}"
-  nft list chain inet "${FIREWALL_TABLE}" input 2>/dev/null | awk '
+  nft list table inet "${FIREWALL_TABLE}" 2>/dev/null | awk '
+    /VPSMGR_GUARD_TCP/ {kind="统一入口允许 TCP"}
+    /VPSMGR_GUARD_UDP/ {kind="统一入口允许 UDP"}
+    /VPSMGR_GUARD_ICMP/ {kind="统一入口允许 ICMP"}
+    /VPSMGR_GUARD_DROP/ {kind="外部入口统一隔离"}
     /VPSMGR_ALLOW_TCP/ {kind="允许 TCP 白名单"}
     /VPSMGR_ALLOW_UDP/ {kind="允许 UDP 白名单"}
+    /VPSMGR_ALLOW_ICMP/ {kind="允许公网 ICMP"}
     /VPSMGR_DROP_TOTAL/ {kind="拒绝其他入站"}
     kind != "" && match($0, /counter packets [0-9]+ bytes [0-9]+/) {
       value=substr($0, RSTART, RLENGTH); sub("counter packets ", "", value); sub(" bytes ", " 个包，", value)
@@ -5988,7 +6114,7 @@ firewall_show_recent_blocks() {
         else if ($i ~ /^IN=/) {iface=$i; sub(/^IN=/,"",iface)}
       }
       before=substr($0,1,index($0,prefix)-1); gsub(/[[:space:]]+$/, "", before)
-      printf "%s | 来源 %s | 本机 %s/%s | 网卡 %s | 已拒绝：端口不在白名单\n", before, source, proto, port, iface
+      printf "%s | 来源 %s | 目标 %s/%s | 网卡 %s | 已拒绝：外部入口不在白名单\n", before, source, proto, port, iface
     }
   ' | tail -n "${limit}"
 }

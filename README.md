@@ -2,7 +2,7 @@
 
 `VPS Manager` 是一个面向 Debian/Ubuntu VPS 的中文交互式管理脚本，并为小硬盘 Alpine/OpenRC NAT VPS 提供受限模式，用于完成服务器初始化、Xray 配置，以及 Komari Agent/WARP 私网接入。
 
-当前版本：`0.9.22-test`
+当前版本：`0.9.23-test`
 
 > 目前是测试版。首次在正式服务器上使用前，建议先运行预览模式，并保留一个已经登录的 SSH 终端。
 
@@ -167,9 +167,10 @@ bash vps-manager.sh --help
 
 ## 9. 防火墙管理
 
-防火墙使用 nftables，并只维护独立的 `inet vps_manager_firewall` 表，不会清空 WARP、Docker 或系统已有规则，也不会修改出站和转发规则。IPv4 与 IPv6 同时生效。
+防火墙使用 nftables，并只维护独立的 `inet vps_manager_firewall` 表，不会清空 WARP、Docker 或系统已有规则。宿主机入站由 `input` 链保护；主站模式还可在 Docker DNAT 之前通过 `prerouting` 统一隔离外部新连接，不依赖项目、容器运行时或 Compose 绑定地址。出站保持允许。
 
-- 主站防火墙配置：自动读取 sshd 的有效端口，只允许 SSH、已建立连接、回环、WARP 私网接口和必要 ICMP 入站。
+- 主站防火墙配置：自动读取并强制保留 sshd 的有效 IPv4 端口；默认启用外部入口统一隔离，拒绝其他宿主机及转发新连接，效果对应“入站仅允许 IPv4 SSH、IPv4 出站全部允许”的主站安全组。公网 ICMP/ICMPv6、IPv6 新入站和本机 CloudflareWARP 网卡直入均为独立开关，默认关闭。
+- systemd 持久化单元会排在 Docker、Podman 之前加载；统一入口隔离在 DNAT 之前按默认路由外部网卡执行，所以新增容器项目和上游 Compose 恢复 `0.0.0.0` 不会自动扩大公网入口。
 - 代理站防火墙配置/刷新：在主站规则基础上，重新扫描当前绑定到非回环地址的 TCP/UDP 监听端口，显示协议、端口、监听地址和进程，确认后替换现有固定白名单。
 - 手动维护 TCP/UDP 白名单：显示当前开放端口，输入完整的新端口列表即可；脚本会校验端口、去重并强制保留当前 SSH 端口，不需要编写 nftables 规则。
 - 日志与中文统计：显示允许/拒绝数据包计数、最近 50 条拒绝记录、最常扫描的来源 IP 和目标端口，不需要阅读 nftables 或内核原始日志。
