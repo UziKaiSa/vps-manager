@@ -40,6 +40,16 @@ def test_main_mode_matches_ssh_only_security_group_defaults():
     assert "VPSMGR_GUARD_DROP" in TEXT
 
 
+def test_ipv6_new_inbound_toggle_does_not_break_ipv6_return_traffic():
+    assert "meta nfproto ipv4 ct state established,related" not in TEXT
+    assert "iifname ${external_set} ct state established,related" in TEXT
+    assert "nd-router-advert" in TEXT
+    assert "nd-neighbor-solicit" in TEXT
+    assert "nd-neighbor-advert" in TEXT
+    assert "packet-too-big" in TEXT
+    assert "VPSMGR_ALLOW_ICMPV6_CONTROL" in TEXT
+
+
 def test_firewall_features_have_independent_persisted_switches():
     assert "VPSMGR_EXTERNAL_GUARD=" in TEXT
     assert "VPSMGR_ALLOW_ICMP=" in TEXT

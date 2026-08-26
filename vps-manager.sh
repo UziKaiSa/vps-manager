@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.9.24-test"
+SCRIPT_VERSION="0.9.25-test"
 SCRIPT_NAME="VPS Manager"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh"
 
@@ -5729,6 +5729,7 @@ firewall_write_rules() {
   local external_guard="${5:-0}" allow_icmp="${6:-1}" allow_ipv6="${7:-1}" trust_warp="${8:-1}"
   local external_interfaces="${9:-}" tcp_set="" udp_set="" icmp_set="" warp_set=""
   local guard_chain="" guard_tcp="" guard_udp="" guard_icmp="" guard_return="" external_set=""
+  local ipv6_control_set="" guard_ipv6_control=""
   local family_prefix=""
 
   [[ "${allow_ipv6}" == "1" ]] || family_prefix="meta nfproto ipv4 "
@@ -5742,15 +5743,13 @@ firewall_write_rules() {
     fi
   fi
   [[ "${trust_warp}" == "1" ]] && warp_set='    iifname "CloudflareWARP" counter accept comment "VPSMGR_TRUST_WARP"'
+  ipv6_control_set='    meta nfproto ipv6 icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem, nd-router-solicit, nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert } counter accept comment "VPSMGR_ALLOW_ICMPV6_CONTROL"'
 
   if [[ "${external_guard}" == "1" ]]; then
     external_set="$(format_nft_ifname_set "${external_interfaces}")" \
       || die "无法生成外部网卡 nftables 集合。"
-    if [[ "${allow_ipv6}" == "1" ]]; then
-      guard_return="    iifname ${external_set} ct state established,related counter accept comment \"VPSMGR_GUARD_RETURN\""
-    else
-      guard_return="    iifname ${external_set} meta nfproto ipv4 ct state established,related counter accept comment \"VPSMGR_GUARD_RETURN\""
-    fi
+    guard_return="    iifname ${external_set} ct state established,related counter accept comment \"VPSMGR_GUARD_RETURN\""
+    guard_ipv6_control="    iifname ${external_set} meta nfproto ipv6 icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem, nd-router-solicit, nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert } counter accept comment \"VPSMGR_GUARD_ICMPV6_CONTROL\""
     [[ -n "${tcp_ports}" ]] && guard_tcp="    iifname ${external_set} ${family_prefix}tcp dport { ${tcp_ports// /, } } counter accept comment \"VPSMGR_GUARD_TCP\""
     [[ -n "${udp_ports}" ]] && guard_udp="    iifname ${external_set} ${family_prefix}udp dport { ${udp_ports// /, } } counter accept comment \"VPSMGR_GUARD_UDP\""
     if [[ "${allow_icmp}" == "1" ]]; then
@@ -5764,6 +5763,7 @@ firewall_write_rules() {
     type filter hook prerouting priority -150; policy accept;
     iifname ${external_set} ct state invalid counter drop
 ${guard_return}
+${guard_ipv6_control}
 ${guard_tcp}
 ${guard_udp}
 ${guard_icmp}
@@ -5790,6 +5790,7 @@ ${guard_chain}
 ${warp_set}
     ct state established,related counter accept
     ct state invalid counter drop
+${ipv6_control_set}
 ${icmp_set}
 ${tcp_set}
 ${udp_set}
