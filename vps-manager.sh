@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.9.23-test"
+SCRIPT_VERSION="0.9.24-test"
 SCRIPT_NAME="VPS Manager"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh"
 
@@ -81,7 +81,17 @@ STATE_DIR="/etc/vps-manager"
 STATE_FILE="${STATE_DIR}/state.json"
 INFO_FILE="${STATE_DIR}/last-install.txt"
 YAML_FILE="${STATE_DIR}/proxies.yaml"
-BACKUP_ROOT="/var/backups/vps-manager"
+BACKUP_HOME="${HOME:-/root}"
+if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+  if command -v getent >/dev/null 2>&1; then
+    candidate_home="$(getent passwd "${SUDO_USER}" | cut -d: -f6)"
+    [[ -z "${candidate_home}" ]] || BACKUP_HOME="${candidate_home}"
+  elif [[ -d "/home/${SUDO_USER}" ]]; then
+    BACKUP_HOME="/home/${SUDO_USER}"
+  fi
+fi
+[[ "${BACKUP_HOME}" == /* ]] || BACKUP_HOME="/root"
+BACKUP_ROOT="${BACKUP_HOME%/}/backups/vps-manager"
 
 DEMO_MODE=0
 WORK_DIR=""
