@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.9.28-test"
+SCRIPT_VERSION="0.9.29-test"
 SCRIPT_NAME="VPS Manager"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh"
 
@@ -5976,6 +5976,19 @@ detect_ssh_ports() {
 }
 
 
+active_ssh_ports_for_firewall() {
+  local normalized port found=0
+  normalized="$(current_ssh_listener_ports 2>/dev/null || true)"
+  [[ -n "${normalized}" ]] || return 1
+  while read -r port; do
+    validate_port "${port:-}" || continue
+    printf '%s\n' "${port}"
+    found=1
+  done < <(printf '%s\n' "${normalized}" | tr ',' '\n')
+  [[ "${found}" == "1" ]]
+}
+
+
 list_public_listeners() {
   local proto local_addr address port process
 
@@ -6316,24 +6329,28 @@ EOF
 
 
 configure_firewall_mode() {
-  local mode="$1" candidate tcp_ports="" udp_ports="" ssh_ports=""
+  local mode="$1" customize_switches="${2:-0}" candidate tcp_ports="" udp_ports="" ssh_ports=""
   local proto port address process listeners="" external_interfaces=""
   local external_guard="0" allow_icmp="1" allow_ipv6="1" trust_warp="1"
   require_root
   command -v nft >/dev/null 2>&1 || die "当前系统未安装 nftables。请先通过初始化环境安装必要工具。"
   nft list ruleset >/dev/null 2>&1 || die "当前内核或容器没有可用的 nftables/NET_ADMIN 权限。"
-  ssh_ports="$(detect_ssh_ports)" || die "无法可靠识别 SSH 监听端口，已停止以避免失联。"
+  ssh_ports="$(active_ssh_ports_for_firewall)" || die "无法可靠识别 SSH 实际监听端口，已停止以避免失联。"
   tcp_ports="$(printf '%s\n' "${ssh_ports}" | sort -nu | tr '\n' ' ' | sed 's/ $//')"
   printf '\n检测到 SSH TCP 端口：%s\n' "${tcp_ports}"
   if [[ "${mode}" == "main" ]]; then
     external_guard="1"
     allow_icmp="0"
     allow_ipv6="0"
-    trust_warp="0"
-    prompt_yes_no "是否启用 Docker/转发前的统一外部入口隔离" "1" && external_guard="1" || external_guard="0"
-    prompt_yes_no "是否允许公网 ICMP/ICMPv6 主动入站" "0" && allow_icmp="1" || allow_icmp="0"
-    prompt_yes_no "是否允许 IPv6 新入站连接" "0" && allow_ipv6="1" || allow_ipv6="0"
-    prompt_yes_no "是否信任本机 CloudflareWARP 网卡直接入站" "0" && trust_warp="1" || trust_warp="0"
+    trust_warp="1"
+    if [[ "${customize_switches}" == "1" ]]; then
+      prompt_yes_no "是否启用 Docker/转发前的统一外部入口隔离" "1" && external_guard="1" || external_guard="0"
+      prompt_yes_no "是否允许公网 ICMP/ICMPv6 主动入站" "0" && allow_icmp="1" || allow_icmp="0"
+      prompt_yes_no "是否允许 IPv6 新入站连接" "0" && allow_ipv6="1" || allow_ipv6="0"
+      prompt_yes_no "是否信任本机 CloudflareWARP 网卡直接入站" "1" && trust_warp="1" || trust_warp="0"
+    else
+      printf '使用主站安全基线；如需逐项调整，请返回并选择“自定义主站安全开关”。\n'
+    fi
   else
     listeners="$(list_public_listeners)"
     printf '\n当前非回环 TCP/UDP 监听候选：\n'
@@ -6372,7 +6389,7 @@ manually_update_firewall_ports() {
   require_root
   command -v nft >/dev/null 2>&1 || die "当前系统未安装 nftables。"
   nft list ruleset >/dev/null 2>&1 || die "当前内核或容器没有可用的 nftables/NET_ADMIN 权限。"
-  ssh_ports="$(detect_ssh_ports)" || die "无法可靠识别 SSH 监听端口，已停止以避免失联。"
+  ssh_ports="$(active_ssh_ports_for_firewall)" || die "无法可靠识别 SSH 实际监听端口，已停止以避免失联。"
   current_tcp="$(firewall_configured_ports tcp)"
   current_udp="$(firewall_configured_ports udp)"
   mode="$(firewall_configured_option MODE custom)"
@@ -6544,6 +6561,7 @@ firewall_management_menu() {
     printf '  4) 查看脚本管理的防火墙规则\n'
     printf '  5) 防火墙日志与中文统计\n'
     printf '  6) 停用脚本管理的防火墙（保留配置）\n'
+    printf '  7) 自定义主站安全开关（仍仅开放 SSH）\n'
     printf '  0) 返回\n'
     read -r -p "请选择: " choice
     case "${choice:-0}" in
@@ -6553,6 +6571,7 @@ firewall_management_menu() {
       4) nft list table inet "${FIREWALL_TABLE}" 2>/dev/null || warn "脚本管理的防火墙尚未启用。" ;;
       5) firewall_log_management_menu ;;
       6) disable_managed_firewall ;;
+      7) configure_firewall_mode main 1 ;;
       0) return 0 ;;
       *) warn "未知选项。" ;;
     esac

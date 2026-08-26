@@ -22,7 +22,9 @@ def test_rules_cover_ipv4_ipv6_and_preserve_ssh():
     assert "table inet ${FIREWALL_TABLE}" in TEXT
     assert "ct state established,related counter accept" in TEXT
     assert "meta l4proto { icmp, ipv6-icmp } counter accept" in TEXT
-    assert 'ssh_ports="$(detect_ssh_ports)"' in TEXT
+    assert 'ssh_ports="$(active_ssh_ports_for_firewall)"' in TEXT
+    assert "active_ssh_ports_for_firewall()" in TEXT
+    assert 'normalized="$(current_ssh_listener_ports 2>/dev/null || true)"' in TEXT
     assert 'counter jump log_drop comment "VPSMGR_DROP_TOTAL"' in TEXT
     assert 'limit rate 6/minute burst 20 packets log prefix' in TEXT
 
@@ -31,7 +33,7 @@ def test_main_mode_matches_ssh_only_security_group_defaults():
     assert 'external_guard="1"' in TEXT
     assert 'allow_icmp="0"' in TEXT
     assert 'allow_ipv6="0"' in TEXT
-    assert 'trust_warp="0"' in TEXT
+    assert 'trust_warp="1"' in TEXT
     assert "detect_external_interfaces()" in TEXT
     assert "type filter hook prerouting priority -150; policy accept;" in TEXT
     assert "ct state established,related counter accept" in TEXT
@@ -60,6 +62,10 @@ def test_firewall_features_have_independent_persisted_switches():
     assert "是否允许公网 ICMP/ICMPv6 主动入站" in TEXT
     assert "是否允许 IPv6 新入站连接" in TEXT
     assert "是否信任本机 CloudflareWARP 网卡直接入站" in TEXT
+    assert 'customize_switches="${2:-0}"' in TEXT
+    assert 'if [[ "${customize_switches}" == "1" ]]' in TEXT
+    assert "自定义主站安全开关（仍仅开放 SSH）" in TEXT
+    assert "7) configure_firewall_mode main 1 ;;" in TEXT
 
 
 def test_prerouting_guard_is_before_docker_dnat_and_environment_agnostic():
