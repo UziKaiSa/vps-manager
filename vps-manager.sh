@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.9.25-test"
+SCRIPT_VERSION="0.9.26-test"
 SCRIPT_NAME="VPS Manager"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh"
 
@@ -834,10 +834,8 @@ ensure_ssh_service_persistent() {
   local ssh_service="$1"
   local effective_ports
 
-  if is_alpine; then
-    install -d -o root -g root -m 0755 /run/sshd \
-      || { warn "无法创建 SSH 运行目录 /run/sshd。"; return 1; }
-  fi
+  install -d -o root -g root -m 0755 /run/sshd \
+    || { warn "无法创建 SSH 运行目录 /run/sshd。"; return 1; }
   /usr/sbin/sshd -t \
     || { warn "SSH 配置语法检查失败，未启动服务。"; return 1; }
   if is_alpine; then
@@ -906,9 +904,9 @@ switch_ssh_socket_to_service() {
   SSH_SOCKET_TRANSITIONED=1
   log "Detected ssh.socket with a fixed listener; switching SSH to ssh.service/sshd_config"
 
-  systemctl disable ssh.socket >/dev/null \
+  systemctl stop ssh.socket \
     && systemctl stop "${ssh_service}" \
-    && systemctl stop ssh.socket \
+    && systemctl disable ssh.socket >/dev/null \
     && systemctl daemon-reload \
     && ensure_ssh_service_persistent "${ssh_service}"
 }
@@ -927,6 +925,8 @@ restore_ssh_socket_state() {
   systemctl daemon-reload >/dev/null 2>&1 || true
   if [[ "${SSH_SOCKET_WAS_ACTIVE}" == "1" ]]; then
     systemctl start ssh.socket >/dev/null 2>&1 || return 1
+    SSH_SOCKET_TRANSITIONED=0
+    return 0
   fi
   systemctl start "${ssh_service}" >/dev/null 2>&1
 }

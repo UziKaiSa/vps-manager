@@ -8,6 +8,12 @@ SCRIPT = Path(__file__).resolve().parents[1] / "vps-manager.sh"
 text = SCRIPT.read_text(encoding="utf-8")
 
 
+def function_body(name: str) -> str:
+    start = text.index(f"{name}() {{")
+    end = text.index("\n}\n", start) + 3
+    return text[start:end]
+
+
 def require(fragment: str, message: str) -> None:
     if fragment not in text:
         raise AssertionError(message)
@@ -74,5 +80,19 @@ require(
 
 if text.count('ensure_ssh_service_persistent "${ssh_service}"') < 4:
     raise AssertionError("SSH hardening and public-key paths must both run persistence checks")
+
+ensure_body = function_body("ensure_ssh_service_persistent")
+if ensure_body.index('install -d -o root -g root -m 0755 /run/sshd') > ensure_body.index('/usr/sbin/sshd -t'):
+    raise AssertionError("/run/sshd must exist before the first sshd syntax check")
+
+switch_body = function_body("switch_ssh_socket_to_service")
+if switch_body.index('systemctl stop ssh.socket') > switch_body.index('systemctl stop "${ssh_service}"'):
+    raise AssertionError("ssh.socket must stop before ssh.service to avoid socket reactivation")
+
+restore_body = function_body("restore_ssh_socket_state")
+socket_start = restore_body.index('systemctl start ssh.socket')
+service_start = restore_body.index('systemctl start "${ssh_service}"')
+if "return 0" not in restore_body[socket_start:service_start]:
+    raise AssertionError("socket-mode rollback must not also force-start ssh.service")
 
 print("SSH persistence regression checks passed")
