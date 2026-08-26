@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.9.29-test"
+SCRIPT_VERSION="0.9.30-test"
 SCRIPT_NAME="VPS Manager"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh"
 
@@ -6342,12 +6342,12 @@ configure_firewall_mode() {
     external_guard="1"
     allow_icmp="0"
     allow_ipv6="0"
-    trust_warp="1"
+    trust_warp="0"
     if [[ "${customize_switches}" == "1" ]]; then
       prompt_yes_no "是否启用 Docker/转发前的统一外部入口隔离" "1" && external_guard="1" || external_guard="0"
       prompt_yes_no "是否允许公网 ICMP/ICMPv6 主动入站" "0" && allow_icmp="1" || allow_icmp="0"
       prompt_yes_no "是否允许 IPv6 新入站连接" "0" && allow_ipv6="1" || allow_ipv6="0"
-      prompt_yes_no "是否信任本机 CloudflareWARP 网卡直接入站" "1" && trust_warp="1" || trust_warp="0"
+      prompt_yes_no "是否信任本机 CloudflareWARP 网卡直接入站" "0" && trust_warp="1" || trust_warp="0"
     else
       printf '使用主站安全基线；如需逐项调整，请返回并选择“自定义主站安全开关”。\n'
     fi

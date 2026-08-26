@@ -33,7 +33,8 @@ def test_main_mode_matches_ssh_only_security_group_defaults():
     assert 'external_guard="1"' in TEXT
     assert 'allow_icmp="0"' in TEXT
     assert 'allow_ipv6="0"' in TEXT
-    assert 'trust_warp="1"' in TEXT
+    assert 'trust_warp="0"' in TEXT
+    assert 'prompt_yes_no "是否信任本机 CloudflareWARP 网卡直接入站" "0"' in TEXT
     assert "detect_external_interfaces()" in TEXT
     assert "type filter hook prerouting priority -150; policy accept;" in TEXT
     assert "ct state established,related counter accept" in TEXT
