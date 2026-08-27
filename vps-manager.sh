@@ -1838,7 +1838,7 @@ download_alpine_xray_archive() {
 
 install_or_upgrade_xray() {
   local installer archive stage alpine_arch archive_name checksum_file
-  local available_kib binary_kib existing_binary_kib reserve_kib=4096 data_file data_kib
+  local available_kib reserve_kib=4096 data_file previous_file
 
   require_root
   check_supported_os
@@ -1876,21 +1876,42 @@ install_or_upgrade_xray() {
     getent group xray >/dev/null 2>&1 || addgroup -S xray
     id xray >/dev/null 2>&1 || adduser -S -D -H -h /var/empty -s /sbin/nologin -G xray xray
     install -d -m 755 /usr/local/bin /usr/local/share/xray /usr/local/etc/xray
+    previous_file="${WORK_DIR}/xray.previous"
+    [[ ! -f "${XRAY_BIN}" ]] || cp -p "${XRAY_BIN}" "${previous_file}"
+    if ! install -m 755 "${stage}/xray" "${XRAY_BIN}"; then
+      rm -f -- "${XRAY_BIN}"
+      [[ ! -f "${previous_file}" ]] || install -m 755 "${previous_file}" "${XRAY_BIN}"
+      die "Xray 二进制落盘失败；已恢复安装前状态。"
+    fi
     available_kib="$(df -Pk /usr/local/bin | awk 'NR == 2 {print $4}')"
-    binary_kib="$(du -k "${stage}/xray" | awk '{print $1}')"
-    existing_binary_kib=0
-    [[ ! -f "${XRAY_BIN}" ]] || existing_binary_kib="$(du -k "${XRAY_BIN}" | awk '{print $1}')"
-    (( available_kib + existing_binary_kib >= binary_kib + reserve_kib )) \
-      || die "根文件系统空间不足：安装 Xray 二进制并保留 ${reserve_kib} KiB 余量需要 $((binary_kib + reserve_kib)) KiB，计入现有文件后仅有 $((available_kib + existing_binary_kib)) KiB。"
-    install -m 755 "${stage}/xray" "${XRAY_BIN}"
+    if (( available_kib < reserve_kib )); then
+      rm -f -- "${XRAY_BIN}"
+      [[ ! -f "${previous_file}" ]] || install -m 755 "${previous_file}" "${XRAY_BIN}"
+      die "安装 Xray 后根盘仅余 ${available_kib} KiB，低于 ${reserve_kib} KiB 安全余量；已恢复安装前状态。"
+    fi
     for data_file in geoip.dat geosite.dat; do
       [[ -f "${stage}/${data_file}" ]] || continue
       available_kib="$(df -Pk /usr/local/share/xray | awk 'NR == 2 {print $4}')"
-      data_kib="$(du -k "${stage}/${data_file}" | awk '{print $1}')"
-      if (( available_kib >= data_kib + reserve_kib )); then
-        install -m 644 "${stage}/${data_file}" "/usr/local/share/xray/${data_file}"
-      else
+      if (( available_kib < reserve_kib )); then
         warn "根盘空间有限，已跳过非必需的 ${data_file}（当前配置不引用该文件）。"
+        continue
+      fi
+      previous_file="${WORK_DIR}/${data_file}.previous"
+      [[ ! -f "/usr/local/share/xray/${data_file}" ]] \
+        || cp -p "/usr/local/share/xray/${data_file}" "${previous_file}"
+      if ! install -m 644 "${stage}/${data_file}" "/usr/local/share/xray/${data_file}"; then
+        rm -f -- "/usr/local/share/xray/${data_file}"
+        [[ ! -f "${previous_file}" ]] \
+          || install -m 644 "${previous_file}" "/usr/local/share/xray/${data_file}"
+        warn "${data_file} 落盘失败，已恢复安装前状态；Xray 核心安装不受影响。"
+        continue
+      fi
+      available_kib="$(df -Pk /usr/local/share/xray | awk 'NR == 2 {print $4}')"
+      if (( available_kib < reserve_kib )); then
+        rm -f -- "/usr/local/share/xray/${data_file}"
+        [[ ! -f "${previous_file}" ]] \
+          || install -m 644 "${previous_file}" "/usr/local/share/xray/${data_file}"
+        warn "安装 ${data_file} 后将低于 ${reserve_kib} KiB 安全余量，已恢复安装前状态。"
       fi
     done
     cat > /etc/init.d/xray <<'EOF'

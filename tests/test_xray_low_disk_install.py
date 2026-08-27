@@ -13,6 +13,8 @@ def test_xray_requests_large_tmpfs_work_area():
 
 def test_xray_preserves_root_space_and_treats_geodata_as_optional():
     assert "reserve_kib=4096" in TEXT
-    assert "available_kib + existing_binary_kib >= binary_kib + reserve_kib" in TEXT
+    assert 'previous_file="${WORK_DIR}/xray.previous"' in TEXT
+    assert "Xray 二进制落盘失败；已恢复安装前状态" in TEXT
+    assert "低于 ${reserve_kib} KiB 安全余量；已恢复安装前状态" in TEXT
     assert "for data_file in geoip.dat geosite.dat" in TEXT
-    assert "已跳过非必需的 ${data_file}" in TEXT
+    assert 'previous_file="${WORK_DIR}/${data_file}.previous"' in TEXT
