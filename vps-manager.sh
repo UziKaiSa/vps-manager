@@ -5249,30 +5249,50 @@ install_alpine_warp_guard() {
 #!/bin/sh
 set -eu
 
-LOG_FILE="/var/log/cloudflare-warp/warp-svc.log"
-ARCHIVE_FILE="/var/log/cloudflare-warp/warp-svc.log.1.gz"
 LOCK_DIR="/run/vps-manager-warp-guard.lock"
 MAX_LOG_BYTES=${max_log_bytes}
 TAIL_BYTES=${tail_bytes}
 MAX_RSS_KIB=${max_rss_kib}
 
+memory_max_bytes="\$(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo max)"
+case "\${memory_max_bytes}" in
+  ''|*[!0-9]*) ;;
+  *)
+    memory_max_kib=\$((memory_max_bytes / 1024))
+    if [ "\${memory_max_kib}" -le 163840 ]; then
+      MAX_RSS_KIB=73728
+    elif [ "\${memory_max_kib}" -le 262144 ] && [ "\${MAX_RSS_KIB}" -gt 98304 ]; then
+      MAX_RSS_KIB=98304
+    fi
+    ;;
+esac
+
 mkdir "\${LOCK_DIR}" 2>/dev/null || exit 0
 cleanup() { rm -rf "\${LOCK_DIR}" "\${TAIL_TMP:-}" "\${ARCHIVE_TMP:-}"; }
 trap cleanup EXIT INT TERM
 
-if [ -f "\${LOG_FILE}" ]; then
-  size="\$(wc -c < "\${LOG_FILE}" 2>/dev/null || echo 0)"
+rotate_log() {
+  log_file="\$1"
+  archive_file="\${log_file}.1.gz"
+  [ -f "\${log_file}" ] || return 0
+  size="\$(wc -c < "\${log_file}" 2>/dev/null || echo 0)"
   if [ "\${size}" -gt "\${MAX_LOG_BYTES}" ]; then
     TAIL_TMP="\$(mktemp /run/warp-svc-tail.XXXXXX)"
-    ARCHIVE_TMP="\${ARCHIVE_FILE}.tmp.\$\$"
-    tail -c "\${TAIL_BYTES}" "\${LOG_FILE}" > "\${TAIL_TMP}" 2>/dev/null || cp "\${LOG_FILE}" "\${TAIL_TMP}"
-    : > "\${LOG_FILE}"
+    ARCHIVE_TMP="\${archive_file}.tmp.\$\$"
+    tail -c "\${TAIL_BYTES}" "\${log_file}" > "\${TAIL_TMP}" 2>/dev/null || cp "\${log_file}" "\${TAIL_TMP}"
+    : > "\${log_file}"
     gzip -c "\${TAIL_TMP}" > "\${ARCHIVE_TMP}"
     chmod 600 "\${ARCHIVE_TMP}"
-    mv -f "\${ARCHIVE_TMP}" "\${ARCHIVE_FILE}"
-    logger -t vps-manager-warp-guard "rotated warp-svc.log at \${size} bytes"
+    mv -f "\${ARCHIVE_TMP}" "\${archive_file}"
+    rm -f "\${TAIL_TMP}"
+    TAIL_TMP=''
+    ARCHIVE_TMP=''
+    logger -t vps-manager-warp-guard "rotated \${log_file} at \${size} bytes"
   fi
-fi
+}
+
+rotate_log /var/log/cloudflare-warp/warp-svc.log
+rotate_log /var/lib/cloudflare-warp/cfwarp_service_log.txt
 
 warp_pid=''
 for cmdline in /proc/[0-9]*/cmdline; do
@@ -5285,6 +5305,9 @@ for cmdline in /proc/[0-9]*/cmdline; do
 done
 
 if [ -n "\${warp_pid}" ] && [ -r "/proc/\${warp_pid}/status" ]; then
+  [ ! -w "/proc/\${warp_pid}/oom_score_adj" ] \
+    || printf '%s\n' 800 > "/proc/\${warp_pid}/oom_score_adj" 2>/dev/null \
+    || true
   rss="\$(awk '/^VmRSS:/{print \$2; exit}' "/proc/\${warp_pid}/status")"
   rss="\${rss:-0}"
   if [ "\${rss}" -gt "\${MAX_RSS_KIB}" ]; then
@@ -5295,9 +5318,15 @@ fi
 EOF
   chmod 700 "${WARP_GUARD_PATH}"
   touch /etc/crontabs/root
-  grep -Fqx "*/5 * * * * ${WARP_GUARD_PATH}" /etc/crontabs/root \
-    || printf '*/5 * * * * %s\n' "${WARP_GUARD_PATH}" >> /etc/crontabs/root
-  service_enable_start crond >/dev/null 2>&1 || true
+  grep -Fv "${WARP_GUARD_PATH}" /etc/crontabs/root > "${WORK_DIR}/root.crontab.warp-guard" || true
+  printf '* * * * * %s\n' "${WARP_GUARD_PATH}" >> "${WORK_DIR}/root.crontab.warp-guard"
+  install -m 600 "${WORK_DIR}/root.crontab.warp-guard" /etc/crontabs/root
+  if [[ -x /etc/init.d/dcron ]]; then
+    rc-update add dcron default >/dev/null 2>&1 || true
+    rc-service dcron start >/dev/null 2>&1 || true
+  else
+    service_enable_start crond >/dev/null 2>&1 || true
+  fi
   "${WARP_GUARD_PATH}"
 }
 
