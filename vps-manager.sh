@@ -343,13 +343,31 @@ service_status_text() {
 
 
 ensure_work_dir() {
+  local required_kib="${1:-0}"
+  local tmp_available_kib=0
+  local run_available_kib=0
+  local run_required_kib="${required_kib}"
+  local prefer_run=0
+
   cleanup
+  tmp_available_kib="$(df -Pk /tmp | awk 'NR == 2 {print $4}')"
   if [[ -r "${ALPINE_WARP_ROOT}/PROFILE" ]] \
-    && grep -qx 'ultra-low-disk' "${ALPINE_WARP_ROOT}/PROFILE" \
-    && [[ -d /run && -w /run ]] \
-    && (( $(df -Pk /run | awk 'NR == 2 {print $4}') >= 32 * 1024 )); then
+    && grep -qx 'ultra-low-disk' "${ALPINE_WARP_ROOT}/PROFILE"; then
+    prefer_run=1
+    (( run_required_kib >= 32 * 1024 )) || run_required_kib=$((32 * 1024))
+  elif (( required_kib > 0 && tmp_available_kib < required_kib )); then
+    prefer_run=1
+  fi
+
+  if (( prefer_run == 1 )) && [[ -d /run && -w /run ]]; then
+    run_available_kib="$(df -Pk /run | awk 'NR == 2 {print $4}')"
+  fi
+  if (( prefer_run == 1 && run_available_kib >= run_required_kib )); then
     WORK_DIR="$(mktemp -d /run/vps-manager.XXXXXX)"
   else
+    if (( required_kib > 0 && tmp_available_kib < required_kib )); then
+      die "临时工作区空间不足：/tmp 可用 ${tmp_available_kib} KiB，需要至少 ${required_kib} KiB，/run 也不满足要求。"
+    fi
     WORK_DIR="$(mktemp -d /tmp/vps-manager.XXXXXX)"
   fi
   chmod 700 "${WORK_DIR}"
@@ -1820,6 +1838,7 @@ download_alpine_xray_archive() {
 
 install_or_upgrade_xray() {
   local installer archive stage alpine_arch archive_name checksum_file
+  local available_kib binary_kib existing_binary_kib reserve_kib=4096 data_file data_kib
 
   require_root
   check_supported_os
@@ -1840,7 +1859,9 @@ install_or_upgrade_xray() {
       aarch64) archive_name="Xray-linux-arm64-v8a.zip" ;;
       *) die "Alpine Xray 自动安装仅支持 x86_64 和 aarch64；当前为 ${alpine_arch}." ;;
     esac
-    ensure_work_dir
+    # The archive and extracted files coexist temporarily. Small Alpine root
+    # filesystems commonly cannot hold both, while /run has sufficient tmpfs.
+    ensure_work_dir $((96 * 1024))
     archive="${WORK_DIR}/xray.zip"
     checksum_file="${WORK_DIR}/xray.zip.dgst"
     stage="${WORK_DIR}/xray"
@@ -1855,9 +1876,23 @@ install_or_upgrade_xray() {
     getent group xray >/dev/null 2>&1 || addgroup -S xray
     id xray >/dev/null 2>&1 || adduser -S -D -H -h /var/empty -s /sbin/nologin -G xray xray
     install -d -m 755 /usr/local/bin /usr/local/share/xray /usr/local/etc/xray
+    available_kib="$(df -Pk /usr/local/bin | awk 'NR == 2 {print $4}')"
+    binary_kib="$(du -k "${stage}/xray" | awk '{print $1}')"
+    existing_binary_kib=0
+    [[ ! -f "${XRAY_BIN}" ]] || existing_binary_kib="$(du -k "${XRAY_BIN}" | awk '{print $1}')"
+    (( available_kib + existing_binary_kib >= binary_kib + reserve_kib )) \
+      || die "根文件系统空间不足：安装 Xray 二进制并保留 ${reserve_kib} KiB 余量需要 $((binary_kib + reserve_kib)) KiB，计入现有文件后仅有 $((available_kib + existing_binary_kib)) KiB。"
     install -m 755 "${stage}/xray" "${XRAY_BIN}"
-    [[ ! -f "${stage}/geoip.dat" ]] || install -m 644 "${stage}/geoip.dat" /usr/local/share/xray/geoip.dat
-    [[ ! -f "${stage}/geosite.dat" ]] || install -m 644 "${stage}/geosite.dat" /usr/local/share/xray/geosite.dat
+    for data_file in geoip.dat geosite.dat; do
+      [[ -f "${stage}/${data_file}" ]] || continue
+      available_kib="$(df -Pk /usr/local/share/xray | awk 'NR == 2 {print $4}')"
+      data_kib="$(du -k "${stage}/${data_file}" | awk '{print $1}')"
+      if (( available_kib >= data_kib + reserve_kib )); then
+        install -m 644 "${stage}/${data_file}" "/usr/local/share/xray/${data_file}"
+      else
+        warn "根盘空间有限，已跳过非必需的 ${data_file}（当前配置不引用该文件）。"
+      fi
+    done
     cat > /etc/init.d/xray <<'EOF'
 #!/sbin/openrc-run
 description="Xray Service"
