@@ -2,7 +2,7 @@
 
 `VPS Manager` 是一个面向 Debian/Ubuntu VPS 的中文交互式管理脚本，并为小硬盘 Alpine/OpenRC NAT VPS 提供受限模式，用于完成服务器初始化、Xray 配置，以及 Komari Agent/WARP 私网接入。
 
-当前版本：`0.9.30-test`
+当前版本：`0.9.31-test`
 
 > 目前是测试版。首次在正式服务器上使用前，建议先运行预览模式，并保留一个已经登录的 SSH 终端。
 
@@ -462,7 +462,7 @@ CF_ACCESS_CLIENT_SECRET='你的 Client Secret'
 sudo chmod 600 /root/warp-token.env
 ```
 
-脚本会安装 Cloudflare 官方 WARP 客户端、写入 MDM、连接 WARP、检查 Komari 私网地址，然后询问是否继续安装 Agent。
+脚本会安装 Cloudflare 官方 WARP 客户端、写入 MDM、连接 WARP、检查 Komari 私网地址，然后询问是否继续安装 Agent。若 `/etc/resolv.conf` 被设置为 immutable，脚本会说明 WARP 无法接管 DNS，并在确认后移除该属性且保留备份。WARP 未进入 `Connected`、内网地址不可达，或已有 systemd drop-in 仍覆盖新 Agent Endpoint 时，流程会停止，不再把失败状态当作安装成功；冲突的旧 drop-in 会改名为带时间戳的 `.disabled-*` 文件，便于恢复。
 
 脚本以 `nft list ruleset` 的实际结果判断 nftables 能力，不会因为 LXC 容器内无法执行 `modprobe` 而误判。容器共享宿主机内核：如果 nftables 不可用，脚本会提示联系服务商开放 nftables/NET_ADMIN 和 `/dev/net/tun`，不会在容器内反复安装无效的 `linux-image`。只有非容器系统在加载 `nf_tables` 后仍不可用时，才会询问是否安装新内核，并且不会自动重启服务器。
 

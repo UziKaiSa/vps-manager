@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.9.30-test"
+SCRIPT_VERSION="0.9.31-test"
 SCRIPT_NAME="VPS Manager"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh"
 
@@ -4794,6 +4794,7 @@ komari_install_agent() {
     return 0
   fi
   prompt_yes_no "确认安装或重装 Komari Agent" 0 || return 0
+  komari_disable_conflicting_agent_overrides "${endpoint}" || return 1
   if [[ -n "${local_agent}" ]] && prompt_yes_no "是否优先使用检测到的本地 Agent（跳过 GitHub Release 下载）" 1; then
     komari_install_local_agent "${local_agent}" "${endpoint}" "${token}" "${install_dir}" "${day}" \
       "${disable_ssh}" "${gpu}" "${public_ip}" || return 1
@@ -4833,6 +4834,7 @@ komari_verify_agent_install() {
   log "检查 Komari Agent 状态和上报通道"
   for attempt in 1 2 3; do
     if service_is_active komari-agent \
+      && komari_effective_agent_uses_endpoint "${endpoint}" \
       && curl -fsS --connect-timeout 5 --max-time 12 -o /dev/null "${endpoint}"; then
       return 0
     fi
@@ -4841,6 +4843,35 @@ komari_verify_agent_install() {
   warn "Komari Agent 未通过安装后检查：服务未运行或上报地址不可达。"
   service_status_text komari-agent | sed -n '1,60p' || true
   return 1
+}
+
+
+komari_disable_conflicting_agent_overrides() {
+  local endpoint="$1" override stamp changed=0
+  local -a overrides=(/etc/systemd/system/komari-agent.service.d/*.conf)
+  is_alpine && return 0
+  [[ -e "${overrides[0]}" ]] || return 0
+  stamp="$(date +%Y%m%d%H%M%S)"
+  for override in "${overrides[@]}"; do
+    grep -q '^ExecStart=' "${override}" || continue
+    grep -Fq -- "${endpoint}" "${override}" && continue
+    mv -- "${override}" "${override}.disabled-${stamp}" || return 1
+    warn "已禁用会覆盖新 Endpoint 的旧 Agent drop-in：${override}.disabled-${stamp}"
+    changed=1
+  done
+  [[ "${changed}" == 0 ]] || systemctl daemon-reload
+}
+
+
+komari_effective_agent_uses_endpoint() {
+  local endpoint="$1" effective=""
+  if is_alpine; then
+    [[ -r /etc/init.d/komari-agent ]] || return 1
+    grep -Fq -- "${endpoint}" /etc/init.d/komari-agent
+    return
+  fi
+  effective="$(systemctl show komari-agent --property=ExecStart --value 2>/dev/null || true)"
+  grep -Fq -- "${endpoint}" <<< "${effective}"
 }
 
 
@@ -5500,7 +5531,24 @@ EOF
 }
 
 
+komari_prepare_warp_dns() {
+  local attributes backup=""
+  [[ -e /etc/resolv.conf ]] || return 0
+  command -v lsattr >/dev/null 2>&1 || return 0
+  attributes="$(lsattr /etc/resolv.conf 2>/dev/null | awk '{print $1}' || true)"
+  [[ "${attributes}" == *i* ]] || return 0
+  warn "检测到 /etc/resolv.conf 已设置 immutable；WARP 无法更新 DNS，因此不能建立完整连接。"
+  prompt_yes_no "是否移除 /etc/resolv.conf 的 immutable 属性" 1 || return 1
+  backup="$(backup_file /etc/resolv.conf resolv-conf-before-warp)"
+  chattr -i /etc/resolv.conf \
+    || { warn "无法移除 /etc/resolv.conf 的 immutable 属性。"; return 1; }
+  log "已允许 WARP 管理 DNS；原文件备份：${backup}"
+}
+
+
 komari_connect_warp() {
+  local attempt status=""
+  komari_prepare_warp_dns || return 1
   service_enable_start warp-svc
   warp-cli --accept-tos disconnect >/dev/null 2>&1 || true
   warp-cli --accept-tos registration delete >/dev/null 2>&1 || true
@@ -5511,7 +5559,18 @@ komari_connect_warp() {
     log "当前 WARP 版本会在服务重启时加载 MDM 配置"
   fi
   sleep 3
-  warp-cli --accept-tos connect || true; sleep 8
+  warp-cli --accept-tos connect || return 1
+  for attempt in 1 2 3 4 5; do
+    status="$(warp-cli --accept-tos status 2>&1 || true)"
+    if grep -q "Status update: Connected" <<< "${status}"; then
+      printf '%s\n' "${status}"
+      return 0
+    fi
+    [[ "${attempt}" == 5 ]] || sleep 3
+  done
+  warn "WARP 未进入 Connected 状态，已停止后续 Agent 安装。"
+  printf '%s\n' "${status}"
+  return 1
 }
 
 
@@ -5519,7 +5578,11 @@ komari_verify_warp() {
   local endpoint="$1"
   warp-cli --accept-tos status || true
   log "检查 Komari 私网地址: ${endpoint}"
-  curl -i --connect-timeout 10 --max-time 20 "${endpoint}" | sed -n '1,40p' || warn "私网地址不可达，请检查 WARP、Zero Trust 路由和 Service Token。"
+  if ! curl -fsS --connect-timeout 10 --max-time 20 -o /dev/null "${endpoint}"; then
+    warn "私网地址不可达，请检查 WARP、Zero Trust 路由和 Service Token。"
+    return 1
+  fi
+  log "Komari 私网地址可达"
 }
 
 
@@ -5753,8 +5816,8 @@ install_komari_warp() {
   komari_check_kernel || return 0
   komari_load_cf_token || return 1
   komari_write_mdm "${team}"
-  komari_connect_warp
-  komari_verify_warp "${endpoint}"
+  komari_connect_warp || return 1
+  komari_verify_warp "${endpoint}" || return 1
   [[ "${install_agent}" == 1 ]] && komari_install_agent "${endpoint}" "${skip_recovery}"
 }
 
