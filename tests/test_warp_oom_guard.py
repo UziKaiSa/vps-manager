@@ -8,7 +8,10 @@ TEXT = SCRIPT.read_text(encoding="utf-8")
 def test_alpine_guard_uses_cgroup_aware_low_memory_limits():
     assert 'memory_max_bytes="\\$(cat /sys/fs/cgroup/memory.max' in TEXT
     assert "MAX_RSS_KIB=73728" in TEXT
+    assert "MAX_RSS_KIB=65536" in TEXT
     assert "MAX_RSS_KIB=98304" in TEXT
+    assert "'/proc/swaps'" not in TEXT
+    assert "/proc/swaps 2>/dev/null" in TEXT
     assert 'oom_score_adj' in TEXT
 
 

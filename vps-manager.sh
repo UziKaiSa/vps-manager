@@ -5260,7 +5260,11 @@ case "\${memory_max_bytes}" in
   *)
     memory_max_kib=\$((memory_max_bytes / 1024))
     if [ "\${memory_max_kib}" -le 163840 ]; then
-      MAX_RSS_KIB=73728
+      if awk 'NR > 1 { found=1 } END { exit !found }' /proc/swaps 2>/dev/null; then
+        MAX_RSS_KIB=73728
+      else
+        MAX_RSS_KIB=65536
+      fi
     elif [ "\${memory_max_kib}" -le 262144 ] && [ "\${MAX_RSS_KIB}" -gt 98304 ]; then
       MAX_RSS_KIB=98304
     fi
