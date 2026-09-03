@@ -61,6 +61,13 @@ def test_access_public_install_uses_loopback_proxy_and_full_agent_flow():
     assert 'komari_install_agent "${endpoint}" "${skip_recovery}"' in TEXT
 
 
+def test_access_proxy_selects_ipv6_resolvers_without_ipv4_default_route():
+    assert 'ip -4 route show default' in TEXT
+    assert 'resolver="1.1.1.1 8.8.8.8 ipv6=off"' in TEXT
+    assert 'resolver="[2606:4700:4700::1111] [2606:4700:4700::1001] ipv6=on"' in TEXT
+    assert 'resolver ${resolver} valid=300s;' in TEXT
+
+
 def test_access_fallback_removes_private_warp_runtime_first():
     cleanup = TEXT.index("komari_remove_private_warp || return 1")
     nginx = TEXT.index("komari_install_access_nginx || return 1", cleanup)

@@ -5758,7 +5758,12 @@ EOF
 
 
 komari_write_access_proxy() {
-  local hostname="$1" client_id="$2" client_secret="$3" candidate backup=""
+  local hostname="$1" client_id="$2" client_secret="$3" candidate backup="" resolver
+  if ip -4 route show default 2>/dev/null | grep -q .; then
+    resolver="1.1.1.1 8.8.8.8 ipv6=off"
+  else
+    resolver="[2606:4700:4700::1111] [2606:4700:4700::1001] ipv6=on"
+  fi
   ensure_work_dir
   candidate="${WORK_DIR}/komari-access-nginx.conf"
   cat > "${candidate}" <<EOF
@@ -5770,7 +5775,7 @@ events { worker_connections 128; }
 
 http {
     access_log off;
-    resolver 1.1.1.1 8.8.8.8 ipv6=off valid=300s;
+    resolver ${resolver} valid=300s;
     map \$http_upgrade \$connection_upgrade {
         default upgrade;
         '' close;
