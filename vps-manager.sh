@@ -1318,11 +1318,14 @@ configure_ssh_high_port() {
       if [[ -e "${SSHD_MANAGED_CONFIG}" ]]; then
         config_existed=1
         cp -a -- "${SSHD_MANAGED_CONFIG}" "${config_before}"
-        awk 'tolower($1) != "port"' "${SSHD_MANAGED_CONFIG}" > "${WORK_DIR}/sshd-port.conf"
-      else
-        : > "${WORK_DIR}/sshd-port.conf"
       fi
-      sed -i "1iPort ${ssh_port}" "${WORK_DIR}/sshd-port.conf"
+      # sed's line insertion does not run on an empty file (first-time setup).
+      {
+        printf 'Port %s\n' "${ssh_port}"
+        if [[ -e "${SSHD_MANAGED_CONFIG}" ]]; then
+          awk 'tolower($1) != "port"' "${SSHD_MANAGED_CONFIG}"
+        fi
+      } > "${WORK_DIR}/sshd-port.conf"
       if ! port_config_backup_dir="$(backup_and_disable_ssh_ports)"; then
         rollback_managed_firewall_ssh_transition || true
         die "无法安全替换现有 SSH Port 配置，已恢复防火墙。"

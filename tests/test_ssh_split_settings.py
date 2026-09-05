@@ -24,7 +24,7 @@ assert "configure_ssh_high_port || true" in text
 assert "disable_ssh_password_login || true" in text
 assert "PasswordAuthentication no" not in port_body
 assert "AuthenticationMethods publickey" not in port_body
-assert 'sed -i "1iPort ${ssh_port}"' in port_body
+assert "printf 'Port %s\\n'" in port_body
 assert "认证方式始终未修改" in port_body
 assert 'SSH_SOCKET_TRANSITIONED=0' in port_body
 assert "PasswordAuthentication no" in auth_body
