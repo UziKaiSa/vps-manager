@@ -5,6 +5,16 @@ SCRIPT = Path(__file__).resolve().parents[1] / "vps-manager.sh"
 TEXT = SCRIPT.read_text(encoding="utf-8")
 
 
+def test_trixie_uses_dedicated_pinned_package():
+    # Both the dispatcher and installer must accept Debian 13.
+    for name in ("komari_install_warp_client", "komari_install_warp_legacy"):
+        body = TEXT.split(name + "() {", 1)[1].split("\n}\n", 1)[0]
+        assert "^(bullseye|bookworm|trixie)$" in body
+    assert 'trixie)\n      package_url="${KOMARI_WARP_LEGACY_TRIXIE_URL}"\n      package_sha256="${KOMARI_WARP_LEGACY_TRIXIE_SHA256}"' in TEXT
+    assert 'https://downloads.cloudflareclient.com/v1/download/trixie-intel/version/2026.1.150.0' in TEXT
+    assert '233e5ff40bfae457477ed9ddfb7c647f89bb61ad8164c7302cdf7bc393502dfc' in TEXT
+
+
 def test_warp_dns_immutable_file_is_handled_explicitly():
     assert "komari_prepare_warp_dns" in TEXT
     assert "lsattr /etc/resolv.conf" in TEXT
