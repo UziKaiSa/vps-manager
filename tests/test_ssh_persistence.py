@@ -96,6 +96,8 @@ if ensure_body.index('ensure_ssh_runtime_directory') > ensure_body.index('/usr/s
     raise AssertionError("/run/sshd must exist before the first sshd syntax check")
 
 socket_body = function_body("configure_ssh_socket_port")
+if "ListenStream=\nBindIPv6Only=ipv6-only\nListenStream=0.0.0.0:${ssh_port}\nListenStream=[::]:${ssh_port}" not in socket_body:
+    raise AssertionError("separate IPv4/IPv6 listeners must override bindv6only=0 to avoid EADDRINUSE")
 if socket_body.index('systemctl stop ssh.socket') > socket_body.index('systemctl stop "${ssh_service}"'):
     raise AssertionError("ssh.socket must stop before ssh.service to avoid socket reactivation")
 if 'systemctl disable ssh.socket' in socket_body:

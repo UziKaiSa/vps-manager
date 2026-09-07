@@ -935,6 +935,7 @@ configure_ssh_socket_port() {
   cat > "${candidate}" <<EOF
 [Socket]
 ListenStream=
+BindIPv6Only=ipv6-only
 ListenStream=0.0.0.0:${ssh_port}
 ListenStream=[::]:${ssh_port}
 EOF
