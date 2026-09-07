@@ -7,7 +7,7 @@ SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/v
 
 XRAY_BIN="/usr/local/bin/xray"
 XRAY_CONFIG="/usr/local/etc/xray/config.json"
-XRAY_INSTALL_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
+XRAY_INSTALL_URL="https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh"
 XRAY_FALLBACK_VERSION="26.7.28"
 XRAY_FALLBACK_AMD64_SHA256="8195d909f1109b8f3d99eefe401a3c451d7bf4af71f24d3815420f77e5dd2a40"
 XRAY_FALLBACK_BASE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/assets"
@@ -1839,6 +1839,30 @@ download_alpine_xray_archive() {
 }
 
 
+
+xray_local_archive_help() {
+  warn "GitHub Release 不可达时，可在有网络的电脑下载官方安装包和同名 .dgst 文件。"
+  printf '架构：%s\n官方下载：https://github.com/XTLS/Xray-core/releases/latest\n' "$(uname -m)"
+  printf '上传至 /root/%s 和 /root/%s.dgst 后重新选择安装。\n' "$1" "$1"
+  printf '也可使用 XRAY_LOCAL_ARCHIVE=/绝对路径/安装包.zip 指定文件；必须提供同路径 .dgst。\n'
+}
+
+validate_xray_local_archive() {
+  local archive="$1" stage="$2" expected
+  [[ -f "${archive}" && -f "${archive}.dgst" ]] || {
+    warn "本地 Xray 安装包或 .dgst 校验文件不存在。"; return 1;
+  }
+  expected="$(awk -F'= ' '/^SHA2-256= / {gsub(/\r/, "", $2); print $2; exit}' "${archive}.dgst")"
+  [[ "${expected}" =~ ^[0-9a-fA-F]{64}$ ]] || { warn "无效的 SHA-256 校验文件。"; return 1; }
+  printf '%s  %s\n' "${expected}" "${archive}" | sha256sum -c - || return 1
+  unzip -tq "${archive}" >/dev/null || return 1
+  mkdir -p "${stage}"
+  # Extract only the binary for a native architecture check before installing.
+  unzip -p "${archive}" xray > "${stage}/xray" || return 1
+  chmod 700 "${stage}/xray"
+  "${stage}/xray" version || { warn "安装包架构不匹配或 Xray 无法运行。"; return 1; }
+}
+
 install_or_upgrade_xray() {
   local installer archive stage alpine_arch archive_name checksum_file
   local available_kib reserve_kib=4096 data_file previous_file
@@ -1945,8 +1969,22 @@ EOF
   chmod 700 "${installer}"
   bash -n "${installer}"
 
+  case "$(uname -m)" in
+    x86_64) archive_name="Xray-linux-64.zip" ;;
+    aarch64|arm64) archive_name="Xray-linux-arm64-v8a.zip" ;;
+    *) archive_name="Xray-linux-$(uname -m).zip" ;;
+  esac
+  archive="${XRAY_LOCAL_ARCHIVE:-/root/${archive_name}}"
   log "使用 XTLS 官方安装器安装或升级 Xray"
-  bash "${installer}" install
+  if [[ -n "${XRAY_LOCAL_ARCHIVE:-}" || -f "${archive}" ]]; then
+    validate_xray_local_archive "${archive}" "${WORK_DIR}/local-xray-check" \
+      || { warn "本地安装包验证失败，未执行安装。"; return 1; }
+    # The official local installer asks for Enter; validation above is mandatory.
+    bash "${installer}" install --local "${archive}" <<< '' || return 1
+  elif ! bash "${installer}" install; then
+    xray_local_archive_help "${archive_name}"
+    return 1
+  fi
 
   [[ -x "${XRAY_BIN}" ]] || die "Xray 安装完成后未找到 ${XRAY_BIN}。"
   "${XRAY_BIN}" version | head -n 3
