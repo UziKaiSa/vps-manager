@@ -4921,7 +4921,7 @@ komari_install_agent() {
   fi
   service_status_text komari-agent | sed -n '1,60p' || true
   if komari_verify_agent_install "${endpoint}"; then
-    log "Komari Agent 服务和上报通道检查通过"
+    log "Komari Agent 服务、运行参数及上报地址 HTTP 检查通过"
     return 0
   fi
   [[ "${skip_recovery}" == 1 ]] && return 1
@@ -4930,18 +4930,22 @@ komari_install_agent() {
 
 
 komari_verify_agent_install() {
-  local endpoint="$1" attempt
-  log "检查 Komari Agent 状态和上报通道"
-  for attempt in 1 2 3; do
-    if service_is_active komari-agent \
-      && komari_effective_agent_uses_endpoint "${endpoint}" \
-      && curl -fsS --connect-timeout 5 --max-time 12 -o /dev/null "${endpoint}"; then
+  local endpoint="$1" attempt reason=""
+  log "检查 Komari Agent 状态和上报地址可达性（最多重试 10 次）"
+  for attempt in {1..10}; do
+    if ! service_is_active komari-agent; then
+      reason="Agent 服务尚未运行"
+    elif ! komari_effective_agent_uses_endpoint "${endpoint}"; then
+      reason="运行中的 Agent 上报地址与本次配置不一致，或进程尚未就绪"
+    elif ! curl -fsS --connect-timeout 5 --max-time 6 -o /dev/null "${endpoint}"; then
+      reason="上报地址 HTTP 检查未通过"
+    else
       return 0
     fi
-    [[ "${attempt}" == 3 ]] || sleep 3
+    [[ "${attempt}" == 10 ]] || sleep 3
   done
-  warn "Komari Agent 未通过安装后检查：服务未运行或上报地址不可达。"
-  service_status_text komari-agent | sed -n '1,60p' || true
+  warn "Komari Agent 安装后检查未通过：${reason}。"
+  warn "此检查不等同于实际 WebSocket 上报状态；请结合后台在线状态判断，无需立即重装。"
   return 1
 }
 
@@ -4964,14 +4968,34 @@ komari_disable_conflicting_agent_overrides() {
 
 
 komari_effective_agent_uses_endpoint() {
-  local endpoint="$1" effective=""
+  local endpoint="$1" pid=""
   if is_alpine; then
     [[ -r /etc/init.d/komari-agent ]] || return 1
     grep -Fq -- "${endpoint}" /etc/init.d/komari-agent
     return
   fi
-  effective="$(systemctl show komari-agent --property=ExecStart --value 2>/dev/null || true)"
-  grep -Fq -- "${endpoint}" <<< "${effective}"
+  # ExecStart may contain only run-agent.sh; inspect the actual running argv.
+  pid="$(systemctl show komari-agent --property=MainPID --value 2>/dev/null || true)"
+  [[ "${pid}" =~ ^[1-9][0-9]*$ ]] || return 1
+  python3 - "${pid}" "${endpoint}" <<'PY_AGENT_ENDPOINT'
+import sys
+from pathlib import Path
+
+try:
+    args = Path(f"/proc/{int(sys.argv[1])}/cmdline").read_bytes().split(b"\0")
+    args = [arg.decode("utf-8", "surrogateescape") for arg in args if arg]
+except (OSError, ValueError):
+    raise SystemExit(1)
+
+endpoints = []
+for index, arg in enumerate(args[1:], 1):
+    if arg in ("-e", "--endpoint") and index + 1 < len(args):
+        endpoints.append(args[index + 1])
+    elif arg.startswith("--endpoint=") or arg.startswith("-e="):
+        endpoints.append(arg.split("=", 1)[1])
+# Compare the effective (last) flag exactly; never print argv containing tokens.
+raise SystemExit(0 if endpoints and endpoints[-1] == sys.argv[2] else 1)
+PY_AGENT_ENDPOINT
 }
 
 
