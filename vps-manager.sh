@@ -987,7 +987,8 @@ ensure_ssh_service_persistent() {
       || { warn "无法设置 ${ssh_service} 开机启动。"; return 1; }
     rc-service "${ssh_service}" start >/dev/null \
       || { warn "无法启动 ${ssh_service}。"; return 1; }
-    rc-update show default 2>/dev/null | awk '{print $1}' | grep -Fxq "${ssh_service}" \
+    # Consume all output: grep -q can cause upstream SIGPIPE under pipefail.
+    rc-update show default 2>/dev/null | awk '{print $1}' | grep -Fx "${ssh_service}" >/dev/null \
       || { warn "${ssh_service} 未保持开机启用状态。"; return 1; }
     rc-service "${ssh_service}" status >/dev/null 2>&1 \
       || { warn "${ssh_service} 当前未运行。"; return 1; }
