@@ -2523,6 +2523,9 @@ if pending_model:
     public_address = str(pending_model["publicAddress"])
     reality = pending_model["reality"]
     reality_port = int(reality["port"])
+    public_ports = pending_model.get("publicPorts", {})
+    reality_public_port = int(public_ports.get("reality", reality_port))
+    direct_domain_strategy = str(pending_model.get("directDomainStrategy", "UseIPv4"))
     reality_dest = str(reality["dest"])
     server_names = list(
         dict.fromkeys(
@@ -2541,6 +2544,9 @@ else:
     node_name = env("CFG_NODE_NAME")
     public_address = env("CFG_PUBLIC_ADDRESS")
     reality_port = int(env("CFG_REALITY_PORT"))
+    public_ports = {}
+    reality_public_port = reality_port
+    direct_domain_strategy = "UseIPv4"
     reality_dest = env("CFG_REALITY_DEST")
     server_names = list(
         dict.fromkeys(
@@ -2611,7 +2617,7 @@ outbounds = [
     {
         "protocol": "freedom",
         "tag": "direct",
-        "settings": {"domainStrategy": "UseIPv4"},
+        "settings": {"domainStrategy": direct_domain_strategy},
     }
 ]
 
@@ -2858,7 +2864,7 @@ for client in display_clients:
             f"- name: {yaml_scalar(label)}",
             "  type: vless",
             f"  server: {yaml_scalar(public_address)}",
-            f"  port: {reality_port}",
+            f"  port: {reality_public_port}",
             f"  uuid: {yaml_scalar(client['uuid'])}",
             "  udp: false",
             "  tls: true",
@@ -2872,12 +2878,20 @@ for client in display_clients:
         ]
     )
 
+state_public_ports = {"reality": reality_public_port}
+if "shadowsocks" in optional_inbounds:
+    state_public_ports["shadowsocks"] = int(
+        public_ports.get("shadowsocks", optional_inbounds["shadowsocks"]["port"])
+    )
+
 state = {
     "version": 3,
     "managedBy": "vps-manager",
     "configSha256": hashlib.sha256(config_text.encode()).hexdigest(),
     "nodeName": node_name,
     "publicAddress": public_address,
+    "publicPorts": state_public_ports,
+    "directDomainStrategy": direct_domain_strategy,
     "reality": {
         "port": reality_port,
         "dest": reality_dest,
@@ -2912,7 +2926,7 @@ state_path.write_text(
 
 lines = [
     f"节点名称: {node_name}",
-    f"自动检测地址: {public_address}:{reality_port}",
+    f"自动检测地址: {public_address}:{reality_public_port}",
     f"Reality dest: {reality_dest}",
     f"Reality serverNames: {', '.join(server_names)}",
     f"Reality 防偷: {'开启' if guard_enabled else '关闭'}"
@@ -2972,11 +2986,13 @@ if "socks5" in optional_inbounds:
 
 if "shadowsocks" in optional_inbounds:
     item = optional_inbounds["shadowsocks"]
+    ss_public_port = state_public_ports["shadowsocks"]
     lines.extend(
         [
             "",
             "Shadowsocks 入站:",
             f"  监听: {item['listen']}:{item['port']}",
+            f"  公网端口: {ss_public_port}",
             f"  加密: {item['method']}",
             f"  密码: {item['password']}",
         ]
@@ -2986,7 +3002,7 @@ if "shadowsocks" in optional_inbounds:
             f"- name: {yaml_scalar(f'{node_name}-ss')}",
             "  type: ss",
             f"  server: {yaml_scalar(public_address)}",
-            f"  port: {item['port']}",
+            f"  port: {ss_public_port}",
             f"  cipher: {yaml_scalar(item['method'])}",
             f"  password: {yaml_scalar(item['password'])}",
             "  udp: true",
@@ -3292,7 +3308,9 @@ managed_special={"direct","reality-guard-block"} if guard_enabled else {"direct"
 proxy_tags=sorted(set(by_tag)-managed_special) if adopt_live else [str(x.get("tag","")) for x in state_proxies]
 if not all(proxy_tags) or len(set(proxy_tags))!=len(proxy_tags): stop("state.json 的 ISP tag 无效")
 if set(by_tag)!={*managed_special,*proxy_tags}: stop("发现 state.json 未登记出口，或受管出口缺失")
-if by_tag["direct"]!={"protocol":"freedom","tag":"direct","settings":{"domainStrategy":"UseIPv4"}}: stop("direct 出口不是脚本管理结构")
+direct_settings=by_tag["direct"].get("settings",{})
+if by_tag["direct"]!={"protocol":"freedom","tag":"direct","settings":direct_settings} or not isinstance(direct_settings,dict) or set(direct_settings)!={"domainStrategy"} or direct_settings.get("domainStrategy") not in {"UseIPv4","UseIPv6"}: stop("direct 出口不是脚本管理结构")
+direct_domain_strategy=direct_settings["domainStrategy"]
 if guard_enabled and by_tag["reality-guard-block"]!={"protocol":"blackhole","tag":"reality-guard-block"}: stop("Reality 防偷 block 出口不是脚本管理结构")
 runtime=settings.get("clients")
 if not isinstance(runtime,list): stop("VLESS clients 格式错误")
@@ -3427,7 +3445,12 @@ if not adopt_live:
     if version==3 and sr.get("privateKey")!=live_reality["privateKey"]: stop("Reality privateKey 在 v3 state 与 live config 间不一致")
 names=[str(x.get("name","")) for x in model_proxies]
 if not all(names) or len(set(names))!=len(names): stop("ISP 名称为空或重复")
-model={"version":3,"managedBy":"vps-manager","nodeName":str(state.get("nodeName","")),"publicAddress":str(state.get("publicAddress","")),"reality":live_reality,"native":{"name":str(native_meta.get("name","native")),"uuid":str(native_live["id"]),"email":native_email,"outbound":"direct"},"proxies":model_proxies,"optionalInbounds":optional}
+stored_public_ports=state.get("publicPorts",{})
+if not isinstance(stored_public_ports,dict): stop("state.publicPorts 不是对象")
+public_ports={"reality":int(stored_public_ports.get("reality",live_reality["port"]))}
+if "shadowsocks" in optional:
+    public_ports["shadowsocks"]=int(stored_public_ports.get("shadowsocks",optional["shadowsocks"]["port"]))
+model={"version":3,"managedBy":"vps-manager","nodeName":str(state.get("nodeName","")),"publicAddress":str(state.get("publicAddress","")),"publicPorts":public_ports,"directDomainStrategy":direct_domain_strategy,"reality":live_reality,"native":{"name":str(native_meta.get("name","native")),"uuid":str(native_live["id"]),"email":native_email,"outbound":"direct"},"proxies":model_proxies,"optionalInbounds":optional}
 if not model["nodeName"] or not model["publicAddress"]: stop("state.json 缺少节点名称或客户端连接地址")
 destination.write_text(json.dumps(model,ensure_ascii=False,indent=2)+"\n"); os.chmod(destination,0o600)
 PY
@@ -3459,11 +3482,16 @@ def unique_name(name,skip=None):
     if any(i!=skip and x["name"]==name for i,x in enumerate(model["proxies"])): raise SystemExit("ISP 名称不能重复")
 if action=="set":
     field,value=args
-    allowed={"nodeName","publicAddress","reality.port","reality.dest","reality.serverNames","reality.privateKey","reality.publicKey","reality.shortId"}
+    allowed={"nodeName","publicAddress","publicPorts.reality","publicPorts.shadowsocks","directDomainStrategy","reality.port","reality.dest","reality.serverNames","reality.privateKey","reality.publicKey","reality.shortId"}
     if field not in allowed: raise SystemExit("不允许更新该字段")
     if field=="nodeName": model["nodeName"]=value
     elif field=="publicAddress": model["publicAddress"]=value
-    elif field=="reality.port": model["reality"]["port"]=int(value)
+    elif field.startswith("publicPorts."): model.setdefault("publicPorts",{})[field.split(".",1)[1]]=int(value)
+    elif field=="directDomainStrategy": model[field]=value
+    elif field=="reality.port":
+        ports=model.setdefault("publicPorts",{})
+        if ports.get("reality",model["reality"]["port"])==model["reality"]["port"]: ports["reality"]=int(value)
+        model["reality"]["port"]=int(value)
     elif field=="reality.serverNames":
         values=list(dict.fromkeys(x.strip() for x in value.split(",") if x.strip()))
         if not values: raise SystemExit("serverNames 不能为空")
@@ -3493,8 +3521,13 @@ elif action=="inbound-enable":
 elif action=="inbound-set":
     kind,field,value=args
     if kind not in model["optionalInbounds"]: raise SystemExit("该入站尚未开启")
+    if kind=="shadowsocks" and field=="port":
+        ports=model.setdefault("publicPorts",{})
+        if ports.get(kind,model["optionalInbounds"][kind]["port"])==model["optionalInbounds"][kind]["port"]: ports[kind]=int(value)
     model["optionalInbounds"][kind][field]=int(value) if field=="port" else value
-elif action=="inbound-disable": model["optionalInbounds"].pop(args[0],None)
+elif action=="inbound-disable":
+    model["optionalInbounds"].pop(args[0],None)
+    model.get("publicPorts",{}).pop(args[0],None)
 elif action=="rotate-uuid":
     if args[0]=="native": model["native"]["uuid"]=str(uuid.uuid4())
     else: model["proxies"][int(args[0])]["uuid"]=str(uuid.uuid4())
@@ -3531,6 +3564,14 @@ if not re.fullmatch(r"[0-9a-fA-F]+",r["shortId"]) or len(r["shortId"])%2: raise 
 try: ports=[int(r.get("port"))]
 except Exception: raise SystemExit("Reality 端口无效")
 if not 1<=ports[0]<=65535: raise SystemExit("Reality 端口超出范围")
+public_ports=model.get("publicPorts",{})
+if not isinstance(public_ports,dict): raise SystemExit("publicPorts 必须是对象")
+for kind,value in public_ports.items():
+    if kind not in {"reality","shadowsocks"}: raise SystemExit("存在未知公网端口类型")
+    try: public_port=int(value)
+    except Exception: raise SystemExit(f"{kind} 公网端口无效")
+    if not 1<=public_port<=65535: raise SystemExit(f"{kind} 公网端口超出范围")
+if model.get("directDomainStrategy","UseIPv4") not in {"UseIPv4","UseIPv6"}: raise SystemExit("directDomainStrategy 无效")
 guard=r.get("guard",{"enabled":True,"port":39000})
 if not isinstance(guard,dict) or not isinstance(guard.get("enabled"),bool): raise SystemExit("Reality 防偷状态无效")
 try: guard_port=int(guard.get("port",39000))
@@ -3564,14 +3605,14 @@ PY
 show_pending_xray_summary() {
   python3 - "${XRAY_PENDING_MODEL}" <<'PY'
 import json,sys
-m=json.load(open(sys.argv[1])); r=m["reality"]; o=m["optionalInbounds"]
+m=json.load(open(sys.argv[1])); r=m["reality"]; o=m["optionalInbounds"]; p=m.get("publicPorts",{})
 print(f"节点：{m['nodeName']}  客户端地址：{m['publicAddress']}")
-print(f"Reality：{r['port']} -> {r['dest']}  serverNames={','.join(r['serverNames'])}")
+print(f"Reality：内部 {r['port']} / 公网 {p.get('reality',r['port'])} -> {r['dest']}  serverNames={','.join(r['serverNames'])}")
 g=r.get('guard',{'enabled':True,'port':39000})
 print("Reality 防偷："+(f"开启（127.0.0.1:{g['port']}，full: 精确匹配）" if g.get('enabled') else "关闭"))
 print(f"ISP 出口：{len(m['proxies'])} 个")
 print("SOCKS5 入站："+(f"{o['socks5']['listen']}:{o['socks5']['port']}" if "socks5" in o else "关闭"))
-print("Shadowsocks 入站："+(f"{o['shadowsocks']['listen']}:{o['shadowsocks']['port']}" if "shadowsocks" in o else "关闭"))
+print("Shadowsocks 入站："+(f"{o['shadowsocks']['listen']}:{o['shadowsocks']['port']} / 公网 {p.get('shadowsocks',o['shadowsocks']['port'])}" if "shadowsocks" in o else "关闭"))
 PY
 }
 
@@ -3589,11 +3630,12 @@ PY
 update_node_info_menu() {
   local choice current value
   while true; do
-    printf '\n节点与客户端 YAML 信息：\n  1) 节点名称：%s\n  2) 客户端连接地址：%s\n  0) 返回\n' "$(pending_model_query nodeName)" "$(pending_model_query publicAddress)"
+    printf '\n节点与客户端 YAML 信息：\n  1) 节点名称：%s\n  2) 客户端连接地址：%s\n  3) 直连出口策略：%s\n  0) 返回\n' "$(pending_model_query nodeName)" "$(pending_model_query publicAddress)" "$(pending_model_query directDomainStrategy 2>/dev/null || printf UseIPv4)"
     read -r -p "请选择 [0]: " choice
     case "${choice:-0}" in
       1) current="$(pending_model_query nodeName)"; value="$(prompt_default "新节点名称" "${current}")"; [[ "${value}" == "${current}" ]] || pending_model_mutate set nodeName "${value}" ;;
       2) current="$(pending_model_query publicAddress)"; value="$(prompt_default "新公网 IP 或域名（仅用于客户端 YAML）" "${current}")"; [[ "${value}" == "${current}" ]] || pending_model_mutate set publicAddress "${value}" ;;
+      3) current="$(pending_model_query directDomainStrategy 2>/dev/null || printf UseIPv4)"; [[ "${current}" == "UseIPv6" ]] && value="UseIPv4" || value="UseIPv6"; pending_model_mutate set directDomainStrategy "${value}" ;;
       0) return 0;; *) warn "未知选项。";;
     esac
   done
@@ -3604,7 +3646,7 @@ update_reality_menu() {
   while true; do
     current="$(pending_model_query reality.guard.enabled 2>/dev/null || printf 1)"
     [[ "${current}" == 1 ]] && guard_label="开启" || guard_label="关闭"
-    printf '\nReality 更新：\n  1) 端口：%s\n  2) target：%s\n  3) serverNames\n  4) 轮换密钥对\n  5) 轮换 Short ID\n  6) 切换 Reality 防偷（当前：%s）\n  0) 返回\n' "$(pending_model_query reality.port)" "$(pending_model_query reality.dest)" "${guard_label}"
+    printf '\nReality 更新：\n  1) 内部监听端口：%s\n  2) target：%s\n  3) serverNames\n  4) 轮换密钥对\n  5) 轮换 Short ID\n  6) 切换 Reality 防偷（当前：%s）\n  7) 公网映射端口：%s\n  0) 返回\n' "$(pending_model_query reality.port)" "$(pending_model_query reality.dest)" "${guard_label}" "$(pending_model_query publicPorts.reality 2>/dev/null || pending_model_query reality.port)"
     read -r -p "请选择 [0]: " choice
     case "${choice:-0}" in
       1) current="$(pending_model_query reality.port)"; while true; do value="$(prompt_default "新 Reality 端口" "${current}")"; validate_port "${value}" && break; warn "端口必须在 1-65535 之间。"; done; [[ "${value}" == "${current}" ]] || pending_model_mutate set reality.port "${value}";;
@@ -3617,6 +3659,7 @@ PY
       4) prompt_yes_no "轮换密钥会要求所有客户端更新，确认继续" "0" || continue; [[ "${DEMO_MODE}" == 1 ]] && { warn "预览模式不生成真实 Reality 密钥。"; continue; }; key_pair="$(generate_reality_keys)"; private_key="${key_pair%%$'\t'*}"; public_key="${key_pair#*$'\t'}"; pending_model_mutate reality-key "${private_key}" "${public_key}";;
       5) prompt_yes_no "轮换 Short ID 会要求所有客户端更新，确认继续" "0" || continue; pending_model_mutate short-id "$(openssl rand -hex 8)";;
       6) current="$(pending_model_query reality.guard.enabled 2>/dev/null || printf 1)"; [[ "${current}" == 1 ]] && pending_model_mutate reality-guard 0 || pending_model_mutate reality-guard 1;;
+      7) current="$(pending_model_query publicPorts.reality 2>/dev/null || pending_model_query reality.port)"; while true; do value="$(prompt_default "新 Reality 公网映射端口" "${current}")"; validate_port "${value}" && break; warn "端口必须在 1-65535 之间。"; done; [[ "${value}" == "${current}" ]] || pending_model_mutate set publicPorts.reality "${value}";;
       0) return 0;; *) warn "未知选项。";;
     esac
   done
@@ -3673,13 +3716,15 @@ manage_ss_inbound_menu() {
       printf '\nShadowsocks 入站当前关闭。\n  1) 开启\n  0) 返回\n'; read -r -p "请选择 [0]: " choice
       case "${choice:-0}" in 1) listen="$(prompt_default "监听地址" 0.0.0.0)"; socks_port="$(pending_model_query optionalInbounds.socks5.port 2>/dev/null || true)"; default_port="$(random_available_port 20000 60000 "$(pending_model_query reality.port)" "${socks_port}")"; while true; do port="$(prompt_default "端口" "${default_port}")"; validate_port "${port}" && ! port_is_listening "${port}" && break; warn "端口无效或已被占用。"; done; method="$(prompt_default "加密方式" 2022-blake3-aes-128-gcm)"; password="$(prompt_secret "密码/PSK（留空自动生成）")"; [[ -n "${password}" ]] || password="$(shadowsocks_password_for_method "${method}")"; pending_model_mutate inbound-enable shadowsocks "${listen}" "${port}" "${method}" "${password}";; 0) return 0;; esac; continue
     fi
-    printf '\nShadowsocks 入站：\n  1) 监听地址\n  2) 端口\n  3) 加密方式\n  4) 替换密码\n  5) 关闭\n  0) 返回\n'; read -r -p "请选择 [0]: " choice
+    printf '\nShadowsocks 入站：\n  1) 监听地址\n  2) 内部监听端口\n  3) 加密方式\n  4) 替换密码\n  5) 关闭\n  6) 公网映射端口（当前：%s）\n  0) 返回\n' "$(pending_model_query publicPorts.shadowsocks 2>/dev/null || pending_model_query optionalInbounds.shadowsocks.port)"; read -r -p "请选择 [0]: " choice
     case "${choice:-0}" in
       1) current="$(pending_model_query optionalInbounds.shadowsocks.listen)"; value="$(prompt_default "监听地址" "${current}")"; [[ "${value}" == "${current}" ]] || pending_model_mutate inbound-set shadowsocks listen "${value}";;
       2) current="$(pending_model_query optionalInbounds.shadowsocks.port)"; while true; do value="$(prompt_default "端口" "${current}")"; validate_port "${value}" && break; warn "端口无效。"; done; [[ "${value}" == "${current}" ]] || pending_model_mutate inbound-set shadowsocks port "${value}";;
       3) current="$(pending_model_query optionalInbounds.shadowsocks.method)"; value="$(prompt_default "加密方式" "${current}")"; if [[ "${value}" != "${current}" ]]; then password="$(prompt_secret "新密码/PSK（留空按新加密方式自动生成）")"; [[ -n "${password}" ]] || password="$(shadowsocks_password_for_method "${value}")"; pending_model_mutate inbound-set shadowsocks method "${value}"; pending_model_mutate inbound-set shadowsocks password "${password}"; fi;;
       4) value="$(prompt_secret "新密码（留空保持原样）")"; [[ -z "${value}" ]] || pending_model_mutate inbound-set shadowsocks password "${value}";;
-      5) prompt_yes_no "确认关闭 Shadowsocks 入站" 0 && pending_model_mutate inbound-disable shadowsocks;; 0) return 0;; *) warn "未知选项。";;
+      6) current="$(pending_model_query publicPorts.shadowsocks 2>/dev/null || pending_model_query optionalInbounds.shadowsocks.port)"; while true; do value="$(prompt_default "新 Shadowsocks 公网映射端口" "${current}")"; validate_port "${value}" && break; warn "端口无效。"; done; [[ "${value}" == "${current}" ]] || pending_model_mutate set publicPorts.shadowsocks "${value}";;
+      5) prompt_yes_no "确认关闭 Shadowsocks 入站" 0 && pending_model_mutate inbound-disable shadowsocks;;
+      0) return 0;; *) warn "未知选项。";;
     esac
   done
 }

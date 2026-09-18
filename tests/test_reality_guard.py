@@ -8,6 +8,7 @@ import re
 import subprocess
 import tempfile
 import uuid
+import sys
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "vps-manager.sh"
@@ -79,6 +80,8 @@ def base_model(enabled: bool, port: int = 39000) -> dict:
         "managedBy": "vps-manager",
         "nodeName": "test",
         "publicAddress": "192.0.2.1",
+        "publicPorts": {"reality": 58403},
+        "directDomainStrategy": "UseIPv6",
         "reality": {
             "port": 443,
             "dest": "[2001:db8::1]:443",
@@ -99,7 +102,7 @@ def base_model(enabled: bool, port: int = 39000) -> dict:
     }
 
 
-def generate(model: dict) -> tuple[dict, dict, str]:
+def generate(model: dict) -> tuple[dict, dict, str, str]:
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         paths = [root / name for name in ("proxies", "config", "state", "info", "yaml", "model")]
@@ -108,7 +111,7 @@ def generate(model: dict) -> tuple[dict, dict, str]:
         environment = os.environ.copy()
         environment["CFG_PENDING_MODEL"] = str(paths[5])
         subprocess.run(
-            ["python3", "-", *(str(path) for path in paths[:5]), "0", ""],
+            [sys.executable, "-", *(str(path) for path in paths[:5]), "0", ""],
             input=generator_source(), text=True, env=environment, check=True,
             capture_output=True,
         )
@@ -116,6 +119,7 @@ def generate(model: dict) -> tuple[dict, dict, str]:
             json.loads(paths[1].read_text()),
             json.loads(paths[2].read_text()),
             paths[3].read_text(),
+            paths[4].read_text(),
         )
 
 
@@ -130,24 +134,28 @@ def load_model(config: dict, state: dict, mode: str = "strict") -> dict:
         state["configSha256"] = hashlib.sha256(config_text.encode()).hexdigest()
         state_path.write_text(json.dumps(state))
         subprocess.run(
-            ["python3", "-", str(config_path), str(state_path), str(result_path), mode, "public"],
+            [sys.executable, "-", str(config_path), str(state_path), str(result_path), mode, "public"],
             input=loader_source(), text=True, check=True, capture_output=True,
         )
         return json.loads(result_path.read_text())
 
 
 def mutate_guard(model: dict, enabled: bool) -> dict:
+    return mutate(model, "reality-guard", "1" if enabled else "0")
+
+
+def mutate(model: dict, *args: str) -> dict:
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory) / "model.json"
         path.write_text(json.dumps(model))
         subprocess.run(
-            ["python3", "-", str(path), "reality-guard", "1" if enabled else "0"],
+            [sys.executable, "-", str(path), *args],
             input=mutator_source(), text=True, check=True, capture_output=True,
         )
         return json.loads(path.read_text())
 
 
-config, state, info = generate(base_model(True))
+config, state, info, yaml_text = generate(base_model(True))
 main = next(item for item in config["inbounds"] if item["protocol"] == "vless")
 helper = next(item for item in config["inbounds"] if item.get("tag") == "reality-guard-in")
 assert main["streamSettings"]["realitySettings"]["dest"] == "127.0.0.1:39000"
@@ -158,10 +166,16 @@ assert config["routing"]["rules"][:2] == [
     {"type": "field", "inboundTag": ["reality-guard-in"], "outboundTag": "reality-guard-block"},
 ]
 assert state["reality"]["dest"] == "[2001:db8::1]:443"
+assert state["publicPorts"] == {"reality": 58403}
+assert state["directDomainStrategy"] == "UseIPv6"
+assert next(item for item in config["outbounds"] if item["tag"] == "direct")["settings"]["domainStrategy"] == "UseIPv6"
+assert "  port: 58403\n" in yaml_text
 assert "full: 精确匹配" in info
 loaded = load_model(config, state)
 assert loaded["reality"]["dest"] == "[2001:db8::1]:443"
 assert loaded["reality"]["guard"] == {"enabled": True, "port": 39000}
+assert loaded["publicPorts"] == {"reality": 58403}
+assert loaded["directDomainStrategy"] == "UseIPv6"
 loaded = mutate_guard(loaded, False)
 assert loaded["reality"]["guard"] == {"enabled": False, "port": 39000}
 loaded = mutate_guard(loaded, True)
@@ -178,12 +192,12 @@ conflicting = base_model(True)
 conflicting["optionalInbounds"]["socks5"] = {
     "listen": "127.0.0.1", "port": 39000, "username": "u", "password": "p"
 }
-config, state, _ = generate(conflicting)
+config, state, _, _ = generate(conflicting)
 helper = next(item for item in config["inbounds"] if item.get("tag") == "reality-guard-in")
 assert helper["port"] == 39001
 assert state["reality"]["guard"]["port"] == 39001
 
-config, state, _ = generate(base_model(False))
+config, state, _, _ = generate(base_model(False))
 main = next(item for item in config["inbounds"] if item["protocol"] == "vless")
 assert main["streamSettings"]["realitySettings"]["dest"] == "[2001:db8::1]:443"
 assert not any(item.get("tag") == "reality-guard-in" for item in config["inbounds"])
@@ -191,3 +205,45 @@ assert not any(item.get("tag") == "reality-guard-block" for item in config["outb
 assert state["reality"]["guard"]["enabled"] is False
 
 print("Reality Guard generator fixtures passed")
+
+# Old state files retain IPv4 defaults and follow internal port changes.
+legacy = base_model(False)
+legacy.pop("publicPorts")
+legacy.pop("directDomainStrategy")
+config, state, _, yaml_text = generate(legacy)
+assert state["directDomainStrategy"] == "UseIPv4"
+assert "  port: 443\n" in yaml_text
+state.pop("publicPorts")
+state.pop("directDomainStrategy")
+restored = load_model(config, state)
+changed = mutate(restored, "set", "reality.port", "8443")
+assert changed["publicPorts"]["reality"] == 8443
+assert mutate(base_model(False), "set", "reality.port", "8443")["publicPorts"]["reality"] == 58403
+
+# Reject extra direct settings instead of silently discarding them on regeneration.
+next(x for x in config["outbounds"] if x["tag"] == "direct")["settings"]["redirect"] = "127.0.0.1:9"
+try:
+    load_model(config, state)
+except subprocess.CalledProcessError:
+    pass
+else:
+    raise AssertionError("unmanaged direct settings were accepted")
+
+ss_model = base_model(False)
+ss_model["optionalInbounds"]["shadowsocks"] = {
+    "listen": "0.0.0.0", "port": 23456,
+    "method": "aes-128-gcm", "password": "test-password",
+}
+ss_model["publicPorts"]["shadowsocks"] = 54321
+config, state, info, yaml_text = generate(ss_model)
+assert "  port: 54321\n" in yaml_text
+assert "公网端口: 54321" in info
+assert next(x for x in config["inbounds"] if x["protocol"] == "shadowsocks")["port"] == 23456
+restored = load_model(config, state)
+assert restored["publicPorts"]["shadowsocks"] == 54321
+assert mutate(restored, "inbound-set", "shadowsocks", "port", "23457")["publicPorts"]["shadowsocks"] == 54321
+restored["publicPorts"]["shadowsocks"] = 23456
+assert mutate(restored, "inbound-set", "shadowsocks", "port", "23457")["publicPorts"]["shadowsocks"] == 23457
+disabled = mutate(restored, "inbound-disable", "shadowsocks")
+assert "shadowsocks" not in disabled["publicPorts"]
+print("Public port and direct strategy compatibility checks passed")
