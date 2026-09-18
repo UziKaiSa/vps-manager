@@ -4367,10 +4367,43 @@ EOF
     "${ssh_config}" "${shortcut_name}"
 }
 
+configure_terminal_prompt() {
+  require_root
+  local target="/etc/profile.d/99-vps-manager-prompt.sh"
+  local admin_user admin_home bashrc hook
+  [[ "${DEMO_MODE}" == 1 ]] && { log "[预览] 配置绿色终端主题"; return 0; }
+  admin_user="$(default_ssh_admin_user)"
+  admin_home="$(getent passwd "${admin_user}" | cut -d: -f6)"
+  [[ -n "${admin_home}" && -d "${admin_home}" ]] || { warn "无法定位管理用户主目录。"; return 1; }
+  bashrc="${admin_home}/.bashrc"
+  hook='[ ! -r /etc/profile.d/99-vps-manager-prompt.sh ] || . /etc/profile.d/99-vps-manager-prompt.sh'
+  [[ ! -e "${target}" ]] || backup_file "${target}" terminal-prompt >/dev/null
+  [[ ! -e "${bashrc}" ]] || backup_file "${bashrc}" terminal-bashrc >/dev/null
+  install -d -m 755 /etc/profile.d
+  cat > "${target}" <<'PROMPT'
+# VPS Manager: ZGO-style prompt for Bash and BusyBox ash.
+case $- in
+  *i*)
+    if [ "${TERM:-dumb}" != dumb ] && { [ -n "${BASH_VERSION:-}" ] || [ -n "${BB_ASH_VERSION:-}" ]; }; then
+      PS1='\[\033[01;32m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ '
+    fi
+    ;;
+esac
+PROMPT
+  chmod 644 "${target}"
+  if ! grep -Fx "${hook}" "${bashrc}" >/dev/null 2>&1; then
+    printf '\n# VPS Manager terminal prompt\n%s\n' "${hook}" >> "${bashrc}"
+    chown "${admin_user}" "${bashrc}"
+  fi
+  log "终端主题已配置：绿色用户名@主机名，蓝色目录。重新登录后生效。"
+  printf '当前会话可执行：. %s\n' "${target}"
+}
+
+
 ssh_key_helper_menu() {
   local choice public_key key_file admin_user admin_home authorized_keys
   while true; do
-    printf '\nSSH 密钥与加固管理：\n  1) 本机 Linux 生成密钥并可配置快捷名称\n  2) 校验 SSH 公钥并显示指纹\n  3) 配置 SSH 高位端口（不改登录方式）\n  4) 禁用密码登录（不改 SSH 端口）\n  5) 添加公钥到当前管理用户 authorized_keys\n  6) 查看当前管理用户 authorized_keys\n  7) 查看当前 SSH 端口与监听状态\n  8) 查看 SSH 完整生效配置\n  0) 返回\n'
+    printf '\nSSH 密钥与加固管理：\n  1) 本机 Linux 生成密钥并可配置快捷名称\n  2) 校验 SSH 公钥并显示指纹\n  3) 配置 SSH 高位端口（不改登录方式）\n  4) 禁用密码登录（不改 SSH 端口）\n  5) 添加公钥到当前管理用户 authorized_keys\n  6) 查看当前管理用户 authorized_keys\n  7) 查看当前 SSH 端口与监听状态\n  8) 查看 SSH 完整生效配置\n  9) 配置绿色终端主题（ZGO 样式）\n  0) 返回\n'
     read -r -p "请选择 [0]: " choice
     case "${choice:-0}" in
       1)
@@ -4403,6 +4436,9 @@ ssh_key_helper_menu() {
         ;;
       8)
         show_effective_ssh_config || true
+        ;;
+      9)
+        configure_terminal_prompt || true
         ;;
       0) return 0 ;;
       *) warn "未知选项。" ;;

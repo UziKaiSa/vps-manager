@@ -309,8 +309,13 @@ ss://BASE64(加密方式:密码)@IP或域名:端口
 4) 禁用密码登录（不改 SSH 端口）
 5) 添加公钥到当前管理用户 authorized_keys
 6) 查看当前管理用户 authorized_keys
+7) 查看当前 SSH 端口与监听状态
+8) 查看 SSH 完整生效配置
+9) 配置绿色终端主题（ZGO 样式）
 0) 返回
 ```
+
+绿色终端主题显示绿色的 `用户名@主机名` 和蓝色目录，支持 Bash 和 BusyBox ash。配置前备份已有主题文件和管理用户的 `.bashrc`；重新登录后生效，当前会话也可执行 `. /etc/profile.d/99-vps-manager-prompt.sh` 立即加载。
 
 “本机 Linux 生成密钥”会直接操作当前管理用户的 `~/.ssh`。例如输入后缀 `GB`，会实际生成 `~/.ssh/id_ed25519_GB` 和 `~/.ssh/id_ed25519_GB.pub`；直接回车使用默认后缀 `vps-manager`。可以选择是否为私钥设置密码。
 
