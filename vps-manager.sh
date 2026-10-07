@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.9.33-test"
+SCRIPT_VERSION="0.9.34-test"
 SCRIPT_NAME="VPS Manager"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh"
 
@@ -1788,12 +1788,12 @@ install_base_tools() {
 
   if [[ "${DEMO_MODE}" == "1" ]]; then
     log "[预览] 初始化基础工具"
-    printf '将安装：ca-certificates curl wget vim unzip python3 python3-yaml openssl iproute2 openssh-client\n'
+    printf '将安装：ca-certificates curl wget vim unzip python3 python3-yaml openssl iproute2 openssh-client nftables\n'
     return 0
   fi
   if is_alpine; then
     log "安装 Alpine 基础工具"
-    apk add --no-cache bash ca-certificates curl wget vim unzip python3 py3-yaml openssl iproute2 openssh-client procps \
+    apk add --no-cache bash ca-certificates curl wget vim unzip python3 py3-yaml openssl iproute2 openssh-client procps nftables \
       || { warn "Alpine 基础工具安装失败。"; return 1; }
     return 0
   fi
@@ -1803,7 +1803,7 @@ install_base_tools() {
   export DEBIAN_FRONTEND=noninteractive
   apt_update_safe
   apt-get install -y --no-install-recommends \
-    ca-certificates curl wget vim unzip python3 python3-yaml openssl iproute2 openssh-client psmisc
+    ca-certificates curl wget vim unzip python3 python3-yaml openssl iproute2 openssh-client psmisc nftables
 }
 
 
