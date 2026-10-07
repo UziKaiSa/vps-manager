@@ -48,7 +48,7 @@ def test_fixed_ip_is_preserved_for_local_and_download_fallbacks():
 
 
 def test_failed_post_install_check_offers_private_public_or_exit():
-    assert 'komari_verify_agent_install "${endpoint}"' in TEXT
+    assert 'komari_verify_agent_install "${endpoint}" "${token}"' in TEXT
     assert "1) 重新使用内网/WARP 安装" in TEXT
     assert "2) 使用零信任公网 Service Token 兜底安装" in TEXT
     assert "3) 退出" in TEXT

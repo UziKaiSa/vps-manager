@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.9.31-test"
+SCRIPT_VERSION="0.9.32-test"
 SCRIPT_NAME="VPS Manager"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh"
 
@@ -4803,6 +4803,7 @@ komari_write_local_runner() {
     [[ "${disable_ssh}" == 1 ]] && printf '%q ' --disable-web-ssh
     [[ "${gpu}" == 1 ]] && printf '%q ' --gpu
     [[ -n "${public_ip}" ]] && printf '%q ' --custom-ipv4 "${public_ip}"
+    [[ "${KOMARI_GATEWAY_MODE:-0}" != 1 ]] || printf '%q ' --interval 1
     printf '\n'
   } > "${runner}"
   chmod 700 "${runner}"
@@ -4825,6 +4826,11 @@ komari_install_local_agent() {
   install -m 700 "${source}" "${WORK_DIR}/komari-agent"
   "${WORK_DIR}/komari-agent" --help >/dev/null 2>&1 \
     || { warn "本地 Komari Agent 无法正常执行 --help，已停止安装。"; return 1; }
+  if [[ "${KOMARI_GATEWAY_MODE:-0}" == 1 ]] \
+    && ! "${WORK_DIR}/komari-agent" --help 2>&1 | grep -F -- '--interval' >/dev/null; then
+    warn "此本地 Agent 不支持网关所需的上报间隔，请使用新版官方 Agent。"
+    return 1
+  fi
   log "本地 Komari Agent SHA-256: $(sha256sum "${WORK_DIR}/komari-agent" | awk '{print $1}')"
   install -d -m 700 "${install_dir}"
   [[ ! -e "${agent}" ]] || backup_agent="$(backup_file "${agent}" komari-agent-local)"
@@ -4927,6 +4933,10 @@ komari_install_fallback_after_failure() {
   if [[ -n "${local_agent}" ]]; then
     prompt_yes_no "是否改用本机兜底 Agent：$(basename "${local_agent}")" 1 || return 1
   else
+    if [[ "${KOMARI_GATEWAY_MODE:-0}" == 1 ]]; then
+      warn "网关模式不使用旧版 1.2.60 仓库兜底，请上传兼容的新版 Agent 后重试。"
+      return 1
+    fi
     komari_download_repo_fallback || return 1
     local_agent="${KOMARI_REPO_FALLBACK_PATH}"
   fi
@@ -4946,13 +4956,22 @@ komari_install_agent() {
     return 0
   fi
   endpoint="$(prompt_default "Komari 连接地址" "${endpoint}")"
+  if [[ "${KOMARI_GATEWAY_MODE:-0}" == 1 ]] \
+    && [[ ! "${endpoint}" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?/?$ ]]; then
+    warn "网关地址必须是 HTTPS 根地址，不能包含用户名、路径或查询参数。"
+    return 1
+  fi
   token="$(prompt_secret "Komari Client Token")"
   [[ -n "${token}" ]] || { warn "Komari Token 不能为空。"; return 1; }
   install_dir="$(prompt_default "Agent 安装目录" "${home}/scripts/komari-agent")"
   [[ "${install_dir}" == /* ]] || install_dir="$(pwd -P)/${install_dir}"
   day="$(prompt_default "流量统计重置日" "11")"
   [[ "${day}" =~ ^([1-9]|[12][0-9]|3[01])$ ]] || { warn "重置日必须是 1-31。"; return 1; }
-  prompt_yes_no "是否禁用 Web SSH" 1 || disable_ssh=0
+  if [[ "${KOMARI_GATEWAY_MODE:-0}" == 1 ]]; then
+    printf '  网关模式：禁用 Web SSH，采集间隔 1 秒。\n'
+  else
+    prompt_yes_no "是否禁用 Web SSH" 1 || disable_ssh=0
+  fi
   prompt_yes_no "是否启用 GPU 监控" 1 || gpu=0
   if prompt_yes_no "是否让 Agent 定期探测并自动跟随公网 IPv4 变化" 1; then
     ip_mode="auto"
@@ -4991,6 +5010,7 @@ komari_install_agent() {
       bash -n "${installer}" || { warn "Komari 官方安装器语法校验失败。"; return 1; }
       checksum="$(sha256sum "${installer}" | awk '{print $1}')"; log "Komari 官方安装器 SHA-256: ${checksum}"
       args=(-e "${endpoint}" -t "${token}" --install-dir "${install_dir}" --month-rotate "${day}")
+      [[ "${KOMARI_GATEWAY_MODE:-0}" != 1 ]] || args+=(--interval 1)
       [[ "${disable_ssh}" == 1 ]] && args+=(--disable-web-ssh)
       [[ "${gpu}" == 1 ]] && args+=(--gpu)
       [[ "${ip_mode}" == "fixed" ]] && args+=(--custom-ipv4 "${public_ip}")
@@ -5002,24 +5022,34 @@ komari_install_agent() {
     fi
   fi
   service_status_text komari-agent | sed -n '1,60p' || true
-  if komari_verify_agent_install "${endpoint}"; then
-    log "Komari Agent 服务、运行参数及上报地址 HTTP 检查通过"
+  if komari_verify_agent_install "${endpoint}" "${token}"; then
+    if [ "${KOMARI_GATEWAY_MODE:-0}" = "1" ]; then
+      log "Komari Agent 服务、运行参数及网关节点认证检查通过"
+    else
+      log "Komari Agent 服务、运行参数及上报地址 HTTP 检查通过"
+    fi
     return 0
   fi
   [[ "${skip_recovery}" == 1 ]] && return 1
+  if [[ "${KOMARI_GATEWAY_MODE:-0}" == 1 ]]; then
+    warn "请核对主控已创建节点、节点 token 及两台网关登记回执；不需要零信任密钥，也不要立即重装。"
+    return 1
+  fi
   komari_install_failure_menu
 }
 
 
 komari_verify_agent_install() {
-  local endpoint="$1" attempt reason=""
+  local endpoint="$1" token="${2:-}" attempt reason=""
   log "检查 Komari Agent 状态和上报地址可达性（最多重试 10 次）"
   for attempt in {1..10}; do
     if ! service_is_active komari-agent; then
       reason="Agent 服务尚未运行"
     elif ! komari_effective_agent_uses_endpoint "${endpoint}"; then
       reason="运行中的 Agent 上报地址与本次配置不一致，或进程尚未就绪"
-    elif ! curl -fsS --connect-timeout 5 --max-time 6 -o /dev/null "${endpoint}"; then
+    elif [[ "${KOMARI_GATEWAY_MODE:-0}" == 1 ]] && ! komari_gateway_handshake "${endpoint}" "${token}"; then
+      reason="网关节点认证尚未通过，可能仍在等待主控登记同步"
+    elif [[ "${KOMARI_GATEWAY_MODE:-0}" != 1 ]] && ! curl -fsS --connect-timeout 5 --max-time 6 -o /dev/null "${endpoint}"; then
       reason="上报地址 HTTP 检查未通过"
     else
       return 0
@@ -5029,6 +5059,36 @@ komari_verify_agent_install() {
   warn "Komari Agent 安装后检查未通过：${reason}。"
   warn "此检查不等同于实际 WebSocket 上报状态；请结合后台在线状态判断，无需立即重装。"
   return 1
+}
+
+
+komari_gateway_handshake() {
+  local endpoint="$1" token="$2"
+  python3 - "${endpoint}" 3<<<"${token}" <<'PY_GATEWAY_HANDSHAKE'
+import base64, hashlib, http.client, os, sys
+from urllib.parse import urlsplit, urlencode
+try:
+    url = urlsplit(sys.argv[1])
+    if url.scheme != "https" or not url.hostname or url.username or url.query or url.fragment:
+        raise ValueError()
+    token = os.fdopen(3).read().strip()
+    if not token:
+        raise ValueError()
+    key = base64.b64encode(os.urandom(16)).decode()
+    connection = http.client.HTTPSConnection(url.hostname, url.port or 443, timeout=6)
+    try:
+        path = url.path.rstrip("/") + "/api/clients/v2/rpc?" + urlencode({"token":token})
+        connection.request("GET", path, headers={"Upgrade":"websocket", "Connection":"Upgrade",
+                           "Sec-WebSocket-Key":key,"Sec-WebSocket-Version":"13"})
+        reply = connection.getresponse()
+        expected = base64.b64encode(hashlib.sha1((key+"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
+        ok = reply.status == 101 and reply.getheader("Sec-WebSocket-Accept") == expected
+    finally:
+        connection.close()
+    raise SystemExit(0 if ok else 1)
+except Exception:
+    raise SystemExit(1)
+PY_GATEWAY_HANDSHAKE
 }
 
 
@@ -6072,6 +6132,14 @@ install_komari_warp() {
 
 install_komari_standard() { require_root; check_supported_os; komari_install_agent "https://example.com"; }
 
+install_komari_gateway() {
+  local KOMARI_GATEWAY_MODE=1
+  require_root; check_supported_os
+  printf '\n网关接入：先在主控创建节点，再填写网关域名和该节点的 Client Token。\n'
+  printf '节点登记由主控同步服务自动发送到两台网关；本机不需要保存 Cloudflare 零信任密钥。\n'
+  komari_install_agent "https://monitor.example.com"
+}
+
 
 komari_status() {
   printf '\nKomari Agent 状态：\n'; service_status_text komari-agent | sed -n '1,60p' || printf '未发现运行中的 Komari Agent。\n'
@@ -6091,14 +6159,14 @@ komari_menu() {
   local choice
   while true; do
     if is_alpine; then
-      printf '\nAlpine Komari/WARP 管理：\n  1) 配置/修复 WARP 私网，并安装/重装 Agent\n  2) 零信任公网 Service Token 安装/重装 Agent\n  3) 查看 Agent/WARP 状态\n  4) 重连 WARP\n  0) 返回\n'
+      printf '\nAlpine Komari/WARP 管理：\n  1) 配置/修复 WARP 私网，并安装/重装 Agent\n  2) 零信任公网 Service Token 安装/重装 Agent\n  3) 查看 Agent/WARP 状态\n  4) 重连 WARP\n  5) 通过监控网关安装/重装 Agent（推荐）\n  0) 返回\n'
       read -r -p "请选择 [0]: " choice
-      case "${choice:-0}" in 1) install_komari_warp ;; 2) install_komari_access_public ;; 3) komari_status ;; 4) komari_reconnect_warp ;; 0) return 0 ;; *) warn "未知选项。" ;; esac
+      case "${choice:-0}" in 1) install_komari_warp ;; 2) install_komari_access_public ;; 3) komari_status ;; 4) komari_reconnect_warp ;; 5) install_komari_gateway ;; 0) return 0 ;; *) warn "未知选项。" ;; esac
       continue
     fi
-    printf '\nKomari Agent 安装/管理：\n  1) 配置/修复 WARP 私网，并可继续安装 Agent（内置流程）\n  2) 安装/重装普通公网 Agent\n  3) 零信任公网 Service Token 安装/重装 Agent\n  4) 查看 Agent/WARP 状态\n  5) 重连 WARP\n  0) 返回\n'
+    printf '\nKomari Agent 安装/管理：\n  1) 配置/修复 WARP 私网，并可继续安装 Agent（内置流程）\n  2) 安装/重装普通公网 Agent\n  3) 零信任公网 Service Token 安装/重装 Agent\n  4) 查看 Agent/WARP 状态\n  5) 重连 WARP\n  6) 通过监控网关安装/重装 Agent（推荐）\n  0) 返回\n'
     read -r -p "请选择 [0]: " choice
-    case "${choice:-0}" in 1) install_komari_warp ;; 2) install_komari_standard ;; 3) install_komari_access_public ;; 4) komari_status ;; 5) komari_reconnect_warp ;; 0) return 0 ;; *) warn "未知选项。" ;; esac
+    case "${choice:-0}" in 1) install_komari_warp ;; 2) install_komari_standard ;; 3) install_komari_access_public ;; 4) komari_status ;; 5) komari_reconnect_warp ;; 6) install_komari_gateway ;; 0) return 0 ;; *) warn "未知选项。" ;; esac
   done
 }
 

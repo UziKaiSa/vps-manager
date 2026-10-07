@@ -2,11 +2,13 @@
 
 `VPS Manager` 是一个面向 Debian/Ubuntu VPS 的中文交互式管理脚本，并为小硬盘 Alpine/OpenRC NAT VPS 提供受限模式，用于完成服务器初始化、Xray 配置，以及 Komari Agent/WARP 私网接入。
 
-当前版本：`0.9.31-test`
+当前版本：`0.9.32-test`
 
 > 目前是测试版。首次在正式服务器上使用前，建议先运行预览模式，并保留一个已经登录的 SSH 终端。
 
 ## 功能
+
+新机器通过监控网关接入时，在 Komari 菜单选择「通过监控网关安装/重装 Agent」（Debian/Ubuntu 第 6 项、Alpine 第 5 项），填写 HTTPS 网关根地址与在主控创建节点后取得的 Client Token。无需输入 Cloudflare 密钥，节点登记由主控独立同步服务推送。此模式固定禁用 Web SSH、1 秒采集，通过节点 WebSocket 认证检查连接，不以受零信任保护的网页首页判断安装是否成功。检查通过不等同于主控已收到指标，仍需确认节点在线与延迟记录。网关模式不使用仓库里的旧版 1.2.60 兜底；下载受限时请上传兼容新版 Agent。原 WARP/Service Token 模式仍可供可信自有机器使用。
 
 - 安装常用基础工具：`curl`、`wget`、`vim`、`unzip`、`python3` 等
 - 可选开启 BBR
