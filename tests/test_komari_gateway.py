@@ -75,4 +75,5 @@ def test_gateway_mode_pins_reporting_and_keeps_legacy_modes_separate():
     assert '--interval 1' in runner and 'args+=(--interval 1)' in installer
     assert 'local KOMARI_GATEWAY_MODE=1' in mode
     assert 'install_komari_warp' not in mode and 'client_secret' not in mode
-    assert '6) install_komari_gateway' in TEXT and '5) install_komari_gateway' in TEXT
+    assert TEXT.count('in 1) install_komari_gateway') == 2
+    assert TEXT.count('1) 公网直装\\n  2) 配置/修复 WARP') == 2

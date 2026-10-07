@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.9.32-test"
+SCRIPT_VERSION="0.9.33-test"
 SCRIPT_NAME="VPS Manager"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh"
 
@@ -4779,12 +4779,14 @@ komari_show_ipv6_only_agent_notice() {
   }
   download_url="https://github.com/komari-monitor/komari-agent/releases/latest/download/komari-agent-linux-${arch}"
   upload_path="${home}/komari-agent-linux-${arch}"
-  if is_alpine; then
-    menu_path="主菜单 3) Komari + WARP 管理 -> 1) 配置/修复 WARP 私网，并安装/重装 Agent"
+  if [[ "${KOMARI_GATEWAY_MODE:-0}" == 1 ]]; then
+    menu_path="Komari Agent 安装/管理 -> 1) 公网直装"
+  elif is_alpine; then
+    menu_path="主菜单 3) Komari + WARP 管理 -> 2) 配置/修复 WARP 私网，并安装/重装 Agent"
   elif [[ "${endpoint}" == *'.internal'* ]]; then
-    menu_path="主菜单 5) 安装/管理 Komari Agent -> 1) 配置/修复 WARP 私网，并可继续安装 Agent"
+    menu_path="主菜单 5) 安装/管理 Komari Agent -> 2) 配置/修复 WARP 私网，并可继续安装 Agent"
   else
-    menu_path="主菜单 5) 安装/管理 Komari Agent -> 2) 安装/重装普通公网 Agent"
+    menu_path="主菜单 5) 安装/管理 Komari Agent -> 3) 安装/重装普通公网 Agent"
   fi
   printf '\n[提示] 检测到当前服务器为 IPv6-only，无法保证直接访问 GitHub Releases。\n'
   printf '请先在其他设备手动下载 Komari Agent：\n  %s\n' "${download_url}"
@@ -6159,14 +6161,14 @@ komari_menu() {
   local choice
   while true; do
     if is_alpine; then
-      printf '\nAlpine Komari/WARP 管理：\n  1) 配置/修复 WARP 私网，并安装/重装 Agent\n  2) 零信任公网 Service Token 安装/重装 Agent\n  3) 查看 Agent/WARP 状态\n  4) 重连 WARP\n  5) 通过监控网关安装/重装 Agent（推荐）\n  0) 返回\n'
+      printf '\nAlpine Komari/WARP 管理：\n  1) 公网直装\n  2) 配置/修复 WARP 私网，并安装/重装 Agent\n  3) 零信任公网 Service Token 安装/重装 Agent\n  4) 查看 Agent/WARP 状态\n  5) 重连 WARP\n  0) 返回\n'
       read -r -p "请选择 [0]: " choice
-      case "${choice:-0}" in 1) install_komari_warp ;; 2) install_komari_access_public ;; 3) komari_status ;; 4) komari_reconnect_warp ;; 5) install_komari_gateway ;; 0) return 0 ;; *) warn "未知选项。" ;; esac
+      case "${choice:-0}" in 1) install_komari_gateway ;; 2) install_komari_warp ;; 3) install_komari_access_public ;; 4) komari_status ;; 5) komari_reconnect_warp ;; 0) return 0 ;; *) warn "未知选项。" ;; esac
       continue
     fi
-    printf '\nKomari Agent 安装/管理：\n  1) 配置/修复 WARP 私网，并可继续安装 Agent（内置流程）\n  2) 安装/重装普通公网 Agent\n  3) 零信任公网 Service Token 安装/重装 Agent\n  4) 查看 Agent/WARP 状态\n  5) 重连 WARP\n  6) 通过监控网关安装/重装 Agent（推荐）\n  0) 返回\n'
+    printf '\nKomari Agent 安装/管理：\n  1) 公网直装\n  2) 配置/修复 WARP 私网，并可继续安装 Agent（内置流程）\n  3) 安装/重装普通公网 Agent\n  4) 零信任公网 Service Token 安装/重装 Agent\n  5) 查看 Agent/WARP 状态\n  6) 重连 WARP\n  0) 返回\n'
     read -r -p "请选择 [0]: " choice
-    case "${choice:-0}" in 1) install_komari_warp ;; 2) install_komari_standard ;; 3) install_komari_access_public ;; 4) komari_status ;; 5) komari_reconnect_warp ;; 6) install_komari_gateway ;; 0) return 0 ;; *) warn "未知选项。" ;; esac
+    case "${choice:-0}" in 1) install_komari_gateway ;; 2) install_komari_warp ;; 3) install_komari_standard ;; 4) install_komari_access_public ;; 5) komari_status ;; 6) komari_reconnect_warp ;; 0) return 0 ;; *) warn "未知选项。" ;; esac
   done
 }
 
