@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.9.35-test"
+SCRIPT_VERSION="0.9.36-test"
 SCRIPT_NAME="VPS Manager"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh"
 
@@ -6988,6 +6988,253 @@ firewall_management_menu() {
 }
 
 
+trash_cleanup_retention_days() {
+  local value=""
+  if [[ -r "${STATE_DIR}/trash-cleanup.conf" ]]; then
+    value="$(sed -n 's/^RETENTION_DAYS=\([1-9][0-9]*\)$/\1/p' "${STATE_DIR}/trash-cleanup.conf" | head -n 1)"
+  elif [[ -r /etc/systemd/system/purge-old-trash.service ]]; then
+    value="$(grep -oE -- '--days[[:space:]]+[0-9]+' /etc/systemd/system/purge-old-trash.service | awk '{print $2}' | head -n 1 || true)"
+  fi
+  [[ "${value}" =~ ^[1-9][0-9]*$ ]] && (( value <= 36500 )) || value=180
+  printf '%s' "${value}"
+}
+
+trash_cleanup_emit_helper() {
+  cat <<'VPS_MANAGER_TRASH_HELPER'
+#!/bin/sh
+# FreeDesktop Trash retention; supports GNU tools and Alpine BusyBox without Python.
+set -eu
+days=180
+dry_run=0
+single_root=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --days) [ "$#" -ge 2 ] || exit 2; days=$2; shift 2 ;;
+    --dry-run) dry_run=1; shift ;;
+    --root) [ "$#" -ge 2 ] || exit 2; single_root=$2; shift 2 ;;
+    *) echo "Usage: $0 [--days 180] [--dry-run] [--root /home/user/.local/share/Trash]" >&2; exit 2 ;;
+  esac
+done
+case "$days" in ''|*[!0-9]*|0*) echo 'Retention must be 1..36500 whole days.' >&2; exit 2;; esac
+[ "$days" -le 36500 ] || exit 2
+cutoff=$(($(date +%s) - days * 86400))
+removed=0
+retained=0
+invalid=0
+locked=0
+lock_dir=/run/vps-manager-trash-cleanup.lock
+if [ "$dry_run" = 0 ] && [ -z "$single_root" ]; then
+  if command -v flock >/dev/null 2>&1; then
+    exec 9>"${lock_dir}.flock"
+    flock -n 9 || { echo 'Cleanup already running; skipped.'; exit 0; }
+  else
+    if ! mkdir "$lock_dir" 2>/dev/null; then
+      old_pid=$(cat "$lock_dir/pid" 2>/dev/null || true)
+      case "$old_pid" in ''|*[!0-9]*) echo 'Invalid cleanup lock; skipped.'; exit 0;; esac
+      if kill -0 "$old_pid" 2>/dev/null; then echo 'Cleanup already running; skipped.'; exit 0; fi
+      rm -f -- "$lock_dir/pid"; rmdir "$lock_dir"; mkdir "$lock_dir"
+    fi
+    printf '%s\n' "$$" > "$lock_dir/pid"
+    locked=1
+    trap '[ "$locked" = 0 ] || { rm -f -- "$lock_dir/pid"; rmdir "$lock_dir"; } 2>/dev/null || true' EXIT HUP INT TERM
+  fi
+fi
+entry_time() {
+  entry=$1
+  metadata=$2
+  timestamp=
+  if [ -f "$metadata" ] && [ ! -L "$metadata" ]; then
+    deleted=$(sed -n 's/^DeletionDate=//p' "$metadata" | head -n 1 | tr 'T' ' ')
+    if [ -n "$deleted" ]; then timestamp=$(date -d "$deleted" +%s 2>/dev/null || true); fi
+  fi
+  if [ -z "$timestamp" ]; then
+    modified=$(stat -c %Y "$entry" 2>/dev/null || echo 0)
+    changed=$(stat -c %Z "$entry" 2>/dev/null || echo 0)
+    if [ "$modified" -gt "$changed" ]; then timestamp=$modified; else timestamp=$changed; fi
+  fi
+  printf '%s\n' "$timestamp"
+}
+has_mount() {
+  [ -r /proc/self/mountinfo ] || return 1
+  awk -v root="$1" '{p=$5;gsub(/\\040/," ",p);if(p==root || index(p,root"/")==1)found=1} END{exit !found}' /proc/self/mountinfo
+}
+purge_root() {
+  trash_root=${1%/}
+  case "$trash_root" in /*/.local/share/Trash) ;; *) echo "Refusing non-Trash root: $trash_root" >&2; return 2;; esac
+  [ -d "$trash_root" ] || return 0
+  if [ -L "$trash_root" ] || [ "$(readlink -f "$trash_root")" != "$trash_root" ]; then
+    echo "Skipping symlinked Trash root: $trash_root"; invalid=$((invalid+1)); return 0
+  fi
+  files_dir=$trash_root/files
+  info_dir=$trash_root/info
+  [ -d "$files_dir" ] && [ -d "$info_dir" ] || return 0
+  if [ -L "$files_dir" ] || [ -L "$info_dir" ]; then invalid=$((invalid+1)); return 0; fi
+  for candidate in "$files_dir"/* "$files_dir"/.[!.]* "$files_dir"/..?*; do
+    [ -e "$candidate" ] || [ -L "$candidate" ] || continue
+    info_path=$info_dir/${candidate##*/}.trashinfo
+    at=$(entry_time "$candidate" "$info_path")
+    case "$at" in ''|*[!0-9]*) invalid=$((invalid+1)); continue;; esac
+    if [ "$at" -eq 0 ] || [ "$at" -ge "$cutoff" ]; then retained=$((retained+1)); continue; fi
+    if has_mount "$candidate"; then echo "Skipping mounted entry: $candidate"; invalid=$((invalid+1)); continue; fi
+    if [ "$dry_run" = 1 ]; then
+      printf 'would_remove: %s\n' "$candidate"
+    else
+      # Unlink final symlinks, never traverse them. Child mounts were rejected above.
+      if [ -L "$candidate" ]; then rm -f -- "$candidate"; else rm -rf -- "$candidate"; fi
+      [ ! -e "$candidate" ] && [ ! -L "$candidate" ] || return 1
+      if [ -f "$info_path" ] && [ ! -L "$info_path" ]; then rm -f -- "$info_path"; fi
+      printf 'removed: %s\n' "$candidate"
+    fi
+    removed=$((removed+1))
+  done
+  for info_path in "$info_dir"/*.trashinfo; do
+    [ -f "$info_path" ] && [ ! -L "$info_path" ] || continue
+    name=${info_path##*/}; name=${name%.trashinfo}
+    [ ! -e "$files_dir/$name" ] && [ ! -L "$files_dir/$name" ] || continue
+    deleted=$(sed -n 's/^DeletionDate=//p' "$info_path" | head -n 1 | tr 'T' ' ')
+    [ -n "$deleted" ] || continue
+    at=$(date -d "$deleted" +%s 2>/dev/null || true)
+    case "$at" in ''|*[!0-9]*) continue;; esac
+    [ "$at" -lt "$cutoff" ] || continue
+    if [ "$dry_run" = 0 ]; then rm -f -- "$info_path"; fi
+  done
+}
+if [ -n "$single_root" ]; then
+  purge_root "$single_root"
+else
+  for user_home in /root /home/*; do
+    [ -d "$user_home" ] && [ ! -L "$user_home" ] || continue
+    purge_root "$user_home/.local/share/Trash"
+  done
+fi
+printf 'summary: days=%s dry_run=%s matched=%s retained=%s invalid=%s\n' "$days" "$dry_run" "$removed" "$retained" "$invalid"
+VPS_MANAGER_TRASH_HELPER
+}
+
+install_trash_cleanup_job() (
+  require_root
+  local days="${1:-180}" stage helper old_cron new_cron
+  [[ "${days}" =~ ^[1-9][0-9]*$ ]] && (( days <= 36500 )) || { warn "保留天数必须为 1–36500。"; return 1; }
+  if [[ "${DEMO_MODE}" == "1" ]]; then
+    printf '预览：每天检查回收站，永久删除进入回收站超过 %s 天的条目；不会扫描普通目录。\n' "${days}"
+    printf 'systemd 使用 purge-old-trash.timer；Alpine 使用 root crontab，每天本机时间 03:40。\n'
+    return 0
+  fi
+  helper=/usr/local/sbin/vps-manager-purge-old-trash
+  stage="$(mktemp -d "${TMPDIR:-/tmp}/vps-manager-trash.XXXXXX")"
+  chmod 700 "${stage}"
+  trap 'rm -rf -- "${stage}"' EXIT
+  trash_cleanup_emit_helper > "${stage}/purge-old-trash"
+  sh -n "${stage}/purge-old-trash" || { warn "清理器语法检查失败。"; return 1; }
+  if is_alpine; then
+    command -v crontab >/dev/null 2>&1 || { warn "系统缺少 crontab；请先初始化环境。"; return 1; }
+    old_cron="$(crontab -l 2>/dev/null || true)"
+    if printf '%s\n' "${old_cron}" | grep -Ei 'trash|recycle' | grep -v 'vps-manager-trash-cleanup' >/dev/null; then
+      warn "已有其他回收站 Cron，未改动；请先查看现有任务，避免重复。"; return 1
+    fi
+  else
+    command -v systemctl >/dev/null 2>&1 || { warn "此系统缺少 systemd。"; return 1; }
+  fi
+  backup_file "${helper}" trash-cleanup-helper >/dev/null
+  backup_file "${STATE_DIR}/trash-cleanup.conf" trash-cleanup-config >/dev/null
+  install -d -m 755 /usr/local/sbin
+  install -d -m 700 "${STATE_DIR}"
+  install -m 755 "${stage}/purge-old-trash" "${helper}"
+  printf 'RETENTION_DAYS=%s\n' "${days}" > "${stage}/trash-cleanup.conf"
+  install -m 600 "${stage}/trash-cleanup.conf" "${STATE_DIR}/trash-cleanup.conf"
+  if is_alpine; then
+    new_cron="$(printf '%s\n' "${old_cron}" | grep -v 'vps-manager-trash-cleanup' || true)"
+    { [[ -z "${new_cron}" ]] || printf '%s\n' "${new_cron}"; printf '40 3 * * * %s --days %s # vps-manager-trash-cleanup\n' "${helper}" "${days}"; } | crontab -
+    rc-update add crond default >/dev/null
+    rc-service crond status >/dev/null 2>&1 || rc-service crond start
+    [[ "$(crontab -l | grep -c 'vps-manager-trash-cleanup')" == 1 ]] || { warn "Cron 校验失败。"; return 1; }
+  else
+    backup_file /etc/systemd/system/purge-old-trash.service trash-cleanup-service >/dev/null
+    backup_file /etc/systemd/system/purge-old-trash.timer trash-cleanup-timer >/dev/null
+    cat > "${stage}/purge-old-trash.service" <<EOF
+[Unit]
+Description=Permanently purge Trash entries older than ${days} days
+
+[Service]
+Type=oneshot
+ExecStart=${helper} --days ${days}
+User=root
+Group=root
+Nice=10
+NoNewPrivileges=true
+ProtectSystem=full
+EOF
+    cat > "${stage}/purge-old-trash.timer" <<'EOF'
+[Unit]
+Description=Daily retained Trash cleanup
+
+[Timer]
+OnCalendar=*-*-* 03:40:00
+RandomizedDelaySec=30m
+Persistent=true
+Unit=purge-old-trash.service
+
+[Install]
+WantedBy=timers.target
+EOF
+    install -m 644 "${stage}/purge-old-trash.service" /etc/systemd/system/purge-old-trash.service
+    install -m 644 "${stage}/purge-old-trash.timer" /etc/systemd/system/purge-old-trash.timer
+    systemctl daemon-reload
+    install -d -m 755 /var/lib/systemd/timers
+    touch /var/lib/systemd/timers/stamp-purge-old-trash.timer
+    systemctl enable --now purge-old-trash.timer
+    systemctl is-active --quiet purge-old-trash.timer || { warn "定时器未启动。"; return 1; }
+  fi
+  "${helper}" --days "${days}" --dry-run
+  log "回收站定时清理已部署：每天检查，保留 ${days} 天；本次仅预览，没有立即删除现有条目。"
+)
+
+trash_cleanup_show_status() {
+  printf '\n回收站保留天数：%s\n' "$(trash_cleanup_retention_days)"
+  if is_alpine; then
+    rc-service crond status 2>/dev/null || true
+    crontab -l 2>/dev/null | grep 'vps-manager-trash-cleanup' || true
+  else
+    systemctl list-timers --all --no-pager purge-old-trash.timer || true
+    systemctl show purge-old-trash.service -p Result -p ExecMainStatus || true
+  fi
+}
+
+trash_cleanup_management_menu() {
+  local choice days current_cron
+  while true; do
+    printf '\n回收站定时清理\n'
+    printf '  1) 一键部署/更新（默认保留 180 天，每天检查）\n'
+    printf '  2) 查看任务状态\n'
+    printf '  3) 预览超过保留天数的条目（不删除）\n'
+    printf '  4) 停用定时任务（保留脚本与配置）\n'
+    printf '  0) 返回\n'
+    read -r -p '请选择: ' choice
+    case "${choice:-0}" in
+      1)
+        days="$(prompt_default '回收站保留天数，过期条目会被永久删除' "$(trash_cleanup_retention_days)")"
+        install_trash_cleanup_job "${days}" || true
+        pause_screen ;;
+      2) trash_cleanup_show_status; pause_screen ;;
+      3) trash_cleanup_emit_helper | sh -s -- --days "$(trash_cleanup_retention_days)" --dry-run; pause_screen ;;
+      4)
+        require_root
+        if [[ "${DEMO_MODE}" == "1" ]]; then
+          printf '预览：停用本脚本管理的定时清理任务。\n'
+        elif is_alpine; then
+          current_cron="$(crontab -l 2>/dev/null | grep -v 'vps-manager-trash-cleanup' || true)"
+          printf '%s\n' "${current_cron}" | crontab -
+        else
+          systemctl disable --now purge-old-trash.timer
+        fi
+        pause_screen ;;
+      0) return 0 ;;
+      *) warn '未知选项。' ;;
+    esac
+  done
+}
+
+
 show_help() {
   cat <<EOF
 ${SCRIPT_NAME} ${SCRIPT_VERSION}
@@ -7036,6 +7283,7 @@ main_menu() {
     printf '  7) 从 GitHub 更新当前脚本\n'
     printf '  8) 删除当前 .sh 脚本\n'
     printf '  9) 防火墙管理\n'
+    printf ' 10) 回收站定时清理（保留 180 天，每天检查）\n'
     printf '  0) 退出\n'
     read -r -p "请选择: " choice
     case "${choice}" in
@@ -7053,6 +7301,7 @@ main_menu() {
         fi
         ;;
       9) firewall_management_menu; pause_screen ;;
+      10) trash_cleanup_management_menu; pause_screen ;;
       0) printf '已退出。\n'; return 0 ;;
       *) warn "未知选项：${choice}" ;;
     esac
@@ -7073,6 +7322,7 @@ alpine_main_menu() {
     printf '  7) 从 GitHub 更新当前脚本\n'
     printf '  8) 删除当前 .sh 脚本\n'
     printf '  9) 防火墙管理\n'
+    printf ' 10) 回收站定时清理（保留 180 天，每天检查）\n'
     printf '  0) 退出\n'
     read -r -p "请选择: " choice
     case "${choice}" in
@@ -7084,6 +7334,7 @@ alpine_main_menu() {
       7) update_current_script || true; pause_screen ;;
       8) if delete_current_script; then printf '脚本已删除，程序退出。\n'; exit 0; fi ;;
       9) firewall_management_menu; pause_screen ;;
+      10) trash_cleanup_management_menu; pause_screen ;;
       0) printf '已退出。\n'; return 0 ;;
       *) warn "未知选项：${choice}" ;;
     esac

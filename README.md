@@ -2,7 +2,7 @@
 
 `VPS Manager` 是一个面向 Debian/Ubuntu VPS 的中文交互式管理脚本，并为小硬盘 Alpine/OpenRC NAT VPS 提供受限模式，用于完成服务器初始化、Xray 配置，以及 Komari Agent/WARP 私网接入。
 
-当前版本：`0.9.35-test`
+当前版本：`0.9.36-test`
 
 > 目前是测试版。首次在正式服务器上使用前，建议先运行预览模式，并保留一个已经登录的 SSH 终端。
 
@@ -586,3 +586,11 @@ README.md                      中文使用说明
 ### 零信任公网中继 TLS 校验
 
 本机 nginx 中继使用系统 CA 包验证上游 HTTPS 证书链和域名。CA 包缺失时先安装 ca-certificates；仍不可用则停止，保留现有配置，不降级关闭证书校验。此修复不修改 Agent 业务版本、Token、上报地址或 CF 策略。
+
+## 回收站定时清理
+
+Linux 主菜单（Debian/Ubuntu、Alpine 均相同）选择 **10 → 1** 可一键部署或更新。默认每天检查并永久删除进入 FreeDesktop 回收站超过 **180 天**的条目，可自行填写保留天数；首次安装只预览，不立即清空回收站。另可查看任务状态、预览候选和停用任务。普通目录、项目目录和运行数据不在扫描范围。
+
+Debian/Ubuntu 使用 `purge-old-trash.timer`（本机时间 03:40，最多随机延迟 30 分钟）；Alpine 使用 root cron（03:40）。清理器为内嵌 POSIX shell，无需 Python，适合极小磁盘机器。通过 `.trashinfo` 删除时间判断保留期；缺少元数据时采用 mtime/ctime 较新值，跳过不合法日期、符号链接的回收站根和子挂载。文件符号链接只删除链接本身。安装不会改 SSH 配置，也不会自动修改其他防火墙、代理或探针服务。
+
+Windows 使用仓库的独立 `windows-trash-cleanup.ps1`，以管理员 PowerShell 执行 `-Action Install -Days 180`。任务名为 `KaiSa-PurgeOldTrash`，以当前用户的有限权限 S4U 运行，不保存账户密码、不以 SYSTEM 清理其他用户。仅扫描固定磁盘当前用户 SID 下的 `$Recycle.Bin`，按 `$I` 删除时间清理对应 `$R`，跳过重解析点。支持 `-Action Preview`（只预览）与 `-Action Status`。无需更改全局 PowerShell 执行策略。
