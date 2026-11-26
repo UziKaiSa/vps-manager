@@ -232,7 +232,7 @@ else:
 ss_model = base_model(False)
 ss_model["optionalInbounds"]["shadowsocks"] = {
     "listen": "0.0.0.0", "port": 23456,
-    "method": "aes-128-gcm", "password": "test-password",
+    "method": "aes-128-gcm", "password": "example-password",
 }
 ss_model["publicPorts"]["shadowsocks"] = 54321
 config, state, info, yaml_text = generate(ss_model)
