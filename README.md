@@ -2,7 +2,7 @@
 
 `VPS Manager` 是一个面向 Debian/Ubuntu VPS 的中文交互式管理脚本，并为小硬盘 Alpine/OpenRC NAT VPS 提供受限模式，用于完成服务器初始化、Xray 配置，以及 Komari Agent/WARP 私网接入。
 
-当前版本：`0.9.34-test`
+当前版本：`0.9.35-test`
 
 > 目前是测试版。首次在正式服务器上使用前，建议先运行预览模式，并保留一个已经登录的 SSH 终端。
 
@@ -582,3 +582,7 @@ vps-manager.sh                 VPS 初始化与管理主脚本
 windows-ssh-key.ps1            Windows SSH 公钥和私钥生成脚本
 README.md                      中文使用说明
 ```
+
+### 零信任公网中继 TLS 校验
+
+本机 nginx 中继使用系统 CA 包验证上游 HTTPS 证书链和域名。CA 包缺失时先安装 ca-certificates；仍不可用则停止，保留现有配置，不降级关闭证书校验。此修复不修改 Agent 业务版本、Token、上报地址或 CF 策略。

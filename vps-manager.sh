@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.9.34-test"
+SCRIPT_VERSION="0.9.35-test"
 SCRIPT_NAME="VPS Manager"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh"
 
@@ -5897,14 +5897,25 @@ komari_install_access_nginx() {
   if [[ "${nginx_was_present}" == 0 ]]; then
     log "安装零信任公网中继所需的 nginx"
     if is_alpine; then
-      apk add --no-cache nginx || return 1
+      apk add --no-cache nginx ca-certificates || return 1
     else
       apt_update_safe || return 1
       DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout="${APT_LOCK_WAIT_SECONDS}" \
-        install -y --no-install-recommends nginx || return 1
+        install -y --no-install-recommends nginx ca-certificates || return 1
       systemctl disable --now nginx.service >/dev/null 2>&1 || true
     fi
   fi
+  if ! komari_access_ca_bundle >/dev/null 2>&1; then
+    log "安装零信任公网中继所需的系统 CA 证书"
+    if is_alpine; then
+      apk add --no-cache ca-certificates || return 1
+    else
+      apt_update_safe || return 1
+      DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout="${APT_LOCK_WAIT_SECONDS}" \
+        install -y --no-install-recommends ca-certificates || return 1
+    fi
+  fi
+  komari_access_ca_bundle >/dev/null || return 1
   command -v nginx >/dev/null 2>&1 || { warn "nginx 安装失败。"; return 1; }
 }
 
@@ -5973,8 +5984,22 @@ EOF
 }
 
 
+komari_access_ca_bundle() {
+  local bundle
+  for bundle in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/cert.pem; do
+    if [[ -r "${bundle}" && -s "${bundle}" ]]; then
+      printf '%s\n' "${bundle}"
+      return 0
+    fi
+  done
+  warn "系统 CA 证书包不可用，已停止生成中继配置；不会关闭 TLS 校验。" >&2
+  return 1
+}
+
+
 komari_write_access_proxy() {
-  local hostname="$1" client_id="$2" client_secret="$3" candidate backup="" resolver
+  local hostname="$1" client_id="$2" client_secret="$3" candidate backup="" resolver ca_bundle
+  ca_bundle="$(komari_access_ca_bundle)" || return 1
   if ip -4 route show default 2>/dev/null | grep -q .; then
     resolver="1.1.1.1 8.8.8.8 ipv6=off"
   else
@@ -6003,6 +6028,9 @@ http {
             proxy_pass \$komari_upstream\$request_uri;
             proxy_ssl_server_name on;
             proxy_ssl_name ${hostname};
+            proxy_ssl_verify on;
+            proxy_ssl_trusted_certificate ${ca_bundle};
+            proxy_ssl_verify_depth 5;
             proxy_http_version 1.1;
             proxy_set_header Host ${hostname};
             proxy_set_header CF-Access-Client-Id "${client_id}";
