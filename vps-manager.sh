@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.9.36-test"
+SCRIPT_VERSION="0.9.38-test"
 SCRIPT_NAME="VPS Manager"
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/vps-manager.sh"
 
@@ -6960,6 +6960,42 @@ disable_managed_firewall() {
 }
 
 
+install_listen_binding_asset() {
+  local name="$1" expected="$2" source_dir="$3" target source candidate actual
+  case "${name}" in listen-bind.py|native-bind.py) ;; *) warn "监听组件名称不合法。"; return 1 ;; esac
+  target="/usr/local/lib/vps-manager/${name}"
+  source="${source_dir}/assets/${name}"
+  if [[ -f "${target}" ]]; then
+    actual="$(sha256sum "${target}" | awk '{print $1}')"
+    [[ "${actual}" != "${expected}" ]] || return 0
+  fi
+  install -d -m 0755 /usr/local/lib/vps-manager
+  candidate="${target}.candidate"
+  if [[ -f "${source}" ]]; then
+    install -m 0600 "${source}" "${candidate}"
+  else
+    (umask 077; curl --proto '=https' --tlsv1.2 -fsSL --connect-timeout 10 --max-time 60 \
+      "https://raw.githubusercontent.com/UziKaiSa/vps-manager/main/assets/${name}" -o "${candidate}") \
+      || { warn "监听组件下载失败，原组件未替换；诊断候选：${candidate}"; return 1; }
+  fi
+  actual="$(sha256sum "${candidate}" | awk '{print $1}')"
+  [[ "${actual}" == "${expected}" ]] || { warn "监听组件 SHA-256 校验失败，未安装；候选：${candidate}"; return 1; }
+  chmod 0755 "${candidate}"
+  mv -f -- "${candidate}" "${target}"
+}
+
+
+listen_binding_menu() {
+  local source_dir
+  require_root
+  command -v python3 >/dev/null 2>&1 || { warn "真实监听管理需要 Python 3；不会为查询自动安装软件。"; return 1; }
+  source_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+  install_listen_binding_asset listen-bind.py 0be6b21b5b0ebba953845e62c3d7e7d7139fbc16a94e4c772ea41737393f62d3 "${source_dir}" || return 1
+  install_listen_binding_asset native-bind.py 8cb67526298a2745c297edd8c0b4a80781fa6f1e222555b38dd2ee779ba534db "${source_dir}" || return 1
+  python3 -B /usr/local/lib/vps-manager/listen-bind.py menu
+}
+
+
 firewall_management_menu() {
   local choice
   while true; do
@@ -6971,6 +7007,7 @@ firewall_management_menu() {
     printf '  5) 防火墙日志与中文统计\n'
     printf '  6) 停用脚本管理的防火墙（保留配置）\n'
     printf '  7) 自定义主站安全开关（仍仅开放 SSH）\n'
+    printf '  8) 真实监听回环：扫描、用途、修改与恢复（不改防火墙）\n'
     printf '  0) 返回\n'
     read -r -p "请选择: " choice
     case "${choice:-0}" in
@@ -6981,6 +7018,7 @@ firewall_management_menu() {
       5) firewall_log_management_menu ;;
       6) disable_managed_firewall ;;
       7) configure_firewall_mode main 1 ;;
+      8) listen_binding_menu ;;
       0) return 0 ;;
       *) warn "未知选项。" ;;
     esac
@@ -7012,7 +7050,7 @@ while [ "$#" -gt 0 ]; do
     --days) [ "$#" -ge 2 ] || exit 2; days=$2; shift 2 ;;
     --dry-run) dry_run=1; shift ;;
     --root) [ "$#" -ge 2 ] || exit 2; single_root=$2; shift 2 ;;
-    *) echo "Usage: $0 [--days 180] [--dry-run] [--root /home/user/.local/share/Trash]" >&2; exit 2 ;;
+    *) echo "Usage: $0 [--days 180] [--dry-run] [--root /path/to/.local/share/Trash]" >&2; exit 2 ;;
   esac
 done
 case "$days" in ''|*[!0-9]*|0*) echo 'Retention must be 1..36500 whole days.' >&2; exit 2;; esac
